@@ -86,6 +86,16 @@ under a `k`-of-`n` Laurent-series sharing and **used without being reassembled**
 | Quantum attacker holding vault file + public key | Can recover the key (ECDLP). Use passphrase/info-theoretic custody if this matters |
 | Compromises the owner process while the vault is open | Sees the masks — threshold protects at rest and the authority to open, not an open session |
 
+### 2.3d Threshold masks (optional)
+
+With `mask_cluster`, no single party holds the masks. Server + fewer than `k`
+custodians learn nothing beyond the baseline (shares are information-theoretic).
+`k` colluding custodians recover masks; an active custodian that lies is detected
+when more than `k` answer (fail-closed otherwise). Reading a cell reveals its mask
+to the owner process; aggregates reveal only the sum. A malicious DB server can
+relabel schema policies — mitigated by the read-only rule for server-learned
+tables (`trust_server_schema`). Details and limits: `masks.md`.
+
 ### 2.4 Owner-process adversary
 
 If the owner process is compromised, the mask vault is exposed. Mask vault

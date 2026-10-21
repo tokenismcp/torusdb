@@ -28,12 +28,14 @@ Usage:  python nokey_server.py [--host H] [--port P] [--db PATH]
 from __future__ import annotations
 
 import argparse
+import collections
 import hashlib
 import hmac
 import itertools
 import json
 import logging
 import signal
+import socket
 import socketserver
 import ssl
 import sys
@@ -84,7 +86,7 @@ READ_RPCS = frozenset({
 })
 WRITE_RPCS = frozenset({
     "create", "insert", "insert_many", "update_cell", "delete_rows",
-    "tx_begin", "tx_commit", "tx_rollback",
+    "tx_begin", "tx_commit", "tx_rollback", "tx_status",
 })
 ADMIN_RPCS = frozenset({"drop", "stats", "checkpoint", "backup"})
 PUBLIC_RPCS = frozenset({"hello", "ping", "auth"})
@@ -125,6 +127,10 @@ class ServerConfig:
     backup_dir: str | None = None
     backup_keep: int = 7
     slow_ms: float = 1000.0
+    max_items: int = 200_000          # longest id/opening list accepted in one request
+    auth_deadline: float = 10.0       # seconds an unauthenticated peer may stay connected
+    pre_auth_frame: int = 8192        # largest frame accepted before authentication
+    tx_ring: int = 100_000            # committed transaction ids remembered
 
 
 def hash_token(token: str) -> str:
@@ -141,8 +147,15 @@ def load_token_file(path: str) -> dict:
         role, sep, tok = line.partition(":")
         if not sep or role not in ROLE_RPCS or not tok:
             raise SystemExit(f"{path}:{n}: expected '<ro|rw|admin>:<token>'")
-        if not tok.startswith("sha256:") and len(tok) < 16:
+        if tok.startswith("sha256:"):
+            tok = "sha256:" + tok[7:].lower()
+            hexpart = tok[7:]
+            if len(hexpart) != 64 or any(c not in "0123456789abcdef" for c in hexpart):
+                raise SystemExit(f"{path}:{n}: sha256 token must be 64 hex characters")
+        elif len(tok) < 16:
             raise SystemExit(f"{path}:{n}: token shorter than 16 characters")
+        if tok in tokens:
+            raise SystemExit(f"{path}:{n}: duplicate token (a token may belong to one role only)")
         tokens[tok] = role
     if not tokens:
         raise SystemExit(f"{path}: no tokens defined")
@@ -165,6 +178,7 @@ class _Stats:
         self.checkpoints = 0
         self.tx_commits = 0
         self.tx_rollbacks = 0
+        self.checkpoint_failures = 0
 
     def record(self, method: str, secs: float, err: str | None) -> None:
         with self.lock:
@@ -184,6 +198,7 @@ class Session:
     peer: str
     role: str | None = None
     in_tx: bool = False
+    tx_id: str | None = None
 
 
 _MISSING = object()
@@ -205,9 +220,14 @@ class Engine:
         self._tx_since = 0.0
         self._undo: list = []
         self._tx_ops: list = []
+        self._tx_id: str | None = None
+        self._txids: collections.OrderedDict[str, bool] = collections.OrderedDict()
         self._timed_out: set[int] = set()              # sessions whose tx was aborted
         self._ids = itertools.count(1)
-        self._fail: dict[str, list] = {}               # ip -> [count, first, locked_until]
+        self._fail: dict[str, list] = {}               # ip -> [count, locked_until, window_end]
+        self._fail_lock = threading.Lock()
+        self._broken: str | None = None                # storage failure ⇒ read-only
+        self._closing = False
         self.stats = _Stats()
         self._tokens = None
         if self.cfg.tokens is not None:
@@ -227,33 +247,54 @@ class Engine:
         try:
             jpath = path + ".journal"
             if Path(path).exists():
-                body, self._gen = dur.read_snapshot(path)
+                body, self._gen, extra = dur.read_snapshot(path)
                 self.srv = NoKeyServer.from_body(body)
-            replayed = 0
-            for ops in dur.Journal.replay(jpath, self._gen):
-                for method, args in ops:
-                    self._mutate(method, args)
-                replayed += 1
+                for t in extra.get("txids", []):
+                    self._remember_tx(t)
             self._journal = dur.Journal(jpath, self._gen, self.cfg.fsync)
-            self._journal.open()
-            self._journal.records = replayed
+            replayed = 0
+            for rec in self._journal.open():        # raises CorruptDatabase on damage
+                for method, args in rec["ops"]:
+                    self._mutate(method, args)
+                if rec.get("tx"):
+                    self._remember_tx(rec["tx"])
+                replayed += 1
             if replayed:
                 log.info("recovered %d journal commit(s) on top of snapshot "
                          "generation %d", replayed, self._gen)
         except BaseException:
+            if self._journal:
+                self._journal.close()
             self._dblock.release()
             raise
+
+    def _remember_tx(self, txid: str) -> None:
+        self._txids[txid] = True
+        self._txids.move_to_end(txid)
+        while len(self._txids) > self.cfg.tx_ring:
+            self._txids.popitem(last=False)
 
     def checkpoint(self) -> int:
         """Fold the journal into a fresh snapshot (no-op without --db)."""
         if not self._path:
             return 0
         with self._lock:
+            if self._broken:
+                raise Busy(f"storage failure: {self._broken}")
             if self._tx_owner is not None:
                 raise Busy("cannot checkpoint while a transaction is open")
             new_gen = self._gen + 1
-            dur.write_snapshot(self._path, self.srv.to_body(), new_gen)
-            self._journal.reset(new_gen)
+            dur.write_snapshot(self._path, self.srv.to_body(), new_gen,
+                               {"txids": list(self._txids)})
+            try:
+                self._journal.reset(new_gen)
+            except BaseException as exc:
+                # the new snapshot is already the truth on disk; commits appended to
+                # the old-generation journal would be ignored on recovery, so stop
+                # accepting writes instead of acknowledging data that could be lost
+                self._broken = f"journal reset failed after checkpoint ({exc})"
+                log.critical("%s — server is now read-only; restart to recover", self._broken)
+                raise
             self._gen = new_gen
             self.stats.bump("checkpoints")
             return new_gen
@@ -262,21 +303,27 @@ class Engine:
         if not self.cfg.backup_dir:
             raise BadRequest("backups are not enabled (start with --backup-dir)")
         with self._lock:
-            Path(self.cfg.backup_dir).mkdir(parents=True, exist_ok=True)
+            if self._tx_owner is not None:
+                raise Busy("cannot back up while a transaction is open "
+                           "(it would capture uncommitted data)")
+            Path(self.cfg.backup_dir).mkdir(parents=True, exist_ok=True, mode=0o700)
             base = Path(self._path).name if self._path else "memory"
             out = Path(self.cfg.backup_dir) / (
                 f"{base}.{time.strftime('%Y%m%dT%H%M%S')}.g{self._gen}"
                 f".{next(self._ids)}.bak")
-            dur.write_snapshot(str(out), self.srv.to_body(), self._gen)
+            dur.write_snapshot(str(out), self.srv.to_body(), self._gen,
+                               {"txids": list(self._txids)})
+            keep = max(1, self.cfg.backup_keep)
             olds = sorted(Path(self.cfg.backup_dir).glob(f"{base}.*.bak"),
                           key=lambda p: p.stat().st_mtime)
-            for old in olds[:-self.cfg.backup_keep]:
+            for old in olds[:-keep]:
                 old.unlink(missing_ok=True)
             return str(out)
 
     def close(self) -> None:
         with self._lock:
-            if self._path and self._journal and self._tx_owner is None:
+            self._closing = True                       # no RPC may mutate from now on
+            if self._path and self._journal and self._tx_owner is None and not self._broken:
                 try:
                     self.checkpoint()
                 except Exception:                      # noqa: BLE001
@@ -309,11 +356,14 @@ class Engine:
         if self._tokens is None:
             return {"role": s.role}
         ip = s.peer.rsplit(":", 1)[0]
-        now = time.time()
-        rec = self._fail.get(ip)
-        if rec and rec[2] > now:
-            raise Forbidden("too many failed authentication attempts; "
-                            "try again later")
+        now = time.monotonic()
+        with self._fail_lock:                          # decide BEFORE doing any work
+            rec = self._fail.get(ip)
+            if rec and rec[1] > now:
+                raise Forbidden("too many failed authentication attempts; "
+                                "try again later")
+            if len(self._fail) > 10_000:               # bound memory
+                self._fail = {k: v for k, v in self._fail.items() if v[1] > now or v[2] > now}
         digest = hash_token(token if isinstance(token, str) else "")
         role = None
         for stored, r in self._tokens.items():         # constant-time scan
@@ -321,17 +371,19 @@ class Engine:
                 role = r
         if role is None:
             time.sleep(self.cfg.auth_fail_delay)
-            rec = self._fail.setdefault(ip, [0, now, 0.0])
-            if now - rec[1] > 60:
-                rec[:] = [0, now, 0.0]
-            rec[0] += 1
-            if rec[0] >= self.cfg.max_auth_failures:
-                rec[2] = now + self.cfg.lockout_seconds
-                rec[0] = 0
+            with self._fail_lock:
+                rec = self._fail.setdefault(ip, [0, 0.0, now + 60])
+                if rec[2] < now:
+                    rec[:] = [0, 0.0, now + 60]
+                rec[0] += 1
+                if rec[0] >= self.cfg.max_auth_failures:
+                    rec[:] = [0, now + self.cfg.lockout_seconds,
+                              now + self.cfg.lockout_seconds + 60]
             self.stats.bump("auth_failures")
             log.warning("authentication failed from %s", ip)
             raise Unauthenticated("invalid token")
-        self._fail.pop(ip, None)
+        with self._fail_lock:
+            self._fail.pop(ip, None)
         s.role = role
         return {"role": role}
 
@@ -381,7 +433,9 @@ class Engine:
         if method == "backup":
             return self.backup()
         if method in ("tx_begin", "tx_commit", "tx_rollback"):
-            return self._tx(s, method)
+            return self._tx(s, method, args)
+        if method == "tx_status":
+            return self._tx_status(args)
         return self._run(s, method, args)
 
     # ── transactions: one open transaction at a time, serializable ───────────
@@ -398,16 +452,33 @@ class Engine:
             self._cv.notify_all()
 
     def _check_timed_out(self, s: Session) -> None:
+        """A session whose transaction the server aborted stays in an aborted
+        state: every statement fails until it issues ROLLBACK (it must not carry
+        on as if it were still inside the transaction, nor autocommit)."""
         if s.id in self._timed_out:
-            self._timed_out.discard(s.id)
-            s.in_tx = False
-            raise Busy("transaction timed out and was rolled back")
+            raise Busy("transaction timed out and was rolled back; "
+                       "issue ROLLBACK before continuing")
 
-    def _tx(self, s: Session, method: str):
+    def _tx(self, s: Session, method: str, args: list):
+        if method == "tx_status":
+            return self._tx_status(args)
         deadline = time.monotonic() + self.cfg.tx_wait
         with self._cv:
+            if s.id in self._timed_out and method != "tx_begin":
+                self._timed_out.discard(s.id)           # ROLLBACK / COMMIT acknowledge it
+                s.in_tx, s.tx_id = False, None
+                if method == "tx_rollback":
+                    return None
+                raise Busy("transaction timed out and was rolled back")
             self._check_timed_out(s)
+            if self._closing:
+                raise Busy("server is shutting down")
             if method == "tx_begin":
+                txid = args[0] if args else None
+                if txid is not None and (not isinstance(txid, str) or not 0 < len(txid) <= 64):
+                    raise BadRequest("transaction id must be a string of 1–64 characters")
+                if self._broken:
+                    raise Busy(f"storage failure: {self._broken}")
                 if s.in_tx:
                     raise BadRequest("a transaction is already open")
                 while self._tx_owner is not None:
@@ -421,40 +492,59 @@ class Engine:
                 with self._lock:
                     self._tx_owner = s.id
                     self._tx_since = time.monotonic()
+                    self._tx_id = txid
                     self._undo, self._tx_ops = [], []
-                s.in_tx = True
+                s.in_tx, s.tx_id = True, txid
                 return None
             if self._tx_owner != s.id:
                 raise BadRequest("no transaction is open")
             with self._lock:
                 if method == "tx_commit":
-                    if self._journal and self._tx_ops:
+                    if self._journal and (self._tx_ops or self._tx_id):
                         try:
-                            self._journal.append(self._tx_ops)
-                        except OSError:
+                            self._journal.append(self._tx_ops, self._tx_id)
+                        except Exception as exc:        # noqa: BLE001
                             self._rollback_locked()
-                            s.in_tx = False
+                            s.in_tx, s.tx_id = False, None
                             self.stats.bump("tx_rollbacks")
+                            if not self._journal.usable:
+                                self._broken = f"journal unusable ({exc})"
                             self._cv.notify_all()
                             raise BadRequest("commit failed (journal write); "
                                              "transaction rolled back")
+                    if self._tx_id:
+                        self._remember_tx(self._tx_id)
                     self._undo, self._tx_ops = [], []
                     self.stats.bump("tx_commits")
                 else:
                     self._rollback_locked()
                     self.stats.bump("tx_rollbacks")
                 self._tx_owner = None
-            s.in_tx = False
+                self._tx_id = None
+            s.in_tx, s.tx_id = False, None
             self._cv.notify_all()
         if method == "tx_commit":
             self._maybe_checkpoint()
         return None
+
+    def _tx_status(self, args: list) -> str:
+        """Outcome of a transaction id: ``committed`` | ``open`` | ``unknown``.
+        ``unknown`` means it never committed (aborted, or never began)."""
+        if len(args) != 1 or not isinstance(args[0], str):
+            raise BadRequest("tx_status takes one transaction id")
+        with self._lock:
+            if args[0] in self._txids:
+                return "committed"
+            if self._tx_id == args[0] and self._tx_owner is not None:
+                return "open"
+            return "unknown"
 
     def _rollback_locked(self) -> None:
         for undo in reversed(self._undo):
             undo()
         self._undo, self._tx_ops = [], []
         self._tx_owner = None
+        self._tx_id = None
 
     # ── executing one RPC ────────────────────────────────────────────────────
     def _run(self, s: Session, method: str, args: list):
@@ -473,8 +563,14 @@ class Engine:
             with self._lock:
                 if self._tx_owner not in (None, s.id):
                     continue                           # lost a race; wait again
+                if s.id in self._timed_out:
+                    self._check_timed_out(s)           # raced with an expiry
                 if method not in MUTATIONS:
                     return self._call(method, args)
+                if self._closing:
+                    raise Busy("server is shutting down")
+                if self._broken:
+                    raise Busy(f"storage failure — the server is read-only: {self._broken}")
                 result, undo = self._mutate(method, args)
                 if s.in_tx and self._tx_owner == s.id:
                     self._undo.append(undo)
@@ -482,8 +578,11 @@ class Engine:
                 elif self._journal:
                     try:
                         self._journal.append([[method, args]])
-                    except OSError as exc:
+                    except Exception as exc:           # noqa: BLE001
                         undo()
+                        if not self._journal.usable:
+                            self._broken = f"journal unusable ({exc})"
+                            log.critical("%s — server is now read-only", self._broken)
                         raise BadRequest(f"write failed (journal): {exc}")
                 break
         if not s.in_tx:
@@ -491,12 +590,17 @@ class Engine:
         return result
 
     def _maybe_checkpoint(self) -> None:
-        if (self._journal and self._tx_owner is None
+        """Never lets a checkpoint problem fail an operation that is already
+        durable in the journal."""
+        if (self._journal and self._tx_owner is None and not self._broken
                 and self._journal.records >= self.cfg.checkpoint_every):
             try:
                 self.checkpoint()
             except Busy:
                 pass
+            except Exception:                          # noqa: BLE001
+                self.stats.bump("checkpoint_failures")
+                log.exception("checkpoint failed (data remains safe in the journal)")
 
     def _call(self, method: str, args: list):
         try:
@@ -579,6 +683,22 @@ class Engine:
     def _rpc_create(self, table, columns):
         if not isinstance(table, str) or not table:
             raise BadRequest("table name must be a non-empty string")
+        if not isinstance(columns, list) or not all(
+                isinstance(c, (list, tuple)) and len(c) == 3
+                and all(isinstance(x, str) for x in c) for c in columns):
+            raise BadRequest("columns must be [[name, type, policy], …]")
+        if not columns:
+            raise BadRequest("a table needs at least one column")
+        names = [c[0] for c in columns]
+        if len(set(names)) != len(names):
+            raise BadRequest("duplicate column name")
+        if any(n.startswith("__") for n in names) or table.startswith("__"):
+            raise BadRequest("names starting with '__' are reserved")
+        for n, t, pol in columns:
+            if t not in ("int", "str", "rational") or pol not in ("plain", "encrypted", "paired"):
+                raise BadRequest(f"bad column definition for {n!r}")
+            if t == "str" and pol != "plain":
+                raise BadRequest(f"STR columns must be PLAIN (column {n!r})")
         self.srv.create(table, [tuple(c) for c in columns]); return None
 
     def _rpc_drop(self, table):
@@ -597,30 +717,56 @@ class Engine:
         return {"rows": len(rows),
                 "deleted": sorted(self.srv._deleted.get(table, ()))}
 
+    @staticmethod
+    def _is_hidden(k: str) -> bool:
+        """Owner-side bookkeeping columns: ``__cid__`` (random cell-group id of
+        a threshold mask cluster) and ``__mv__<col>`` (mask version)."""
+        return k == "__cid__" or k.startswith("__mv__")
+
     def _rpc_insert(self, table, row_wire):
         names = {c[0] for c in self._cols(table)}
+        if not isinstance(row_wire, dict):
+            raise BadRequest("row must be an object")
         keys = set(row_wire)
         macs = {k for k in keys if k.startswith("__mac__") and k[7:] in names}
-        if keys - macs != names:
+        hidden = {k for k in keys if self._is_hidden(k)}
+        if keys - macs - hidden != names:
             raise BadRequest("INSERT must provide exactly the table's columns")
         row = {k: w.uwv(v) for k, v in row_wire.items()}
+        if "__cid__" in row and not (isinstance(row["__cid__"], str)
+                                     and 0 < len(row["__cid__"]) <= 64):
+            raise BadRequest("__cid__ must be a short string")
+        if any(not isinstance(row[k], int) or isinstance(row[k], bool) or row[k] < 0
+               for k in hidden if k != "__cid__"):
+            raise BadRequest("mask versions must be non-negative integers")
         return self.srv.insert(table, row)
 
     def _rpc_update_cell(self, table, idx, col, wire_value):
         self._row(table, idx)
         known = {c[0] for c in self._cols(table)}
-        if col not in known and not (col.startswith("__mac__") and col[7:] in known):
+        if not isinstance(col, str):
+            raise BadRequest("column must be a string")
+        if (col not in known and not self._is_hidden(col)
+                and not (col.startswith("__mac__") and col[7:] in known)):
             raise BadRequest(f"no such column: {col}")
         self.srv.update_cell(table, idx, col, w.uwv(wire_value)); return None
 
-    def _rpc_delete_rows(self, table, idxs):
+    def _check_ids(self, table, idxs) -> list:
+        """Validated row-id list: bounded length, real ints, in range."""
         rows = self.srv._rows.get(table)
         if rows is None:
             raise BadRequest(f"no such table: {table}")
-        if any((not isinstance(i, int)) or isinstance(i, bool)
-               or not 0 <= i < len(rows) for i in idxs):
-            raise BadRequest("row id out of range")
-        return self.srv.delete_rows(table, idxs)
+        if not isinstance(idxs, list) or len(idxs) > self.cfg.max_items:
+            raise BadRequest(f"id list must be a list of at most {self.cfg.max_items} ids")
+        n = len(rows)
+        for i in idxs:
+            if isinstance(i, bool) or not isinstance(i, int) or not 0 <= i < n:
+                raise BadRequest("row id out of range")
+        return idxs
+
+    def _rpc_delete_rows(self, table, idxs):
+        ids = sorted(set(self._check_ids(table, idxs)))       # duplicates count once
+        return self.srv.delete_rows(table, ids)
 
     def _check_predicate(self, table, pred) -> None:
         """Predicates may only test PLAIN columns: comparing against a blinded
@@ -648,30 +794,56 @@ class Engine:
         return [i for i, r in enumerate(rows)
                 if i not in dead and w.match_wire(r, pred)]
 
+    def _col(self, table, col) -> str:
+        known = {c[0] for c in self._cols(table)}
+        if not isinstance(col, str) or not (col in known or self._is_hidden(col)
+                                            or (col.startswith("__mac__") and col[7:] in known)):
+            raise BadRequest(f"no such column: {col!r}")
+        return col
+
     def _rpc_plain_cells(self, table, col, idxs):
-        self._cols(table)
-        return [w.wv(v) for v in self.srv.plain_cells(table, col, idxs)]
+        self._col(table, col)
+        return [w.wv(v) for v in self.srv.plain_cells(table, col, self._check_ids(table, idxs))]
 
     def _rpc_blinded_cell(self, table, col, idx):
+        self._col(table, col)
+        self._check_ids(table, [idx])
         return w.wv(self.srv.blinded_cell(table, col, idx))
 
     def _rpc_blinded_cells(self, table, col, idxs):
-        return [w.wv(v) for v in self.srv.blinded_cells(table, col, idxs)]
+        self._col(table, col)
+        return [w.wv(v) for v in self.srv.blinded_cells(table, col, self._check_ids(table, idxs))]
+
+    @staticmethod
+    def _scalar(k) -> int:
+        if isinstance(k, bool) or not isinstance(k, (int, str)):
+            raise BadRequest("scalar must be an integer (or its decimal string)")
+        return int(k)
 
     # — Π_lin (affine on blinded scalars; no key) —
     def _rpc_blinded_sum(self, table, col, idxs):
-        return str(self.srv.blinded_sum(table, col, idxs))
+        self._col(table, col)
+        return str(self.srv.blinded_sum(table, col, self._check_ids(table, idxs)))
 
     def _rpc_blinded_scaled_sum(self, table, col, idxs, k):
-        return str(self.srv.blinded_scaled_sum(table, col, idxs, int(k)))
+        self._col(table, col)
+        return str(self.srv.blinded_scaled_sum(table, col, self._check_ids(table, idxs),
+                                               self._scalar(k)))
 
     def _rpc_blinded_per_row_scaled(self, table, col, idxs, k):
-        return [str(x) for x in
-                self.srv.blinded_per_row_scaled(table, col, idxs, int(k))]
+        self._col(table, col)
+        return [str(x) for x in self.srv.blinded_per_row_scaled(
+            table, col, self._check_ids(table, idxs), self._scalar(k))]
 
     # — Π_mult (combine opened operands; no key) —
     def _rpc_mult_combine_batch(self, openings):
-        pairs = [(int(e), int(g)) for (e, g) in openings]
+        if not isinstance(openings, list) or len(openings) > self.cfg.max_items:
+            raise BadRequest(f"at most {self.cfg.max_items} openings per request")
+        pairs = []
+        for o in openings:
+            if not isinstance(o, (list, tuple)) or len(o) != 2:
+                raise BadRequest("each opening must be a pair [e, g]")
+            pairs.append((self._scalar(o[0]), self._scalar(o[1])))
         return [str(x) for x in self.srv.mult_combine_batch(pairs)]
 
     # ── introspection ────────────────────────────────────────────────────────
@@ -703,6 +875,8 @@ class Engine:
         return snap
 
     def prometheus(self) -> str:
+        def esc(v: str) -> str:               # Prometheus label-value escaping
+            return str(v).replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
         s = self.stats_snapshot()
         out = [
             "# TYPE torusdb_up gauge", "torusdb_up 1",
@@ -718,13 +892,13 @@ class Engine:
             f"torusdb_auth_failures_total {s['auth_failures']}",
             "# TYPE torusdb_requests_total counter",
         ]
-        out += [f'torusdb_requests_total{{method="{m}"}} {n}'
+        out += [f'torusdb_requests_total{{method="{esc(m)}"}} {n}'
                 for m, n in sorted(s["requests"].items())]
         out.append("# TYPE torusdb_request_seconds_total counter")
-        out += [f'torusdb_request_seconds_total{{method="{m}"}} {v}'
+        out += [f'torusdb_request_seconds_total{{method="{esc(m)}"}} {v}'
                 for m, v in sorted(s["request_seconds"].items())]
         out.append("# TYPE torusdb_errors_total counter")
-        out += [f'torusdb_errors_total{{type="{t}"}} {n}'
+        out += [f'torusdb_errors_total{{type="{esc(t)}"}} {n}'
                 for t, n in sorted(s["errors"].items())]
         out += [
             "# TYPE torusdb_bytes_in_total counter",
@@ -739,7 +913,7 @@ class Engine:
             f"torusdb_journal_records {s['journal_records']}",
             "# TYPE torusdb_table_rows gauge",
         ]
-        out += [f'torusdb_table_rows{{table="{t}"}} {v["rows"]}'
+        out += [f'torusdb_table_rows{{table="{esc(t)}"}} {v["rows"]}'
                 for t, v in sorted(s["tables"].items())]
         return "\n".join(out) + "\n"
 
@@ -752,6 +926,8 @@ def _client_error_text(exc: Exception) -> str:
         return f"{type(exc).__name__}: {exc}"
     if type(exc).__name__ in ("PlanError", "ParseError", "ExecError"):
         return f"{type(exc).__name__}: {exc}"
+    if isinstance(exc, (RecursionError, OverflowError, MemoryError)):
+        return f"BadRequest: request too complex or too large ({type(exc).__name__})"
     if isinstance(exc, (KeyError, IndexError, ValueError, TypeError)):
         return f"BadRequest: {type(exc).__name__}: {exc}"
     ref = uuid.uuid4().hex[:8]
@@ -762,7 +938,10 @@ def _client_error_text(exc: Exception) -> str:
 
 class _Handler(socketserver.StreamRequestHandler):
     def setup(self) -> None:
-        self.timeout = self.server.cfg.idle_timeout or None
+        # until authenticated a peer gets a short deadline and a tiny frame budget
+        cfg = self.server.cfg
+        self.timeout = (cfg.auth_deadline if self.server.engine._tokens is not None
+                        else (cfg.idle_timeout or None))
         super().setup()
 
     def handle(self) -> None:
@@ -777,10 +956,14 @@ class _Handler(socketserver.StreamRequestHandler):
             return
         session = engine.new_session(peer)
         log.info("connect %s session=%d", peer, session.id)
+        started = time.monotonic()
         try:
             while True:
+                if session.role is None and time.monotonic() - started > cfg.auth_deadline:
+                    return                                # did not authenticate in time
+                limit = cfg.max_frame if session.role is not None else cfg.pre_auth_frame
                 try:
-                    payload = read_frame(self.rfile, cfg.max_frame)
+                    payload = read_frame(self.rfile, limit)
                 except ValueError as exc:                 # oversized frame
                     self._send({"err": f"BadRequest: {exc}"})
                     return
@@ -795,6 +978,8 @@ class _Handler(socketserver.StreamRequestHandler):
                         raise BadRequest("request must be a JSON object")
                     out = engine.dispatch(req.get("m"), req.get("a", []), session)
                     resp = {"ok": out}
+                    if session.role is not None and self.connection.gettimeout() != (cfg.idle_timeout or None):
+                        self.connection.settimeout(cfg.idle_timeout or None)
                 except json.JSONDecodeError:
                     resp = {"err": "BadRequest: malformed JSON"}
                 except Exception as exc:                  # noqa: BLE001
@@ -828,6 +1013,8 @@ class NoKeyTCPServer(socketserver.ThreadingTCPServer):
     def __init__(self, host: str, port: int, db_path: str | None = None,
                  ssl_ctx: ssl.SSLContext | None = None,
                  config: ServerConfig | None = None):
+        if ":" in host:
+            self.address_family = socket.AF_INET6      # e.g. --host ::1
         super().__init__((host, port), _Handler, bind_and_activate=False)
         self.cfg = config or ServerConfig()
         self._ssl_ctx = ssl_ctx
@@ -874,9 +1061,10 @@ class NoKeyTCPServer(socketserver.ThreadingTCPServer):
 
     def server_close(self) -> None:
         super().server_close()
-        eng, self.engine = getattr(self, "engine", None), None
+        eng = getattr(self, "engine", None)
         if eng is not None:
-            eng.close()
+            eng.close()                      # handler threads still see a live object
+                                             # that refuses further writes (Busy)
 
 
 # ── metrics / health HTTP endpoint ───────────────────────────────────────────
@@ -939,7 +1127,8 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--fsync", choices=("always", "never"), default="always")
     ap.add_argument("--checkpoint-every", type=int, default=5000)
     ap.add_argument("--backup-dir", default=None)
-    ap.add_argument("--backup-keep", type=int, default=7)
+    ap.add_argument("--backup-keep", type=int, default=7,
+                    help="how many backups to retain (≥1)")
     ap.add_argument("--restore-from", default=None,
                     help="restore --db from a backup file and exit")
     ap.add_argument("--token-file", default=None,
@@ -967,10 +1156,13 @@ def main(argv: list[str] | None = None) -> None:
     if args.restore_from:
         if not args.db:
             raise SystemExit("--restore-from requires --db")
-        body, _gen = dur.read_snapshot(args.restore_from)     # verifies checksum
-        dur.write_snapshot(args.db, body, 0)
-        Path(args.db + ".journal").unlink(missing_ok=True)
-        print(f"restored {args.db} from {args.restore_from}")
+        try:
+            gen = dur.restore_backup(args.db, args.restore_from)   # takes the DB lock
+        except dur.DatabaseLocked as exc:
+            raise SystemExit(f"{exc} — stop the server before restoring")
+        except dur.CorruptDatabase as exc:
+            raise SystemExit(f"backup rejected: {exc}")
+        print(f"restored {args.db} from {args.restore_from} (generation {gen})")
         return
 
     tokens = load_token_file(args.token_file) if args.token_file else None
@@ -982,6 +1174,8 @@ def main(argv: list[str] | None = None) -> None:
         log.warning("listening on %s without TLS — blinded data and tokens "
                     "travel in the clear; use --tls", args.host)
 
+    if args.backup_keep < 1:
+        raise SystemExit("--backup-keep must be at least 1")
     cfg = ServerConfig(tokens=tokens, max_connections=args.max_connections,
                        idle_timeout=args.idle_timeout,
                        max_frame=args.max_frame_mb * 1024 * 1024,
@@ -994,7 +1188,8 @@ def main(argv: list[str] | None = None) -> None:
     except dur.DatabaseLocked as exc:
         raise SystemExit(str(exc))
     except dur.CorruptDatabase as exc:
-        raise SystemExit(f"{exc} — restore from a backup with --restore-from")
+        raise SystemExit(f"{exc} — refusing to start on damaged data; restore from a "
+                         f"backup with --restore-from")
     host, port = srv.address
     tags = ("  TLS" if ssl_ctx else "") + ("  AUTH" if tokens else "")
     print(f"no-key TorusDB server {SERVER_VERSION} (HOLDS NO KEYS) on "

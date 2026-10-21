@@ -149,8 +149,8 @@ conn = torussql.connect(host, port, token=db_token, vault_path="owner.vault",
 **Does not protect**
 * **An opened vault lives in the owner process's memory.** To unblind results the
   owner needs the masks. Whoever compromises that process while the vault is open
-  sees them. (Making the *masks themselves* threshold-shared, so unblinding is
-  also a quorum operation, is a different architecture — see the roadmap.)
+  sees them. Making the *masks themselves* threshold-shared is available as a separate
+  mode — see `masks.md`.
 * The opener learns the envelope's derived key `K` for that vault (not `x`).
 * `k` colluding custodians reconstruct `x`; nothing can stop them.
 * **Post-quantum:** this mode rests on ECDLP in secp256k1 / BN254. A quantum

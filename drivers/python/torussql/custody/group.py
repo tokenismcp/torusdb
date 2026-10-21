@@ -36,8 +36,7 @@ except ImportError:                                           # pragma: no cover
 _COORD = 32
 
 
-class CustodyError(Exception):
-    """Base class for threshold-custody failures."""
+from ..errors import CustodyError                          # noqa: E402  (shared base)
 
 
 class InvalidPoint(CustodyError):

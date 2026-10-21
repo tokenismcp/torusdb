@@ -106,3 +106,79 @@ def commit_check_weights(x: int, t: int, q: int) -> list[int]:
         w = w * xi % q
         out.append(w)
     return out
+
+
+# ── evaluation at another point & robust (fault-detecting) reconstruction ────
+class InconsistentShares(ValueError):
+    """The supplied shares do not lie on one Laurent series (a holder is faulty
+    or malicious) and no strict majority agrees."""
+
+
+def eval_coeffs(xs: list[int], x_new: int, q: int) -> list[int]:
+    """μᵢ with  y(x_new) = Σ μᵢ·yᵢ  for the degree-(k−1) polynomial in u=1/x
+    through the k known points ``xs``."""
+    us = [inv(x, q) for x in xs]
+    un = inv(x_new, q)
+    out = []
+    for i, ui in enumerate(us):
+        num = den = 1
+        for j, uj in enumerate(us):
+            if j != i:
+                num = num * (un - uj) % q
+                den = den * (ui - uj) % q
+        out.append(num * inv(den, q) % q)
+    return out
+
+
+def robust_reconstruct(shares: list[tuple[int, int]], k: int, q: int,
+                       max_subsets: int = 4000) -> tuple[int, list[int]]:
+    """Residue from ≥ k shares, with fault detection.
+
+    * exactly ``k`` shares: reconstructed, nothing can be cross-checked;
+    * more than ``k``: every extra share must lie on the polynomial. If they do
+      not, the largest mutually consistent group wins provided it is a strict
+      majority and holds at least k+1 shares; the shares outside it are returned
+      as faulty. Otherwise ``InconsistentShares`` is raised — never a guess.
+
+    Returns ``(secret, faulty_xs)``.
+    """
+    import itertools
+    shares = sorted(set(shares))
+    if len({x for x, _ in shares}) != len(shares):
+        raise InconsistentShares("a holder supplied two different shares")
+    m = len(shares)
+    if m < k:
+        raise ValueError(f"need {k} shares, have {m}")
+    if m == k:
+        return reconstruct(shares, q), []
+    best = None                                  # (group_size, secret, bad_xs)
+    groups: dict[int, int] = {}
+    for n_tried, S in enumerate(itertools.combinations(range(m), k)):
+        if n_tried >= max_subsets:
+            break
+        pts = [shares[i] for i in S]
+        xs = [x for x, _ in pts]
+        lam = lambdas(xs, q)
+        secret = sum(lam[x] * y for x, y in pts) % q
+        agree, bad = 0, []
+        for j in range(m):
+            if j in S:
+                continue
+            xj, yj = shares[j]
+            mu = eval_coeffs(xs, xj, q)
+            if sum(c * y for c, (_, y) in zip(mu, pts)) % q == yj % q:
+                agree += 1
+            else:
+                bad.append(xj)
+        size = k + agree
+        groups[secret] = max(groups.get(secret, 0), size)
+        if best is None or size > best[0]:
+            best = (size, secret, bad)
+        if agree == m - k:
+            break                                # everything consistent
+    size, secret, bad = best
+    others = [s for s_, s in groups.items() if s_ != secret]
+    if size < k + 1 or 2 * size <= m or (others and max(others) >= size):
+        raise InconsistentShares(
+            f"{m} shares are mutually inconsistent and no strict majority agrees")
+    return secret, bad

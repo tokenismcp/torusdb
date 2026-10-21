@@ -33,7 +33,8 @@ RUN python -m venv /opt/venv \
 FROM python:3.12-slim
 LABEL org.opencontainers.image.title="torusdb-server" \
       org.opencontainers.image.description="Keyless TorusDB server" \
-      org.opencontainers.image.licenses="Apache-2.0"
+      org.opencontainers.image.licenses="Apache-2.0 AND LicenseRef-TorusDB-Engine-Proprietary" \
+      org.opencontainers.image.description.license-note="Bundles the separately licensed TorusDB engine; do not redistribute the image publicly"
 COPY --from=build /opt/venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH" PYTHONUNBUFFERED=1
 RUN useradd -m -u 1001 torusdb && mkdir /data && chown torusdb /data

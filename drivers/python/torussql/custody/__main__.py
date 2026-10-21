@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import hashlib
 import json
 import logging
 import os
@@ -41,23 +42,43 @@ def _pass(args, prompt="Passphrase: ", confirm=False) -> str | None:
     env = getattr(args, "passphrase_env", None)
     if env:
         v = os.environ.get(env)
-        if v is None:
-            raise SystemExit(f"environment variable {env} is not set")
-        return v or None
+        if not v:
+            raise SystemExit(f"environment variable {env} is not set or empty — "
+                             f"refusing to fall back to an unprotected file "
+                             f"(use --no-passphrase if that is really intended)")
+        return v
     if getattr(args, "no_passphrase", False):
+        print("WARNING: --no-passphrase: the secret file will be stored UNENCRYPTED "
+              "(protect it with disk encryption and permissions)", file=sys.stderr)
         return None
     if not sys.stdin.isatty():
         raise SystemExit("no passphrase source: set --passphrase-env or --no-passphrase")
     v = getpass.getpass(prompt)
+    if not v:
+        raise SystemExit("an empty passphrase is not accepted (use --no-passphrase explicitly)")
     if confirm and getpass.getpass("Repeat: ") != v:
         raise SystemExit("passphrases differ")
-    return v or None
+    return v
 
 
 def _load_ids(path: str):
     d = json.loads(Path(path).read_text())
     g = get_group(d["group"])
-    return g, {int(i): g.from_hex(p["public"]) for i, p in d["participants"].items()}, d
+    pubs = {}
+    for i, p in d["participants"].items():
+        idx = int(i)
+        pt = g.from_hex(p["public"])
+        if g.is_identity(pt):
+            raise SystemExit(f"{path}: participant {idx} has the identity as public key")
+        if "fingerprint" in p and p["fingerprint"] != fingerprint(g, pt):
+            raise SystemExit(f"{path}: participant {idx}'s fingerprint does not match its "
+                             f"public key — the file was tampered with")
+        pubs[idx] = pt
+    if sorted(pubs) != list(range(1, len(pubs) + 1)):
+        raise SystemExit(f"{path}: participant indices must be exactly 1..{len(pubs)}")
+    if len({g.hex(p) for p in pubs.values()}) != len(pubs):
+        raise SystemExit(f"{path}: two participants share a public key")
+    return g, pubs, d
 
 
 def _session(s: str) -> bytes:
@@ -80,11 +101,21 @@ def cmd_ids_merge(a):
         group = group or d["group"]
         if d["group"] != group:
             raise SystemExit("all identities must use the same group")
-        parts[str(d["index"])] = {"public": d["public"], "fingerprint": d["fingerprint"]}
+        g = get_group(group)
+        pt = g.from_hex(d["public"])
+        fp = fingerprint(g, pt)                      # ALWAYS recomputed from the key
+        if d.get("fingerprint") not in (None, fp):
+            raise SystemExit(f"{f}: the stated fingerprint does not match the public key")
+        if str(d["index"]) in parts:
+            raise SystemExit(f"duplicate participant index {d['index']}")
+        parts[str(d["index"])] = {"public": d["public"], "fingerprint": fp}
     Path(a.out).write_text(json.dumps({"group": group, "participants": parts}, indent=1))
-    print(f"wrote {a.out}. COMPARE THESE FINGERPRINTS OUT OF BAND:")
+    _load_ids(a.out)                                 # validates the merged file
+    whole = hashlib.sha256(json.dumps(parts, sort_keys=True).encode()).hexdigest()[:32]
+    print(f"wrote {a.out}. COMPARE THESE (computed from the keys) OUT OF BAND:")
     for i in sorted(parts, key=int):
         print(f"  {i}: {parts[i]['fingerprint']}")
+    print(f"  whole-file digest: {whole}")
 
 
 def cmd_new_session(_a):
@@ -140,17 +171,39 @@ def cmd_public_show(a):
     print(json.dumps({k: v for k, v in pub.to_json().items() if k != "commitments"}, indent=1))
 
 
+def _read_tokens(path: str):
+    """``name:token[:perm,perm]`` lines; perms default to ``key`` (least privilege)."""
+    tokens, perms = {}, {}
+    for n, line in enumerate(Path(path).read_text().splitlines(), 1):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split(":")
+        if len(parts) < 2 or not parts[0] or not parts[1]:
+            raise SystemExit(f"{path}:{n}: expected name:token[:perms]")
+        name, tok = parts[0], parts[1]
+        if name in tokens:
+            raise SystemExit(f"{path}:{n}: duplicate caller {name!r}")
+        tokens[name] = tok
+        if len(parts) > 2:
+            p = {"key", "mask_write", "mask_read", "mask_admin"} if parts[2] == "all" \
+                else set(filter(None, parts[2].split(",")))
+            perms[name] = p
+    return tokens, perms
+
+
 def cmd_serve(a):
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    share_pass = _pass(a, "Share passphrase: ")
-    ks = KeyShare.load(a.share, share_pass)
-    tokens = {}
-    for line in Path(a.token_file).read_text().splitlines():
-        line = line.strip()
-        if line and not line.startswith("#"):
-            name, _, tok = line.partition(":")
-            tokens[name] = tok
-    cust = Custodian(ks, tokens, audit_path=a.audit, rate_per_minute=a.rate)
+    from .net import Limits
+    from .shares import MaskShareStore
+    share_pass = _pass(a, "Share/store passphrase: ")
+    ks = KeyShare.load(a.share, share_pass) if a.share else None
+    masks = MaskShareStore(a.mask_store, share_pass) if a.mask_store else None
+    tokens, perms = _read_tokens(a.token_file)
+    cust = Custodian(ks, tokens, permissions=perms, masks=masks, audit_path=a.audit,
+                     rate_per_minute=a.rate,
+                     limits=Limits(min_aggregate_rows=a.min_aggregate_rows,
+                                   reveal_rows_per_minute=a.reveal_quota))
     ctx = None
     if a.tls:
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
@@ -163,10 +216,13 @@ def cmd_serve(a):
     if host not in ("127.0.0.1", "localhost", "::1") and not a.tls and not a.insecure_no_tls:
         raise SystemExit("refusing a non-loopback listen without --tls (tokens are bearer secrets)")
     srv = CustodianServer(host or "127.0.0.1", int(port), cust, ssl_ctx=ctx)
-    print(f"custodian {ks.index}/{ks.public.n} epoch {ks.epoch} key {ks.public.key_id} "
-          f"on {srv.address[0]}:{srv.address[1]}", flush=True)
+    what = ([f"key share {ks.index}/{ks.public.n} epoch {ks.epoch} key {ks.public.key_id}"] if ks else []) \
+        + (["mask store"] if masks else [])
+    print(f"custodian [{', '.join(what)}] on {srv.address[0]}:{srv.address[1]}", flush=True)
 
     def reload(*_):                      # SIGHUP: pick up a refreshed share file
+        if not a.share:
+            return
         try:
             cust.replace_share(KeyShare.load(a.share, share_pass))
             print(f"reloaded share, epoch {cust.info()['epoch']}", flush=True)
@@ -181,13 +237,71 @@ def cmd_serve(a):
         pass
     finally:
         srv.server_close()
+        if masks:
+            masks.close()
+
+
+# ── mask cluster administration ──────────────────────────────────────────────
+def _cluster(path: str, token_env: str, gen=None):
+    from .masks import ThresholdMaskStore
+    d = json.loads(Path(path).read_text())
+    tok = os.environ.get(token_env or "")
+    if not tok:
+        raise SystemExit("set the caller token in the environment variable named by --token-env")
+    nodes = [RemoteCustodian(n["host"], int(n["port"]), tok, group=None, tls=d.get("tls", False),
+                             cafile=d.get("cafile"), tls_insecure=d.get("tls_insecure", False))
+             for n in d["nodes"]]
+    return ThresholdMaskStore(nodes, int(d["k"]), xs=[int(n["x"]) for n in d["nodes"]], gen=gen)
+
+
+def cmd_mask_init(a):
+    st = _cluster(a.cluster, a.token_env)
+    st.initialize(authenticated=a.authenticated, force=a.force)
+    print(f"mask cluster initialised (k={st.k}, n={st.n}, authenticated={a.authenticated})")
+
+
+def cmd_mask_status(a):
+    st = _cluster(a.cluster, a.token_env)
+    for i, nd in enumerate(st.nodes):
+        try:
+            print(f"x={st.xs[i]} {nd.label}: {json.dumps(nd.call('mask_stats', []))}")
+        except Exception as exc:                                       # noqa: BLE001
+            print(f"x={st.xs[i]} {nd.label}: UNREACHABLE ({exc})")
+
+
+def cmd_mask_repair(a):
+    st = _cluster(a.cluster, a.token_env)
+    st.config()
+    print(st.repair())
+
+
+def cmd_mask_gc(a):
+    import torussql
+    st = _cluster(a.cluster, a.token_env)
+    db_tok = os.environ.get(a.db_token_env or "") if a.db_token_env else None
+    with torussql.connect(a.db_host, a.db_port, token=db_tok, mask_cluster=st,
+                          tls=a.db_tls) as conn:
+        print(conn.mask_gc(min_age=a.min_age, dry_run=a.dry_run))
+
+
+def cmd_mask_reshare(a):
+    from .masks import reshare_masks
+    old = _cluster(a.cluster, a.token_env)
+    new = _cluster(a.new_cluster, a.token_env)
+    res = reshare_masks(old, new.nodes, new.k, new_xs=new.xs)
+    print(f"masks re-shared to generation {res.gen} (k={res.k}, n={res.n}); the old generation "
+          f"is frozen — drop it with the admin RPC mask_drop_gen once clients have moved")
 
 
 def cmd_open_test(a):
     pub = PublicKey.load(a.public)
+    tok = os.environ.get(a.token_env or "")
+    if not tok:
+        raise SystemExit("set the caller token in the environment variable named by --token-env "
+                         "(tokens are never accepted on the command line)")
     custs = []
-    for spec in a.custodian:                 # host:port:token
-        host, port, tok = spec.split(":", 2)
+    for spec in a.custodian:                 # host:port
+        host, _, port = spec.rpartition(":")
         custs.append(RemoteCustodian(host, int(port), tok, group=pub.g, tls=a.tls,
                                      cafile=a.cafile, tls_insecure=a.tls_insecure))
     K, hdr = wrap_key(pub, b"open-test")
@@ -254,13 +368,19 @@ def main(argv=None):
     p.add_argument("--out", required=True)
     p = add("share-check", cmd_share_check); p.add_argument("--share", required=True)
     p = add("public-show", cmd_public_show); p.add_argument("--public", required=True)
-    p = add("serve", cmd_serve); p.add_argument("--share", required=True)
+    p = add("serve", cmd_serve); p.add_argument("--share", help="key share file (optional)")
+    p.add_argument("--mask-store", help="mask share store file (enables the mask service)")
+    p.add_argument("--min-aggregate-rows", type=int, default=1)
+    p.add_argument("--reveal-quota", type=int, default=None,
+                   help="max mask cells returned per caller per minute")
     p.add_argument("--listen", default="127.0.0.1:8601"); p.add_argument("--token-file", required=True)
     p.add_argument("--audit"); p.add_argument("--rate", type=int, default=30)
     p.add_argument("--tls", action="store_true"); p.add_argument("--cert"); p.add_argument("--key")
     p.add_argument("--cafile"); p.add_argument("--insecure-no-tls", action="store_true")
     p = add("open-test", cmd_open_test); p.add_argument("--public", required=True)
-    p.add_argument("--custodian", action="append", required=True, metavar="HOST:PORT:TOKEN")
+    p.add_argument("--custodian", action="append", required=True, metavar="HOST:PORT")
+    p.add_argument("--token-env", required=True, metavar="VAR",
+                   help="environment variable holding the caller token")
     p.add_argument("--tls", action="store_true"); p.add_argument("--cafile")
     p.add_argument("--tls-insecure", action="store_true")
     for name, fn in (("reshare-start", cmd_reshare_start), ("reshare-finish", cmd_reshare_finish)):
@@ -274,6 +394,21 @@ def main(argv=None):
         else:
             p.add_argument("--old-ids", required=True); p.add_argument("--inbox", required=True)
             p.add_argument("--out", required=True); p.add_argument("--public-out", required=True)
+    for name, fn in (("mask-init", cmd_mask_init), ("mask-status", cmd_mask_status),
+                     ("mask-repair", cmd_mask_repair), ("mask-gc", cmd_mask_gc),
+                     ("mask-reshare", cmd_mask_reshare)):
+        p = add(name, fn)
+        p.add_argument("--cluster", required=True, help="cluster.json (k, nodes[host,port,x], tls)")
+        p.add_argument("--token-env", required=True, metavar="VAR")
+        if name == "mask-init":
+            p.add_argument("--authenticated", action="store_true")
+            p.add_argument("--force", action="store_true")
+        if name == "mask-gc":
+            p.add_argument("--db-host", required=True); p.add_argument("--db-port", type=int, default=8533)
+            p.add_argument("--db-token-env"); p.add_argument("--db-tls", action="store_true")
+            p.add_argument("--min-age", type=int, default=3600); p.add_argument("--dry-run", action="store_true")
+        if name == "mask-reshare":
+            p.add_argument("--new-cluster", required=True)
     args = ap.parse_args(argv)
     try:
         args.fn(args)

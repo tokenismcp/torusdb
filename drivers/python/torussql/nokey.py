@@ -12,7 +12,7 @@ PEP 249 usage:
     cur.execute("CREATE TABLE t (id INT PLAIN, v RATIONAL ENC)")
     cur.execute("INSERT INTO t (id, v) VALUES (%s, FRAC(%s,1))", (1, 8000))
     cur.execute("SELECT SUM(v) FROM t")
-    print(cur.fetchall())    # [[Fraction(8000, 1)]]
+    print(cur.fetchall())    # [(8000,)]   (an int when the value is integral)
     conn.close()
 
 Legacy one-shot API (backward compat):
@@ -22,6 +22,8 @@ Legacy one-shot API (backward compat):
 from __future__ import annotations
 
 import json
+import os
+import secrets
 import socket
 import ssl
 import sys
@@ -128,6 +130,18 @@ def _translate_error(exc: Exception) -> DatabaseError:
 # ── wire transport ────────────────────────────────────────────────────────────
 
 PROTOCOL_VERSION = 2          # newest wire protocol this driver speaks
+_LOOPBACK = {"127.0.0.1", "::1", "localhost"}
+
+
+class ConnectionLost(OperationalError):
+    """The transport failed (the server may or may not have processed the last
+    request). Distinct from an error the server *answered* with."""
+
+
+class TransactionInDoubt(OperationalError):
+    """COMMIT was sent but its outcome could not be learned (connection lost and
+    the server unreachable). The vault keeps both possibilities; the next
+    connection to the same vault asks the server and settles it."""
 
 
 class _Conn:
@@ -140,35 +154,46 @@ class _Conn:
                  certfile: str | None = None,
                  keyfile: str | None = None,
                  tls_insecure: bool = False,
-                 token: str | None = None):
+                 token: str | None = None,
+                 allow_insecure_token: bool = False):
+        if token is not None and not tls and host not in _LOOPBACK and not allow_insecure_token:
+            raise InterfaceError(
+                "refusing to send an API token over an unencrypted connection to a "
+                "non-loopback host — use tls=True (or allow_insecure_token=True if the "
+                "network is trusted)")
+        self.closed = True            # until fully set up (so close() is always safe)
+        self._sock = self._rf = self._wf = None
+        self._lock = threading.Lock()
+        self.server_info: dict = {}
         try:
             sock = socket.create_connection((host, port), timeout=timeout)
         except OSError as exc:
             raise OperationalError(f"cannot connect to {host}:{port}: {exc}") from exc
-        if tls:
-            if tls_insecure:
-                # explicit opt-in only: encrypted but UNAUTHENTICATED peer
-                ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-                ctx.check_hostname = False
-                ctx.verify_mode = ssl.CERT_NONE
-            else:
-                # verify the server certificate and hostname (system CAs, or
-                # `cafile` when given)
-                ctx = ssl.create_default_context(cafile=cafile)
-            ctx.minimum_version = ssl.TLSVersion.TLSv1_2
-            if certfile:
-                ctx.load_cert_chain(certfile, keyfile)
-            try:
+        try:
+            if tls:
+                if tls_insecure:
+                    # explicit opt-in only: encrypted but UNAUTHENTICATED peer
+                    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+                    ctx.check_hostname = False
+                    ctx.verify_mode = ssl.CERT_NONE
+                else:
+                    ctx = ssl.create_default_context(cafile=cafile)
+                ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+                if certfile:
+                    ctx.load_cert_chain(certfile, keyfile)
                 sock = ctx.wrap_socket(sock, server_hostname=host)
-            except (ssl.SSLError, OSError) as exc:
-                sock.close()
-                raise OperationalError(f"TLS handshake failed: {exc}") from exc
+        except (ssl.SSLError, OSError) as exc:
+            sock.close()
+            if isinstance(exc, (FileNotFoundError, PermissionError)):
+                raise InterfaceError(f"cannot read TLS file: {exc}") from exc
+            raise OperationalError(f"TLS handshake failed: {exc}") from exc
+        except BaseException:
+            sock.close()
+            raise
         self._sock = sock
         self._rf = sock.makefile("rb")
         self._wf = sock.makefile("wb")
-        self._lock = threading.Lock()
         self.closed = False
-        self.server_info: dict = {}
         try:
             self._handshake(token)
         except BaseException:
@@ -203,10 +228,10 @@ class _Conn:
                 payload = read_frame(self._rf)
             except (OSError, ssl.SSLError, EOFError, ValueError) as exc:
                 self.close()
-                raise OperationalError(f"connection lost: {exc}") from exc
+                raise ConnectionLost(f"connection lost: {exc}") from exc
         if payload is None:
             self.close()
-            raise OperationalError("server closed the connection")
+            raise ConnectionLost("server closed the connection")
         resp = json.loads(payload)
         if "err" in resp:
             raise _translate_error(Exception(resp["err"]))
@@ -214,10 +239,12 @@ class _Conn:
 
     def close(self):
         self.closed = True
-        try:
-            self._rf.close(); self._wf.close(); self._sock.close()
-        except OSError:
-            pass
+        for o in (self._wf, self._rf, self._sock):       # each independently: one
+            try:                                           # failing flush must not
+                if o is not None:                          # leak the socket
+                    o.close()
+            except (OSError, ValueError):
+                pass
 
 
 # ── remote server proxy ───────────────────────────────────────────────────────
@@ -294,14 +321,66 @@ def _sql_literal(v) -> str:
     if isinstance(v, int):
         return str(v)
     if isinstance(v, float):
-        # represent as FRAC with integer num/den
-        f = Fraction(v).limit_denominator(10 ** 9)
-        return f"FRAC({f.numerator},{f.denominator})"
+        if v != v or v in (float("inf"), float("-inf")):
+            raise InterfaceError("NaN / infinity cannot be stored")
+        f = Fraction(v)                 # EXACT binary value — never silently rounded;
+        return f"FRAC({f.numerator},{f.denominator})"   # absurd magnitudes fail loudly (OutOfBudget)
     if isinstance(v, Fraction):
         return f"FRAC({v.numerator},{v.denominator})"
     if isinstance(v, str):
         return "'" + v.replace("'", "''") + "'"
     raise InterfaceError(f"unsupported parameter type: {type(v).__name__}")
+
+
+def _substitute(operation: str, literals: tuple) -> str:
+    """DB-API 'format' substitution done by a scanner, not by ``%``:
+    ``%s`` takes the next parameter, ``%%`` is a literal percent, anything else
+    after a ``%`` is an error. A placeholder inside a quoted string is refused —
+    quoting a parameter is the classic injection mistake (the driver already
+    quotes string parameters)."""
+    out, i, n, used = [], 0, len(operation), 0
+    in_str = False
+    while i < n:
+        ch = operation[i]
+        if in_str:
+            if ch == "'":
+                if operation[i + 1:i + 2] == "'":
+                    out.append("''"); i += 2; continue
+                in_str = False
+            elif ch == "%":
+                nxt = operation[i + 1:i + 2]
+                if nxt == "s":
+                    raise ProgrammingError(
+                        "a placeholder inside a quoted string is not supported — write %s "
+                        "without quotes (string parameters are quoted for you)")
+                if nxt == "%":                       # escaped percent, even inside a string
+                    out.append("%"); i += 2; continue
+            out.append(ch); i += 1; continue
+        if ch == "'":
+            in_str = True; out.append(ch); i += 1; continue
+        if ch == "-" and operation[i:i + 2] == "--":          # comment: verbatim
+            j = operation.find("\n", i)
+            j = n if j < 0 else j
+            out.append(operation[i:j]); i = j; continue
+        if ch == "/" and operation[i:i + 2] == "/*":
+            j = operation.find("*/", i + 2)
+            j = n if j < 0 else j + 2
+            out.append(operation[i:j]); i = j; continue
+        if ch == "%":
+            nxt = operation[i + 1:i + 2]
+            if nxt == "s":
+                if used >= len(literals):
+                    raise ProgrammingError("not enough parameters for the %s placeholders")
+                out.append(literals[used]); used += 1; i += 2; continue
+            if nxt == "%":
+                out.append("%"); i += 2; continue
+            raise ProgrammingError(
+                f"unsupported placeholder %{nxt!s} — only %s and %% are allowed "
+                f"(paramstyle 'format')")
+        out.append(ch); i += 1
+    if used != len(literals):
+        raise ProgrammingError(f"{len(literals)} parameters supplied for {used} placeholders")
+    return "".join(out)
 
 
 class Cursor:
@@ -323,6 +402,7 @@ class Cursor:
     def execute(self, operation: str, parameters=None) -> "Cursor":
         if self._connection is None:
             raise InterfaceError("cursor is closed")
+        self._clear()                       # a failed execute must not leave stale rows
         sql = self._apply_params(operation, parameters)
         try:
             result = self._connection._run(sql)
@@ -338,15 +418,24 @@ class Cursor:
         one table is blinded locally and sent in a single round trip."""
         if self._connection is None:
             raise InterfaceError("cursor is closed")
+        self._clear()
         sqls = [self._apply_params(operation, p) for p in seq_of_parameters]
         if sqls and operation.lstrip()[:6].upper() == "INSERT":
             n = self._connection._run_insert_many(sqls)
             self.description, self._rows, self._pos, self.rowcount = None, [], 0, n
             return
         total = 0
-        for sql in sqls:
-            self._load(self._connection._run(sql))
-            total += max(self.rowcount, 0)
+
+        def run_all():
+            nonlocal total
+            for sql in sqls:
+                self._load(self._connection._run(sql))
+                total += max(self.rowcount, 0)
+        if len(sqls) > 1 and not self._connection._in_tx:
+            with self._connection.transaction():            # all-or-nothing batch
+                run_all()
+        else:
+            run_all()
         self.rowcount = total
 
     # ── fetching ───────────────────────────────────────────────────────────
@@ -398,20 +487,22 @@ class Cursor:
 
     # ── internals ─────────────────────────────────────────────────────────
 
+    def _clear(self) -> None:
+        self.description, self._rows, self._pos, self.rowcount = None, [], 0, -1
+
     @staticmethod
     def _apply_params(operation: str, parameters) -> str:
         if parameters is None:
-            return operation
+            return operation                  # no parameters: '%' is just a character
+        if isinstance(parameters, (dict, str, bytes)):
+            raise InterfaceError("parameters must be a sequence (paramstyle 'format')")
         try:
             literals = tuple(_sql_literal(v) for v in parameters)
-        except InterfaceError:
+        except Error:
             raise
         except Exception as exc:
             raise InterfaceError(f"parameter error: {exc}") from exc
-        try:
-            return operation % literals
-        except TypeError as exc:
-            raise InterfaceError(f"parameter substitution failed: {exc}") from exc
+        return _substitute(operation, literals)
 
     def _load(self, result) -> None:
         if hasattr(result, "rows"):
@@ -458,26 +549,83 @@ class Connection:
                  keyfile: str | None = None,
                  tls_insecure: bool = False,
                  token: str | None = None,
+                 allow_insecure_token: bool = False,
                  vault_path: str | None = None,
                  vault_passphrase: str | None = None,
                  vault_custody=None,
+                 mask_cluster=None,
                  sync_schema: bool = True,
+                 trust_server_schema: bool = False,
                  timeout: float | None = 30.0):
-        self._wire = _Conn(host, port, timeout=timeout, tls=tls,
-                           cafile=cafile, certfile=certfile, keyfile=keyfile,
-                           tls_insecure=tls_insecure, token=token)
+        if mask_cluster is not None and (vault_path or vault_passphrase or vault_custody):
+            raise ProgrammingError(
+                "mask_cluster replaces the local vault — do not combine it with "
+                "vault_path / vault_passphrase / vault_custody")
+        if vault_path:
+            vault_path = os.path.expanduser(vault_path)
+            Path(vault_path).parent.mkdir(parents=True, exist_ok=True)
+        self._wire_args = dict(timeout=timeout, tls=tls, cafile=cafile, certfile=certfile,
+                               keyfile=keyfile, tls_insecure=tls_insecure, token=token,
+                               allow_insecure_token=allow_insecure_token)
+        self._host, self._port = host, port
+        self._wire = _Conn(host, port, **self._wire_args)
+        self._trust_server_schema = trust_server_schema
         self._closed = False
         self._in_tx = False
+        self._txid: str | None = None
+        self._tx_failed: str | None = None       # set when a statement failed mid-transaction
+        self._vault = None
+        self.client = None
         try:
             self.client = NoKeyClient(RemoteNoKeyServer(self._wire),
-                                      authenticated=authenticated)
+                                      authenticated=authenticated,
+                                      maskstore=mask_cluster)
+            if mask_cluster is not None:
+                if authenticated and not self.client.authenticated:
+                    raise ProgrammingError(
+                        "authenticated=True but the mask cluster was initialised "
+                        "without integrity protection")
+                sync_schema = True            # a stateless owner re-learns the schema
             self._vault = VaultLog(vault_path, vault_passphrase, vault_custody)
-            self._vault.open_into(self.client)
+            existing = self._vault.open_into(self.client)
+            if authenticated and existing and not self.client.authenticated:
+                raise ProgrammingError(
+                    "authenticated=True, but this vault was created without integrity "
+                    "protection (MAC) and its tables carry no MACs — refusing to silently "
+                    "run unprotected; use a new vault for authenticated mode")
+            for txid in list(self._vault.in_doubt):          # settle a lost COMMIT
+                self._settle(txid)
             if sync_schema:
                 self.sync_schema()
         except BaseException:
-            self._wire.close()
+            self._cleanup()
             raise
+
+    def _cleanup(self) -> None:
+        """Release everything on a failed construction / close (never raises)."""
+        self._closed = True
+        for closer in (getattr(self._vault, "close", None),
+                       getattr(getattr(self.client, "maskstore", None), "close", None),
+                       self._wire.close):
+            try:
+                if closer:
+                    closer()
+            except Exception:                                    # noqa: BLE001
+                pass
+
+    def _settle(self, txid: str) -> None:
+        """Ask the server what became of a transaction whose COMMIT reply was
+        lost, then make the vault agree with the answer."""
+        try:
+            status = self._wire.call("tx_status", [txid])
+        except Error as exc:
+            raise TransactionInDoubt(
+                f"transaction {txid} is unresolved and the server cannot say how it "
+                f"ended ({exc}); the vault is kept as is — retry once the server "
+                f"supports tx_status") from exc
+        if status == "open":
+            raise TransactionInDoubt(f"transaction {txid} is still open on the server")
+        self._vault.resolve_in_doubt(self.client, txid, status == "committed")
 
     # ── PEP 249 interface ─────────────────────────────────────────────────
 
@@ -496,15 +644,16 @@ class Connection:
             self._end_tx(commit=False)
 
     def close(self) -> None:
-        if not self._closed:
+        if self._closed:
+            return
+        try:
             if self._in_tx:                      # never leave a tx dangling
                 try:
                     self._end_tx(commit=False)
                 except Error:
                     pass
-            self._closed = True
-            self._vault.close()
-            self._wire.close()
+        finally:
+            self._cleanup()
 
     def _check_open(self) -> None:
         if self._closed:
@@ -514,7 +663,10 @@ class Connection:
         """Learn tables that exist on the server but not in this client yet
         (e.g. a second reader, or a fresh vault). Only the schema is fetched —
         decrypting encrypted columns still requires the owner's vault.
-        Returns the newly learned table names."""
+        Tables learned this way are READ-ONLY for the client unless the
+        connection was opened with ``trust_server_schema=True``: a malicious
+        server could relabel an encrypted column as plain and so receive
+        plaintext on INSERT/UPDATE. Returns the newly learned table names."""
         self._check_open()
         added = []
         for t in self._wire.call("tables", []):
@@ -522,6 +674,8 @@ class Connection:
                 continue
             cols = [tuple(c) for c in self._wire.call("schema", [t])]
             self.client._schema[t] = cols
+            if not self._trust_server_schema:
+                self.client._untrusted.add(t)
             for (name, typ, pol) in cols:
                 dict.__setitem__(self.client._coltype, (t, name), typ)
                 dict.__setitem__(self.client._colpolicy, (t, name), pol)
@@ -538,28 +692,88 @@ class Connection:
         self._check_open()
         if self._in_tx:
             raise ProgrammingError("a transaction is already open")
-        self._vault.tx_begin(self.client)
+        txid = secrets.token_hex(16)
+        self._vault.tx_begin(self.client, txid)       # provisional marker BEFORE the server
         try:
-            self._wire.call("tx_begin", [])
+            self._wire.call("tx_begin", [txid])
         except BaseException:
-            self._vault.tx_commit()              # nothing happened: drop undo
+            self._vault.tx_rollback(self.client)       # tx_begin failed ⇒ no tx exists
             raise
-        self._in_tx = True
+        self._in_tx, self._txid, self._tx_failed = True, txid, None
+
+    def _abort_local(self) -> None:
+        """The server has (definitively) rolled the transaction back."""
+        if self._in_tx:
+            self._in_tx, self._txid, self._tx_failed = False, None, None
+            self._vault.tx_rollback(self.client)
 
     def _end_tx(self, *, commit: bool) -> None:
+        txid = self._txid
+        if commit and self._tx_failed:
+            reason = self._tx_failed
+            self._rollback_best_effort()
+            raise ProgrammingError(f"the transaction was aborted by an earlier error "
+                                   f"({reason}); it has been rolled back")
         try:
             self._wire.call("tx_commit" if commit else "tx_rollback", [])
+        except ConnectionLost as exc:
+            self._on_lost_reply(commit, txid, exc)         # indeterminate COMMIT
+            return
         except Error:
-            # the server did not commit (error, timeout, lost connection):
-            # the only safe client state is the pre-transaction one
-            self._in_tx = False
-            self._vault.tx_rollback(self.client)
+            # the server ANSWERED with an error (e.g. "timed out and was rolled back",
+            # "no transaction is open"): it holds no transaction ⇒ roll the vault back
+            self._abort_local()
             raise
-        self._in_tx = False
+        self._in_tx, self._txid, self._tx_failed = False, None, None
         if commit:
             self._vault.tx_commit()
         else:
             self._vault.tx_rollback(self.client)
+
+    def _rollback_best_effort(self) -> None:
+        try:
+            self._wire.call("tx_rollback", [])
+        except Error:
+            pass
+        self._abort_local()
+
+    def _on_lost_reply(self, commit: bool, txid: str, exc: Exception) -> None:
+        """COMMIT/ROLLBACK was sent but the reply never arrived."""
+        if not commit:
+            self._abort_local()           # the server rolls back on disconnect
+            raise exc
+        # reconnect and ask the server how the transaction ended
+        try:
+            fresh = _Conn(self._host, self._port, **self._wire_args)
+        except Error:
+            self._in_tx = False
+            self._vault.tx_in_doubt()
+            self._closed = True
+            self._vault.close()           # leaves the open `txb`; next connect settles it
+            raise TransactionInDoubt(
+                f"COMMIT of transaction {txid} was sent but the connection was lost and "
+                f"the server is unreachable. Its outcome is unknown; the vault keeps both "
+                f"possibilities and will settle it with the server on the next connect") from exc
+        try:
+            status = fresh.call("tx_status", [txid])
+        except Error:
+            fresh.close()
+            self._in_tx = False
+            self._vault.tx_in_doubt()
+            self._closed = True
+            self._vault.close()
+            raise TransactionInDoubt(
+                f"COMMIT of transaction {txid}: outcome unknown (server cannot report it)") from exc
+        self._wire.close()
+        self._wire = fresh
+        self.client.server._c = fresh
+        self._in_tx, self._txid, self._tx_failed = False, None, None
+        if status == "committed":
+            self._vault.tx_commit()       # it did commit: keep the new masks
+            return
+        self._vault.tx_rollback(self.client)
+        raise OperationalError(f"COMMIT of transaction {txid} did not take effect "
+                               f"(connection lost before it was processed); rolled back") from exc
 
     def transaction(self):
         """``with conn.transaction():`` — commit on success, roll back on error."""
@@ -567,21 +781,35 @@ class Connection:
 
     # ── statement execution (shared by Cursor and Connection.execute) ─────
 
+    _PLANNING_ERRORS = ("ParseError", "PlanError", "ValidationError")
+
+    @staticmethod
+    def _statement_kind(sql: str) -> str:
+        """Kind from the parsed statement (not from the first word: a leading
+        comment must not change how a statement is treated)."""
+        try:
+            from torussql_parser.parser import parse
+            return type(parse(sql)).__name__
+        except Exception:                                            # noqa: BLE001
+            return ""                      # the engine will raise the proper error
+
     def _run(self, sql: str):
         self._check_open()
-        words = sql.split(None, 1)
-        kind = words[0].upper() if words else ""
+        if self._in_tx and self._tx_failed:
+            raise ProgrammingError(
+                f"the current transaction was aborted by an earlier error "
+                f"({self._tx_failed}); issue ROLLBACK")
+        kind = self._statement_kind(sql)
         try:
-            if kind == "SELECT":
+            if kind == "Select":
                 return self.client.execute(sql)
-            implicit = kind == "UPDATE" and not self._in_tx
+            implicit = kind == "Update" and not self._in_tx
             if implicit:
                 self.begin()
             try:
                 result = self.client.execute(sql)
-            except BaseException:
-                if implicit:
-                    self.rollback()
+            except BaseException as exc:
+                self._on_statement_error(exc, implicit)
                 raise
             if implicit:
                 self.commit()
@@ -593,8 +821,29 @@ class Connection:
         except Exception as exc:
             raise _translate_error(exc) from exc
 
+    def _on_statement_error(self, exc: BaseException, implicit: bool) -> None:
+        if isinstance(exc, ConnectionLost):
+            # the server drops an open transaction when the connection dies
+            self._abort_local()
+            self._cleanup()
+            return
+        if isinstance(exc, ServerBusyError) and "timed out" in str(exc):
+            self._abort_local()            # the server rolled it back: forget it NOW
+            return
+        if implicit:
+            try:
+                self.rollback()
+            except Error:
+                pass
+        elif self._in_tx and type(exc).__name__ not in self._PLANNING_ERRORS:
+            # a statement may have half-applied: like PostgreSQL, the transaction can
+            # only be rolled back from here
+            self._tx_failed = f"{type(exc).__name__}: {str(exc)[:120]}"
+
     def _run_insert_many(self, sqls: list[str]) -> int:
         self._check_open()
+        if self._in_tx and self._tx_failed:
+            raise ProgrammingError(f"the current transaction was aborted ({self._tx_failed})")
         try:
             n = self.client.insert_many(sqls)
             if not self._in_tx:
@@ -602,8 +851,11 @@ class Connection:
             return n
         except DatabaseError:
             raise
-        except Exception as exc:
-            raise _translate_error(exc) from exc
+        except BaseException as exc:
+            self._on_statement_error(exc, False)
+            if isinstance(exc, Exception):
+                raise _translate_error(exc) from exc
+            raise
 
     # ── convenience / legacy API ──────────────────────────────────────────
 
@@ -660,31 +912,55 @@ class Connection:
         self._vault.reseal(self.client, custody=custody, passphrase=vault_passphrase)
 
     def find_orphans(self) -> dict[str, list[int]]:
-        """Rows on the server that this vault cannot decrypt (a crash between
-        the server accepting an INSERT and the vault recording its mask).
-        They are invisible to correct reads only if removed — see
-        ``repair_orphans``."""
+        """Rows whose masks cannot be recovered (a crash between the server
+        accepting a write and the masks being durable — or a different vault).
+        Raises if the masks are merely *unreachable*: absent ≠ unreachable."""
         self._check_open()
+        ms = self.client.maskstore
         orphans: dict[str, list[int]] = {}
         for table, cols in self.client._schema.items():
             enc = [c for (c, _t, pol) in cols if pol != "plain"]
             if not enc:
                 continue
+            if self.client.authenticated:
+                enc += ["__mac__" + c for c in enc]
             info = self._wire.call("table_info", [table])
             dead = set(info["deleted"])
-            bad = [i for i in range(info["rows"])
-                   if i not in dead and any(
-                       (table, i, c) not in self.client._masks for c in enc)]
+            live = [i for i in range(info["rows"]) if i not in dead]
+            bad: set[int] = set()
+            for c in enc:
+                ok = ms.available(table, c, live)
+                bad |= {i for i, a in zip(live, ok) if not a}
             if bad:
-                orphans[table] = bad
+                orphans[table] = sorted(bad)
         return orphans
 
-    def repair_orphans(self) -> int:
-        """Tombstone every orphan row; returns how many were removed."""
+    def repair_orphans(self, *, max_fraction: float = 0.5) -> int:
+        """Tombstone every orphan row; returns how many were removed. Refuses
+        when more than ``max_fraction`` of a table would go (that points at a
+        wrong vault / mask cluster, not at crash leftovers)."""
         n = 0
         for table, ids in self.find_orphans().items():
+            info = self._wire.call("table_info", [table])
+            live = info["rows"] - len(info["deleted"])
+            if live and len(ids) / live > max_fraction:
+                raise ProgrammingError(
+                    f"{len(ids)} of {live} rows in {table!r} have no recoverable mask — "
+                    f"this looks like the wrong vault or mask cluster, not crash "
+                    f"leftovers; refusing to delete them")
             n += self._wire.call("delete_rows", [table, ids])
         return n
+
+    # — threshold mask cluster maintenance (mask_cluster= connections) —
+    def mask_gc(self, **kw) -> dict:
+        """Delete masks no committed row refers to (needs ``mask_admin``)."""
+        self._check_open()
+        return self.client.maskstore.gc(**kw)
+
+    def mask_repair(self, **kw) -> dict:
+        """Restore shares a custodian missed while it was down."""
+        self._check_open()
+        return self.client.maskstore.repair(**kw)
 
     def __enter__(self) -> "Connection":
         return self
@@ -721,10 +997,13 @@ def connect(host: str = "127.0.0.1", port: int = 8533, *,
             keyfile: str | None = None,
             tls_insecure: bool = False,
             token: str | None = None,
+            allow_insecure_token: bool = False,
             vault_path: str | None = None,
             vault_passphrase: str | None = None,
             vault_custody=None,
+            mask_cluster=None,
             sync_schema: bool = True,
+            trust_server_schema: bool = False,
             timeout: float | None = 30.0) -> Connection:
     """Open a PEP 249 connection to a no-key TorusDB server.
 
@@ -736,18 +1015,30 @@ def connect(host: str = "127.0.0.1", port: int = 8533, *,
             to skip verification for local development only.
         cafile: CA certificate file for server verification
         certfile / keyfile: client certificate for mutual TLS
-        token: API token when the server runs with ``--token-file``
+        token: API token when the server runs with ``--token-file``. Sending it
+            over an unencrypted connection to a non-loopback host is refused
+            unless ``allow_insecure_token=True``
         vault_path: persist the mask vault here (append-only, 0600)
         vault_passphrase: seal the vault file under a passphrase
         vault_custody: seal the vault under a THRESHOLD key
             (``torussql.custody.ThresholdCustody``): a quorum of custodians is
             needed to open it, and the key is never reassembled
+        mask_cluster: hold NO local vault: the masks are secret-shared among the
+            custodians of a ``torussql.custody.masks.ThresholdMaskStore`` (k-of-n);
+            this process is then stateless
         sync_schema: learn tables that exist on the server (schema only)
+        trust_server_schema: allow INSERT/UPDATE on tables whose column policies
+            were learned from the server (default: they are read-only, because a
+            malicious server could relabel an encrypted column "plain"). Tables
+            created through / restored from this client's vault are always
+            trusted. A stateless ``mask_cluster`` owner needs this flag.
         timeout: socket timeout in seconds (default 30; None = block forever)
     """
     return Connection(host, port, authenticated=authenticated,
                       tls=tls, cafile=cafile, certfile=certfile,
                       keyfile=keyfile, tls_insecure=tls_insecure, token=token,
+                      allow_insecure_token=allow_insecure_token,
                       vault_path=vault_path, vault_passphrase=vault_passphrase,
-                      vault_custody=vault_custody,
-                      sync_schema=sync_schema, timeout=timeout)
+                      vault_custody=vault_custody, mask_cluster=mask_cluster,
+                      sync_schema=sync_schema, trust_server_schema=trust_server_schema,
+                      timeout=timeout)

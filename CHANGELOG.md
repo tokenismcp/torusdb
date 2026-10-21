@@ -11,6 +11,23 @@ Versioning: [Versioning Policy](docs/versioning.md).
 Hardening release: SQL joins completed, server and drivers made operable, a
 cryptographic self-audit, and the open repository made self-contained.
 
+### Added — threshold masks and full audit (late 0.5.0)
+
+- **Threshold mask custody** (`docs/masks.md`): per-cell masks shared k-of-n
+  among custodians; aggregates unblinded from partial sums; stateless owner;
+  `mask-init/status/gc/repair/reshare` operator tools.
+- **Schema trust anchor:** tables learned from the server are read-only unless
+  `trust_server_schema=True` (a hostile server could relabel an encrypted
+  column as plain).
+- Unified `RecordLog` (journal/vault/mask stores): failed appends truncated,
+  torn tail vs corruption distinguished, sequence-numbered, header-bound AAD.
+- Transaction ids, `tx_status`, vault tx markers: a lost COMMIT reply no longer
+  loses masks (`TransactionInDoubt` when it cannot be resolved).
+- Server/SQL fixes from five independent audits (differential fuzz vs SQLite,
+  validator/planner fuzz, tx fuzz, protocol attacks, claims verification):
+  NULL-safe predicates, AVG on PLAIN, scalar bound, DDL parity, `__` reserved
+  names, row-id validation, parameter-scanner `%%`, CI artifact leak, and more.
+
 ### Added — SQL dialect v0.5 (`spec/TorusSQL-Spec-v0.5.md`)
 
 - Table **aliases** (`FROM emp e`), **self-joins**, **any number of joins**,

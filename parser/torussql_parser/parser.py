@@ -40,10 +40,10 @@ _TOK_RE = re.compile(r"""
     \s+                         |
     --[^\n]*                    |
     /\*.*?\*/                   |
-    (?P<num>-?\d+)              |
+    (?P<num>-?[0-9]+)           |
     (?P<str>'(?:[^']|'')*')     |
     (?P<id>[A-Za-z_][A-Za-z_0-9]*) |
-    (?P<sym>==|!=|<>|<=|>=|[(),*=<>?.])
+    (?P<sym>==|!=|<>|<=|>=|[(),*=<>?.;])
 """, re.VERBOSE | re.DOTALL)
 
 
@@ -62,7 +62,10 @@ def _tokenise(sql: str) -> list[Tok]:
         if not m:
             raise ParseError(f"unexpected char at {i}: {sql[i:i+10]!r}")
         if m.group("num"):
-            toks.append(Tok("num", int(m.group("num")), i))
+            try:
+                toks.append(Tok("num", int(m.group("num")), i))
+            except ValueError:
+                raise ParseError(f"integer literal at {i} is too long") from None
         elif m.group("str"):
             s = m.group("str")[1:-1].replace("''", "'")
             toks.append(Tok("str", s, i))
@@ -106,7 +109,11 @@ class _P:
 
 def parse(sql: str) -> Query:
     """Parse one TorusSQL statement into an AST node."""
-    toks = _tokenise(sql.strip().rstrip(";"))
+    toks = _tokenise(sql)
+    if toks and toks[-1].kind == "sym" and toks[-1].value == ";":
+        toks.pop()                                   # one optional trailing ';'
+    if any(t.kind == "sym" and t.value == ";" for t in toks):
+        raise ParseError("only one statement per call (found ';' inside the statement)")
     if not toks:
         raise ParseError("empty SQL")
     p = _P(toks)
@@ -151,7 +158,10 @@ def _parse_create(p: _P) -> CreateTable:
 
 def _parse_drop(p: _P) -> DropTable:
     p.eat(kind="id", value="TABLE")
-    return DropTable(name=p.eat(kind="id").value)
+    name = p.eat(kind="id").value
+    if not p.eof():
+        raise ParseError("trailing tokens after DROP TABLE")
+    return DropTable(name=name)
 
 
 def _parse_insert(p: _P) -> Insert:
@@ -176,6 +186,10 @@ def _parse_insert(p: _P) -> Insert:
     p.eat(kind="sym", value=")")
     if len(cols) != len(vals):
         raise ParseError("column/value count mismatch")
+    if len(set(cols)) != len(cols):
+        raise ParseError("duplicate column in INSERT")
+    if not p.eof():
+        raise ParseError("trailing tokens after INSERT")
     return Insert(table=table, columns=cols, values=vals)
 
 
@@ -196,6 +210,8 @@ def _parse_update(p: _P) -> Update:
         where = _parse_where(p)
     if not p.eof():
         raise ParseError("trailing tokens in UPDATE")
+    if len({c for c, _ in assignments}) != len(assignments):
+        raise ParseError("duplicate column in UPDATE SET")
     return Update(table=table, assignments=assignments, where=where)
 
 

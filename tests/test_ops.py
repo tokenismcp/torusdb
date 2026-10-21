@@ -37,6 +37,7 @@ class Running:
         self.t.start()
 
     def connect(self, **kw):
+        kw.setdefault("trust_server_schema", True)      # these tests vouch for the schema
         return torussql.connect(self.host, self.port, **kw)
 
     def stop(self):
@@ -438,8 +439,9 @@ def test_clean_shutdown_checkpoints_and_empties_journal(tmp_path):
         c.execute("INSERT INTO t (x) VALUES (1)")
     s.stop()
     assert Path(db).exists()
-    assert Path(db + ".journal").stat().st_size == 0
-    body, gen = dur.read_snapshot(db)
+    from torussql.recordlog import RecordLog
+    assert list(RecordLog(db + ".journal", dur.JOURNAL_MAGIC).open()) == []   # fully folded
+    body, gen, _extra = dur.read_snapshot(db)
     assert gen >= 1 and "t" in body["schema"]
 
 
@@ -497,7 +499,7 @@ def test_corrupt_snapshot_is_detected(tmp_path):
         c.execute("CREATE TABLE t (x INT PLAIN)")
     s.stop()
     doc = json.loads(Path(db).read_text())
-    doc["snapshot"]["schema"]["t"][0][0] = "tampered"
+    doc["snapshot"]["body"]["schema"]["t"][0][0] = "tampered"
     Path(db).write_text(json.dumps(doc))
     with pytest.raises(dur.CorruptDatabase):
         NoKeyTCPServer("127.0.0.1", 0, db)
@@ -615,7 +617,7 @@ def test_torn_vault_tail_is_dropped_but_mid_corruption_refused(tmp_path):
         lines = good.split(b"\n")
         lines[3] = b"P 00000000 garbage"
         vault.write_bytes(b"\n".join(lines))
-        with pytest.raises(VaultError, match="refusing to truncate"):
+        with pytest.raises(VaultError, match="refusing"):
             s.connect(vault_path=str(vault))
     finally:
         s.stop()

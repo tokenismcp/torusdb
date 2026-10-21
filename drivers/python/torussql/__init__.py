@@ -30,7 +30,7 @@ _DRIVER_NAMES = frozenset({
     "Connection", "Cursor", "Warning", "Error", "InterfaceError", "DatabaseError",
     "DataError", "OperationalError", "IntegrityError", "InternalError",
     "ProgrammingError", "NotSupportedError", "NoKeyError", "AuthenticationError",
-    "ServerBusyError", "connect",
+    "ServerBusyError", "TransactionInDoubt", "ConnectionLost", "connect",
 })
 
 
@@ -62,4 +62,5 @@ __all__ = [
     "DataError", "OperationalError", "IntegrityError",
     "InternalError", "ProgrammingError", "NotSupportedError",
     "NoKeyError", "AuthenticationError", "ServerBusyError",
+    "TransactionInDoubt", "ConnectionLost",
 ]

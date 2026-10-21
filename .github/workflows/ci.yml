@@ -74,9 +74,10 @@ jobs:
         env:
           TORUSDB_ENGINE_DIR: ${{ github.workspace }}/_engine
         run: pytest -q -p no:cacheprovider
-      - name: engine suites
+      - name: engine suites (need the parser + driver importable)
         env:
           TORUSDB_ENGINE_DIR: ${{ github.workspace }}/_engine
+          PYTHONPATH: ${{ github.workspace }}/parser:${{ github.workspace }}/drivers/python
         run: pytest _engine/ec_fhe_engine _engine/ec_fhe_query -q -p no:cacheprovider
 
   wheels:
@@ -109,8 +110,15 @@ jobs:
           assert c.execute("SELECT SUM(v) FROM t").rows == [[9]], "wrong result"
           print("smoke ok", torussql.__version__)
           PY
+      # Only the open-source wheels are uploaded. The proprietary engine wheels
+      # (ec_fhe_engine, ec_fhe_query) are build inputs and must never become a
+      # downloadable artifact of this public repository.
+      - run: |
+          mkdir pub
+          cp wh/torussql-*.whl wh/torussql_parser-*.whl wh/torusdb_server-*.whl pub/
+          ls pub; ! ls pub | grep -qi "ec_fhe"
       - uses: actions/upload-artifact@v4
-        with: { name: wheels, path: wh/*.whl }
+        with: { name: wheels, path: pub/*.whl }
 
   typescript:
     name: typescript driver

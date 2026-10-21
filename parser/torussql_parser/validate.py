@@ -25,6 +25,9 @@ from .ast import (
 from .errors import ValidationError
 
 
+MAX_SCALAR = 1 << 126          # |k| bound for k*col / k*SUM(col) (exactness contract)
+
+
 def _describe(lit) -> str:
     if lit is None:
         return "NULL"
@@ -130,10 +133,16 @@ class Schema:
         return self.tables[name]
 
     def _validate_create(self, q: CreateTable) -> None:
+        if q.name.startswith("__"):
+            raise ValidationError(
+                f"table names starting with '__' are reserved ({q.name!r})")
         if q.name in self.tables:
             raise ValidationError(f"table {q.name!r} already exists")
         seen: set[str] = set()
         for (n, t, p) in q.columns:
+            if n.startswith("__"):
+                raise ValidationError(
+                    f"column names starting with '__' are reserved (column {n!r})")
             if n in seen:
                 raise ValidationError(f"duplicate column {n!r}")
             seen.add(n)
@@ -166,6 +175,19 @@ class Schema:
         if not q.star:
             for proj in q.projections:
                 self._validate_proj(scope, proj)
+        agg_like = (not q.star and not q.group_by and any(
+            isinstance(p, (SumExpr, AvgExpr, MinExpr, MaxExpr, CountStar, DotExpr,
+                           ScaledSumExpr, ScalarMulExpr, CtMulExpr))
+            for p in q.projections))
+        if agg_like and q.order_by is not None:
+            raise ValidationError(
+                "ORDER BY has no effect on an aggregate result — use GROUP BY or "
+                "select plain rows")
+        if (not q.star and not q.group_by and q.limit is not None and any(
+                isinstance(p, (ScalarMulExpr, CtMulExpr)) for p in q.projections)):
+            raise ValidationError(
+                "LIMIT does not apply to per-row encrypted expressions (k*col, a*b), "
+                "which are returned as one list")
 
         self._validate_where(scope, q.where)
 
@@ -294,6 +316,10 @@ class Schema:
                     f"{fn} requires a numeric column (column {col.name!r} is str)")
 
         elif isinstance(proj, (ScalarMulExpr, ScaledSumExpr)):
+            if abs(proj.scalar) > MAX_SCALAR:
+                raise ValidationError(
+                    f"scalar {proj.scalar} is out of range (|k| ≤ 2^126): a larger "
+                    f"multiplier could wrap around the modulus and return a wrong value")
             _i, col = scope.resolve(proj.column, "k * col")
             if col.policy == "plain":
                 raise ValidationError(

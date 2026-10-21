@@ -33,17 +33,34 @@ def wv(v: Any) -> dict:
 
 
 def uwv(d: dict) -> Any:
+    """wire form → python value. Strict: a malformed or non-scalar value is a
+    ValueError (never stored, never reaches the snapshot)."""
+    if not isinstance(d, dict) or "t" not in d:
+        raise ValueError("malformed wire value")
     t = d["t"]
     if t == "n":
         return None
     if t == "b":
-        return bool(d["v"])
+        if not isinstance(d.get("v"), bool):
+            raise ValueError("boolean wire value must be true/false")
+        return d["v"]
     if t == "i":
-        return int(d["v"])
+        v = d.get("v")
+        if not isinstance(v, (str, int)) or isinstance(v, bool):
+            raise ValueError("integer wire value must be a decimal string")
+        return int(v)
     if t == "s":
+        if not isinstance(d.get("v"), str):
+            raise ValueError("string wire value must be a string")
         return d["v"]
     if t == "f":
-        return Fraction(int(d["n"]), int(d["d"]))
+        if not all(isinstance(d.get(k), (str, int)) and not isinstance(d.get(k), bool)
+                   for k in ("n", "d")):
+            raise ValueError("fraction wire value needs decimal n and d")
+        den = int(d["d"])
+        if den == 0:
+            raise ValueError("fraction denominator must be non-zero")
+        return Fraction(int(d["n"]), den)
     raise ValueError(f"unknown wire value tag {t!r}")
 
 
@@ -66,11 +83,25 @@ def where_to_wire(pwhere) -> dict | None:
 
 
 def _cmp(a, op: str, b) -> bool:
+    """SQL comparison: a NULL operand makes the atom false (never an error)."""
+    if a is None or b is None:
+        return False
     if op == "=":
         return a == b
     if op in ("!=", "<>"):
         return a != b
-    return {"<": a < b, ">": a > b, "<=": a <= b, ">=": a >= b}[op]
+    try:
+        if op == "<":
+            return a < b
+        if op == ">":
+            return a > b
+        if op == "<=":
+            return a <= b
+        if op == ">=":
+            return a >= b
+    except TypeError:
+        raise ValueError(f"cannot compare {type(a).__name__} with {type(b).__name__}") from None
+    raise ValueError(f"unsupported operator {op!r}")
 
 
 def match_wire(row: dict, pred: dict | None) -> bool:
@@ -84,7 +115,7 @@ def match_wire(row: dict, pred: dict | None) -> bool:
 
 
 def _atom(row: dict, a: dict) -> bool:
-    val = row[a["c"]]
+    val = row.get(a["c"])
     if "in" in a:
-        return val in [uwv(x) for x in a["in"]]
+        return val is not None and val in [uwv(x) for x in a["in"]]
     return _cmp(val, a["op"], uwv(a["v"]))

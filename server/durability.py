@@ -1,18 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 """Crash-safe durability for the keyless server: snapshot + write-ahead journal.
 
-Layout for a database at ``PATH``:
+Layout for a database at ``PATH`` (all files ``0600``):
 
     PATH            snapshot (JSON, sha256-checked, carries ``generation``)
-    PATH.journal    JSONL write-ahead log; each line = one committed unit
-    PATH.lock       advisory lock so two servers never open the same db
+    PATH.journal    write-ahead log (a :class:`torussql.recordlog.RecordLog`)
+    PATH.lock       advisory lock so two processes never open the same db
 
-A journal line is ``{"g": generation, "ops": [[method, args], ...], "c": crc32}``.
-One line is one atomic commit (a single statement, or a whole transaction), so
-a crash mid-write leaves at most one torn trailing line, which recovery
-discards. Records whose generation differs from the snapshot's are stale
-(left over from before a checkpoint) and are ignored, which makes a crash
-between "snapshot written" and "journal truncated" harmless.
+A journal record is ``{"g": generation, "ops": [[method, args], …], "tx": id?}``.
+One record is one atomic commit (a single statement, or a whole transaction).
+The journal inherits the RecordLog guarantees: an append that fails part-way is
+truncated away (it can never reappear after recovery), a torn final record is
+dropped, and **corruption anywhere else refuses to load** rather than silently
+discarding the commits after it. Records whose generation differs from the
+snapshot's are stale (left over from before a checkpoint) and are ignored, which
+makes a crash between "snapshot written" and "journal truncated" harmless.
 
 Nothing here ever holds key material: the snapshot and journal contain only
 schema, plaintext columns, and one-time-padded scalars (I(M;V_S)=0).
@@ -22,14 +24,16 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import zlib
 from pathlib import Path
-from typing import Any, Callable, Iterable
+
+from torussql.recordlog import LogCorrupt, RecordLog, _create_exclusive, _fsync_dir
 
 try:                                    # POSIX advisory locking
     import fcntl
 except ImportError:                     # pragma: no cover  (Windows)
     fcntl = None                        # type: ignore[assignment]
+
+JOURNAL_MAGIC = b"TORUSJRN1"
 
 
 class DatabaseLocked(RuntimeError):
@@ -37,128 +41,94 @@ class DatabaseLocked(RuntimeError):
 
 
 class CorruptDatabase(RuntimeError):
-    """The snapshot failed its integrity check."""
+    """The snapshot or journal failed its integrity check."""
 
 
-def _fsync_dir(path: Path) -> None:
+def write_snapshot(path: str, body: dict, generation: int, extra: dict | None = None) -> None:
+    """Atomically write ``body`` as generation ``generation`` with a checksum.
+    ``extra`` (e.g. the committed-transaction ring) is covered by the checksum."""
+    inner = {"body": body, "extra": extra or {}}
+    payload = json.dumps(inner, sort_keys=True, separators=(",", ":"))
+    doc = {"format": 3, "generation": generation,
+           "sha256": hashlib.sha256(payload.encode()).hexdigest(), "snapshot": inner}
+    tmp = path + ".tmp"
+    fd = _create_exclusive(tmp)
     try:
-        fd = os.open(str(path.parent), os.O_RDONLY)
-    except OSError:                     # pragma: no cover
-        return
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(doc, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)       # never leave a stale temp behind
+        raise
+    _fsync_dir(path)
+
+
+def read_snapshot(path: str) -> tuple[dict, int, dict]:
+    """-> (body, generation, extra). Accepts the legacy formats."""
     try:
-        os.fsync(fd)
-    except OSError:                     # pragma: no cover
-        pass
-    finally:
-        os.close(fd)
-
-
-def write_snapshot(path: str, body: dict, generation: int) -> None:
-    """Atomically write ``body`` as generation ``generation`` with a checksum."""
-    payload = json.dumps(body, sort_keys=True, separators=(",", ":"))
-    doc = {"format": 2, "generation": generation,
-           "sha256": hashlib.sha256(payload.encode()).hexdigest(),
-           "snapshot": body}
-    p = Path(path)
-    tmp = p.with_name(p.name + ".tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(doc, f)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, p)
-    _fsync_dir(p)
-
-
-def read_snapshot(path: str) -> tuple[dict, int]:
-    """-> (body, generation). Accepts the legacy un-checksummed format."""
-    with open(path, "r", encoding="utf-8") as f:
-        doc = json.load(f)
-    if "snapshot" not in doc:                       # legacy v1 file
-        return doc, 0
-    body = doc["snapshot"]
-    payload = json.dumps(body, sort_keys=True, separators=(",", ":"))
+        with open(path, "r", encoding="utf-8") as f:
+            doc = json.load(f)
+    except (ValueError, OSError) as exc:
+        raise CorruptDatabase(f"{path}: unreadable snapshot ({exc})") from exc
+    if "snapshot" not in doc:                       # legacy v1 file (no checksum)
+        return doc, 0, {}
+    inner = doc["snapshot"]
+    legacy = doc.get("format", 2) < 3
+    payload = json.dumps(inner, sort_keys=True, separators=(",", ":"))
     if hashlib.sha256(payload.encode()).hexdigest() != doc.get("sha256"):
         raise CorruptDatabase(f"{path}: snapshot checksum mismatch")
-    return body, int(doc.get("generation", 0))
+    if legacy:
+        return inner, int(doc.get("generation", 0)), {}
+    return inner["body"], int(doc.get("generation", 0)), inner.get("extra", {})
 
 
 class Journal:
-    """Append-only commit log with torn-tail recovery."""
+    """Write-ahead commit log (thin wrapper over :class:`RecordLog`)."""
 
     def __init__(self, path: str, generation: int, fsync: str = "always"):
-        if fsync not in ("always", "never"):
-            raise ValueError("fsync must be 'always' or 'never'")
         self.path = path
         self.generation = generation
-        self._fsync = fsync
-        self._f = None
-        self.records = 0
+        self._fsync_mode = fsync
+        self._log = RecordLog(path, JOURNAL_MAGIC, fsync=fsync)
+        self.records = 0                        # commits since the last checkpoint
         self.bytes = 0
 
-    # — recovery —
-    @staticmethod
-    def replay(path: str, generation: int) -> Iterable[list]:
-        """Yield each valid committed ``ops`` list of this generation."""
-        if not os.path.exists(path):
-            return
-        good_end = 0
-        with open(path, "rb") as f:
-            while True:
-                line = f.readline()
-                if not line:
-                    break
-                try:
-                    rec = json.loads(line)
-                    body = json.dumps([rec["g"], rec["ops"]],
-                                      separators=(",", ":")).encode()
-                    if zlib.crc32(body) != rec["c"]:
-                        raise ValueError("crc")
-                except (ValueError, KeyError, TypeError):
-                    break                           # torn / corrupt tail
-                good_end = f.tell()
-                if rec["g"] == generation:
-                    yield rec["ops"]
-        # drop the torn tail so new appends start on a clean boundary
-        if good_end < os.path.getsize(path):
-            with open(path, "r+b") as f:
-                f.truncate(good_end)
+    def open(self) -> list[dict]:
+        """Open (creating if needed) and return every valid record of the
+        CURRENT generation, in order."""
+        try:
+            recs = list(self._log.open())
+        except LogCorrupt as exc:
+            raise CorruptDatabase(str(exc)) from None
+        out = [r for r in recs if r.get("g") == self.generation]
+        self.records = len(out)
+        self.bytes = self._log._size
+        return out
 
-    def open(self) -> None:
-        self._f = open(self.path, "ab")
-        self.bytes = self._f.tell()
-
-    def append(self, ops: list) -> None:
-        body = json.dumps([self.generation, ops],
-                          separators=(",", ":")).encode()
-        rec = json.dumps({"g": self.generation, "ops": ops,
-                          "c": zlib.crc32(body)},
-                         separators=(",", ":")).encode() + b"\n"
-        self._f.write(rec)
-        self._f.flush()
-        if self._fsync == "always":
-            os.fsync(self._f.fileno())
+    def append(self, ops: list, tx: str | None = None) -> None:
+        rec = {"g": self.generation, "ops": ops}
+        if tx:
+            rec["tx"] = tx
+        self._log.append(rec)                   # all-or-nothing; raises on failure
         self.records += 1
-        self.bytes += len(rec)
+        self.bytes = self._log._size
+
+    @property
+    def usable(self) -> bool:
+        return self._log._fd is not None
 
     def reset(self, generation: int) -> None:
-        """Start a fresh, empty journal for ``generation`` (after a checkpoint)."""
-        if self._f:
-            self._f.close()
-        with open(self.path, "wb") as f:
-            f.flush()
-            os.fsync(f.fileno())
+        """Start a fresh, empty journal for ``generation`` (after a checkpoint).
+        Atomic: on failure the old journal is untouched."""
+        self._log.rewrite([])
         self.generation = generation
         self.records = 0
-        self.open()
+        self.bytes = self._log._size
 
     def close(self) -> None:
-        if self._f:
-            try:
-                self._f.flush()
-                os.fsync(self._f.fileno())
-            finally:
-                self._f.close()
-                self._f = None
+        self._log.close()
 
 
 class DbLock:
@@ -186,3 +156,33 @@ class DbLock:
                 os.close(self._fd)
             finally:
                 self._fd = None
+
+
+def restore_backup(db_path: str, backup_path: str) -> int:
+    """Replace ``db_path`` with a backup. Holds the database lock (a running
+    server makes this fail), verifies the backup's checksum first, and stamps the
+    restored snapshot with a generation higher than any existing snapshot or
+    journal so no stale record can ever be replayed on top of it."""
+    lock = DbLock(db_path)
+    lock.acquire()
+    try:
+        body, _gen, extra = read_snapshot(backup_path)          # verifies checksum
+        old_gen = -1
+        if os.path.exists(db_path):
+            try:
+                old_gen = read_snapshot(db_path)[1]
+            except CorruptDatabase:
+                old_gen = 0
+        jp = db_path + ".journal"
+        if os.path.exists(jp):
+            try:
+                recs = list(RecordLog(jp, JOURNAL_MAGIC).open())
+                old_gen = max([old_gen] + [r.get("g", 0) for r in recs])
+            except Exception:                                   # noqa: BLE001
+                old_gen = max(old_gen, 1_000_000)               # unreadable: jump far ahead
+        new_gen = old_gen + 1
+        write_snapshot(db_path, body, new_gen, extra)
+        Path(jp).unlink(missing_ok=True)
+        return new_gen
+    finally:
+        lock.release()

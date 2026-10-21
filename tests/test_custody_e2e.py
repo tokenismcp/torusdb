@@ -170,13 +170,12 @@ def test_rate_limit_and_policy_and_audit(keyset, tmp_path):
 
 def test_malformed_and_off_curve_requests_are_rejected(net):
     r = net.remote(0)
-    r._call([("auth", [TOKEN])])
     g = net.g
     for bad in ("00" * 63 + "01", "zz", "", g.hex(g.identity)):
         with pytest.raises(QuorumError, match="malformed"):
-            r._call([("auth", [TOKEN]), ("partial", [bad, ""])])
+            r.call("partial", [bad, ""])
     with pytest.raises(QuorumError, match="malformed"):
-        r._call([("auth", [TOKEN]), ("partial", [g.hex(g.G), "00" * 2000])])
+        r.call("partial", [g.hex(g.G), "00" * 2000])
 
 
 def test_custodian_token_policy_and_share_swap(keyset, tmp_path):
@@ -237,7 +236,7 @@ def test_vault_sealed_by_threshold_key_end_to_end(keyset, net, db, tmp_path):
         _seed(c)
         assert c.execute("SELECT SUM(salary) FROM emp").rows == [[600]]
     raw = Path(vault).read_bytes()
-    assert raw.startswith(b"TORUSVAULT1 thr ")
+    assert raw.startswith(b"TORUSVAULT2 thr ")
     assert b"salary" not in raw and b'"r"' not in raw                  # nothing readable
     # reopen with ANY 3 of 5 custodians (two are offline)
     net.kill(1); net.kill(3)
@@ -308,7 +307,7 @@ def test_rotate_vault_key_needs_no_quorum_to_write(keyset, db, tmp_path):
         head1 = Path(vault).read_bytes().split(b"\n")[0]
         c.rotate_vault_key()
         head2 = Path(vault).read_bytes().split(b"\n")[0]
-        assert head1 != head2 and head2.startswith(b"TORUSVAULT1 thr ")
+        assert head1 != head2 and head2.startswith(b"TORUSVAULT2 thr ")
         c.execute("INSERT INTO emp (id, dept, salary) VALUES (4, 1, 4)")
     with torussql.connect(*db, vault_path=vault, vault_custody=cust) as c:
         assert c.execute("SELECT SUM(salary) FROM emp").rows == [[604]]
@@ -324,7 +323,7 @@ def test_tampered_envelope_header_is_refused_without_damage(keyset, db, tmp_path
     lines = vault.read_bytes().split(b"\n")
     hdr = json.loads(base64.urlsafe_b64decode(lines[0].split(b" ")[2]))
     hdr["E"] = pub.g.hex(pub.g.mul(pub.g.G, 12345))                    # swap the ephemeral
-    lines[0] = b"TORUSVAULT1 thr " + base64.urlsafe_b64encode(json.dumps(hdr).encode())
+    lines[0] = b"TORUSVAULT2 thr " + base64.urlsafe_b64encode(json.dumps(hdr).encode())
     vault.write_bytes(b"\n".join(lines))
     before = vault.read_bytes()
     with pytest.raises(VaultLocked):
@@ -404,11 +403,15 @@ def test_cli_three_host_ceremony_then_daemons_then_vault(db, tmp_path):
         procs.append(p)
         ports.append(int(re.search(r"on 127\.0\.0\.1:(\d+)", p.stdout.readline()).group(1)))
     try:
-        specs = [f"127.0.0.1:{pt}:{TOKEN}" for pt in ports]
-        args = ["open-test", "--public", str(d / "pub1.json")]
-        for s in specs:
-            args += ["--custodian", s]
-        assert "OK" in cli(*args).stdout
+        specs = [f"127.0.0.1:{pt}" for pt in ports]
+        args = ["open-test", "--public", str(d / "pub1.json"), "--token-env", "CUST_TOKEN"]
+        for sp in specs:
+            args += ["--custodian", sp]
+        assert "OK" in cli(*args, env_extra={"CUST_TOKEN": TOKEN}).stdout
+        # tokens are never accepted on the command line
+        r = cli("open-test", "--public", str(d / "pub1.json"), "--custodian",
+                f"127.0.0.1:{ports[0]}:{TOKEN}", "--token-env", "NOPE", check=False)
+        assert r.returncode != 0 and TOKEN not in (r.stdout + r.stderr)
         pub = __import__("torussql.custody", fromlist=["PublicKey"]).PublicKey.load(str(d / "pub1.json"))
         remotes = [RemoteCustodian("127.0.0.1", pt, TOKEN, group=pub.g) for pt in ports]
         vault = str(d / "owner.vault")
@@ -471,7 +474,7 @@ def test_reseal_passphrase_vault_to_threshold_and_back(keyset, db, tmp_path):
     with torussql.connect(*db, vault_path=vault, vault_passphrase="old-pass") as c:
         _seed(c)
         c.reseal_vault(custody=_local_cust(shares, pub))               # → threshold
-    assert Path(vault).read_bytes().startswith(b"TORUSVAULT1 thr ")
+    assert Path(vault).read_bytes().startswith(b"TORUSVAULT2 thr ")
     with pytest.raises(VaultLocked):
         torussql.connect(*db, vault_path=vault, vault_passphrase="old-pass")   # old key is dead
     with torussql.connect(*db, vault_path=vault, vault_custody=_local_cust(shares, pub)) as c:
@@ -480,7 +483,7 @@ def test_reseal_passphrase_vault_to_threshold_and_back(keyset, db, tmp_path):
     with torussql.connect(*db, vault_path=vault, vault_passphrase="back-again") as c:
         assert c.execute("SELECT SUM(salary) FROM emp").rows == [[600]]
         c.reseal_vault()                                               # → unsealed
-    assert Path(vault).read_bytes().startswith(b"TORUSVAULT1\n")
+    assert Path(vault).read_bytes().startswith(b"TORUSVAULT2\n")
 
 
 def test_reseal_onto_a_fresh_threshold_key_after_compromise(keyset, db, tmp_path):
