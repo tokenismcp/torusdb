@@ -19,6 +19,7 @@ For quorum recovery and offsite escrow use the LSS custody export in
 """
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
@@ -69,11 +70,17 @@ class _LoggedDict(dict):
 class VaultLog:
     """Append-only mask-vault log bound to one NoKeyClient."""
 
-    def __init__(self, path: str | None = None, passphrase: str | None = None):
+    def __init__(self, path: str | None = None, passphrase: str | None = None,
+                 custody=None):
         # path=None -> in-memory vault: no file, but still tracks transaction
         # undo so a client-side ROLLBACK can restore the mask state.
         self.path = path
+        if passphrase and custody is not None:
+            raise VaultError("use either a passphrase or threshold custody, not both")
         self._pass = passphrase
+        self._custody = custody          # torussql.custody.ThresholdCustody | None
+        self._thr: dict | None = None    # threshold envelope header of this vault
+        self._head_override: bytes | None = None   # set by reseal() for one rebase
         self._k: int | None = None
         self._f = None
         self._dirty = False
@@ -85,7 +92,7 @@ class VaultLog:
     def _encode(self, rec: dict) -> bytes:
         body = json.dumps(rec, separators=(",", ":")).encode()
         if self._k is not None:
-            from ecfhe_query.keymgmt import seal
+            from .seal import seal
             return b"S " + seal(self._k, body).hex().encode() + b"\n"
         return b"P %08x " % zlib.crc32(body) + body + b"\n"
 
@@ -94,7 +101,7 @@ class VaultLog:
         if line.startswith(b"S "):
             if self._k is None:
                 raise VaultLocked("vault is sealed — supply a passphrase")
-            from ecfhe_query.keymgmt import unseal
+            from .seal import unseal
             try:
                 body = unseal(self._k, bytes.fromhex(line[2:].decode()))
             except Exception as exc:                  # noqa: BLE001
@@ -120,13 +127,25 @@ class VaultLog:
                 head = f.readline()
                 if not head.startswith(_MAGIC.rstrip(b"\n")):
                     raise VaultError(f"{self.path}: not a TorusDB vault")
-                salt_hex = head.strip().split(b" ")[1:]
-                if salt_hex:
+                toks = head.strip().split(b" ")[1:]
+                if toks and toks[0] == b"thr":                 # threshold-sealed
+                    if self._custody is None:
+                        raise VaultLocked("vault is sealed under a threshold key — "
+                                          "supply vault_custody")
+                    self._thr = json.loads(base64.urlsafe_b64decode(toks[1]))
+                    try:
+                        self._k = self._custody.unwrap(self._thr)
+                    except VaultError:
+                        raise
+                    except Exception as exc:                 # noqa: BLE001
+                        raise VaultLocked(f"cannot open the vault: {exc}") from exc
+                elif toks:
                     if not self._pass:
                         raise VaultLocked("vault is sealed — supply a passphrase")
-                    self._k = _kdf(self._pass, bytes.fromhex(salt_hex[0].decode()))
-                elif self._pass:
-                    raise VaultError("vault is not sealed but a passphrase was given")
+                    self._k = _kdf(self._pass, bytes.fromhex(toks[0].decode()))
+                elif self._pass or self._custody is not None:
+                    raise VaultError("vault is not sealed but a passphrase/"
+                                     "custody was given")
                 good = f.tell()
                 state = _State()
                 n = 0
@@ -166,7 +185,10 @@ class VaultLog:
     def _init_file(self) -> None:
         salt = os.urandom(16)
         head = _MAGIC.rstrip(b"\n")
-        if self._pass:
+        if self._custody is not None:
+            self._k, self._thr = self._custody.wrap(b"vault\x00" + salt)
+            head += self._thr_head(self._thr)
+        elif self._pass:
             self._k = _kdf(self._pass, salt)
             head += b" " + salt.hex().encode()
         fd = os.open(self.path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
@@ -175,6 +197,10 @@ class VaultLog:
             f.flush()
             os.fsync(f.fileno())
         self._f = open(self.path, "ab")
+
+    @staticmethod
+    def _thr_head(hdr: dict) -> bytes:
+        return b" thr " + base64.urlsafe_b64encode(json.dumps(hdr).encode())
 
     @staticmethod
     def _hdr(client) -> dict:
@@ -255,11 +281,20 @@ class VaultLog:
         ct, cp = dict(client._coltype), dict(client._colpolicy)
         tmp = self.path + ".tmp"
         old_f, self._f = self._f, None
+        old_k, old_thr = self._k, self._thr
         self._seq = 0
         fd = os.open(tmp, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "wb") as f:
             head = _MAGIC.rstrip(b"\n")
-            if self._k is not None:
+            if self._head_override is not None:
+                head = self._head_override           # reseal(): new protection mode
+            elif self._thr is not None:
+                # rotate the sealing key: a fresh envelope needs only the
+                # PUBLIC key, no quorum
+                ctx = bytes.fromhex(self._thr["ctx"])
+                self._k, self._thr = self._custody.wrap(ctx)
+                head += self._thr_head(self._thr)
+            elif self._k is not None:
                 with open(self.path, "rb") as src:
                     head = src.readline().rstrip(b"\n")
             f.write(head + b"\n")
@@ -281,6 +316,35 @@ class VaultLog:
         client._masks = _LoggedDict(self, "m", masks)
         client._coltype = _LoggedDict(self, "ct", ct)
         client._colpolicy = _LoggedDict(self, "cp", cp)
+
+    def reseal(self, client, *, custody=None, passphrase: str | None = None) -> None:
+        """Re-protect the whole vault under a different key or mode — e.g.
+        passphrase → threshold custody, or onto a brand-new threshold key after
+        a custodian compromise. Atomic: the old file stays valid until the new
+        one is fully written; on failure nothing changes."""
+        if custody is not None and passphrase:
+            raise VaultError("use either a passphrase or threshold custody, not both")
+        if self.path is None:
+            raise VaultError("an in-memory vault has nothing to reseal")
+        saved = (self._k, self._thr, self._custody, self._pass, self._head_override)
+        try:
+            self._custody, self._pass = custody, passphrase
+            if custody is not None:
+                self._thr = {"ctx": (b"vault\x00" + os.urandom(16)).hex()}   # rebase() wraps
+                self._head_override = None
+            elif passphrase:
+                salt = os.urandom(16)
+                self._thr, self._k = None, _kdf(passphrase, salt)
+                self._head_override = _MAGIC.rstrip(b"\n") + b" " + salt.hex().encode()
+            else:
+                self._thr, self._k = None, None
+                self._head_override = _MAGIC.rstrip(b"\n")
+            self.rebase(client)
+        except BaseException:
+            self._k, self._thr, self._custody, self._pass, self._head_override = saved
+            raise
+        finally:
+            self._head_override = None
 
     def close(self) -> None:
         if self._f:

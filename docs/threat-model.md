@@ -70,6 +70,22 @@ construction (verified in tests).
 | Malformed input / data corruption | Strict request validation (types, row-id ranges, exact column sets on INSERT); internal errors return only an opaque reference — stack traces go to the server log, never the client. |
 | A read-only token reads data | It receives only what the server already holds (blinded cells and plaintext columns); it cannot decrypt without the owner's vault. |
 
+### 2.3c Threshold custody (v0.5, optional)
+
+With `vault_custody=ThresholdCustody(...)` the vault key is held by `n` custodians
+under a `k`-of-`n` Laurent-series sharing and **used without being reassembled**
+(`custody.md`). Adversary model:
+
+| Adversary | Outcome |
+|---|---|
+| Steals the vault file | Sealed; needs `k` custodians (separate hosts/admins) |
+| Compromises < `k` custodians | Learns nothing about the key (perfect secrecy of the sharing); can at most refuse service |
+| Malicious custodian | Its partial result carries a DLEQ proof; a wrong one is detected and excluded |
+| Network attacker | Tokens + TLS (verified by default); ceremony files are signed/encrypted |
+| Compromises ≥ `k` custodians (same epoch) | Key compromised — reseal onto a new key |
+| Quantum attacker holding vault file + public key | Can recover the key (ECDLP). Use passphrase/info-theoretic custody if this matters |
+| Compromises the owner process while the vault is open | Sees the masks — threshold protects at rest and the authority to open, not an open session |
+
 ### 2.4 Owner-process adversary
 
 If the owner process is compromised, the mask vault is exposed. Mask vault

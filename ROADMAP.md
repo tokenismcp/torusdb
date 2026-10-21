@@ -14,6 +14,7 @@ This file states what is *not* done as plainly as what is.
 | Keyless server: auth/roles, TLS, WAL + checkpoints, backup/restore, transactions, metrics, Docker | ✅ single node |
 | Drivers: Python (DB-API 2.0), TypeScript, Rust | ✅ (MAC integrity, vault log/sealing: Python only) |
 | Durable, sealed, tamper-evident mask-vault log | ✅ Python driver |
+| **Threshold key custody**: dealerless DKG, k-of-n verifiable key use, refresh/reshare, daemon, CLI | ✅ Python (`torussql.custody`) |
 | Internal cryptographic audit + review packet | ✅ (findings F-1…F-12) |
 | Benchmarks: micro, network, TPC-H-style | ✅ |
 
@@ -30,6 +31,12 @@ This file states what is *not* done as plainly as what is.
 6. ⬜ Connection pooling and a thread-safe connection in the Python driver.
 
 ## Later
+
+* ⬜ **Threshold unblinding** — secret-share the *masks* themselves so that unblinding is also a
+  quorum operation and no single process ever holds the vault (linear, so it fits the same
+  sharing). Larger change: n× mask storage and online custodians on every query.
+* ⬜ Custody in the TypeScript / Rust drivers; Pedersen/GJKR DKG; P-256 and Ed25519 groups;
+  a post-quantum-safe threshold-use option.
 
 * ⬜ Multi-column `ORDER BY`, `IS NULL`, `HAVING` on aggregates other than COUNT.
 * ⬜ Non-equi and `RIGHT`/`FULL` joins; subqueries.

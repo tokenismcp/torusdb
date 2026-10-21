@@ -34,6 +34,24 @@ jobs:
       - run: pip install pytest ./parser
       - run: pytest parser/tests -q
 
+  custody:
+    name: threshold custody (engine-free) · py${{ matrix.python }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "${{ matrix.python }}" }
+      - run: pip install pytest "py_ecc>=6,<9"
+      - name: custodian host install has no engine
+        run: |
+          pip install --no-deps ./drivers/python
+          python -c "import sys, torussql.custody; assert 'ecfhe_query' not in sys.modules"
+      - run: pytest tests/test_custody.py -q -p no:cacheprovider
+
   python:
     name: python suites (engine) · py${{ matrix.python }}
     runs-on: ubuntu-latest

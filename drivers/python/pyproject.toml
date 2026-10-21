@@ -29,7 +29,11 @@ classifiers = [
 dependencies = ["ec-fhe-query>=0.2.0,<1.0.0"]
 
 [project.optional-dependencies]
+custody = ["py_ecc>=6.0.0,<9.0.0"]
 dev = ["pytest>=8"]
+
+[project.scripts]
+torussql-custody = "torussql.custody.__main__:main"
 
 [project.urls]
 Homepage    = "https://torusdb.io"

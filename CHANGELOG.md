@@ -40,6 +40,21 @@ cryptographic self-audit, and the open repository made self-contained.
   `insert_many`, `tx_*`, `stats`, `checkpoint`, `backup`, `ping`.
 - Predicates on encrypted columns are rejected at the RPC layer too.
 
+### Added — threshold key custody (`torussql.custody`, z-MPC style)
+
+- **Dealerless DKG** over Laurent-series sharing (secret = residue): Feldman
+  commitments + Schnorr proofs of knowledge; aborts and names the culprit.
+- **k-of-n key use without reassembly**: ECIES-style envelope, one verifiable
+  message per custodian (Chaum–Pedersen DLEQ proof), aggregator-free combine.
+- **Proactive refresh and membership change** (reshare to any new k, n; public key
+  unchanged). Signed/encrypted file-based ceremony; custodian daemon with tokens,
+  TLS, rate limit, policy hook and audit log; `python -m torussql.custody` CLI.
+- **Vault integration**: `connect(vault_custody=…)`, `rotate_vault_key()`,
+  `reseal_vault()` (passphrase ⇄ threshold ⇄ new key). Curves: secp256k1, BN254.
+- Custodian hosts need only `torussql` + `py_ecc`; the driver now imports lazily.
+- Honest limits (docs/custody.md §3–4): computational (ECDLP, not post-quantum),
+  Feldman-style DKG, an open vault lives in owner memory. ~100 new tests.
+
 ### Added — drivers
 
 - **Python**: transactions (`begin/commit/rollback`, `with conn.transaction()`),

@@ -54,6 +54,7 @@ reference and the list of what is *not* supported:
 | `parser/` | `torussql-parser` — engine-free parser and static validator (zero deps) |
 | `drivers/python/` | `torussql` — PEP 249 driver (TLS, tokens, transactions, durable sealed vault, bulk load) |
 | `drivers/typescript/`, `drivers/rust/` | `@torusdb/driver`, `torusdb` — same protocol, joins, transactions, vault |
+| `drivers/python/torussql/custody/` | **Threshold key custody** (z-MPC-style Laurent sharing): dealerless DKG, k-of-n verifiable key use, refresh/reshare, custodian daemon, CLI — see [`docs/custody.md`](docs/custody.md) |
 | `server/` | `torusdb-server` — keyless server: auth/roles, WAL durability, backups, metrics, Docker |
 | `proto/` | Wire protocol v2 spec |
 | `torusctl/` | Interactive shell |
@@ -78,6 +79,13 @@ c.cursor().executemany("INSERT INTO t (id, v) VALUES (%s, %s)", [(1, 10), (2, 32
 print(c.execute("SELECT SUM(v) FROM t").rows)         # [[42]] — computed on blinded data
 PY
 ```
+
+## Threshold key custody
+
+The owner's mask vault can be sealed under a key that **no one ever holds**: it is
+generated dealer-free by `n` custodians and used by any `k` of them through one
+verifiable message each — the key is never reassembled (`python -m torussql.custody`,
+[`docs/custody.md`](docs/custody.md)). Custodian hosts do not need the engine.
 
 ## Operating it
 

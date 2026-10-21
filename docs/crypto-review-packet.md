@@ -332,6 +332,11 @@ now stated).
 | F-10 | Vault sealing uses an HMAC-SHA256 keystream with encrypt-then-MAC (stdlib only), not a standard AEAD (AES-GCM / ChaCha20-Poly1305). Sound construction, non-standard. | **OPEN** — replace with a vetted AEAD once a crypto dependency is acceptable. | `keymgmt.seal` |
 | F-11 | scrypt cost for passphrase sealing is moderate (n=2^14). | **OPEN** — raise for high-value vaults. | `vault._SCRYPT` |
 | F-12 | Rational DOT collapses denominators; rejected at plan time. | **DOC** (spec §4.5) | conformance |
+| F-13 | **Threshold custody (`torussql.custody`) is computational**: security of the shared key rests on ECDLP in secp256k1 / BN254 (not post-quantum), unlike the information-theoretic LSS custody in `keymgmt`. | **DOC** — tradeoff stated in `custody.md` §3 | — |
+| F-14 | Feldman-style DKG lets a last-speaking adversary bias the distribution of the public key X (no effect on an encryption key). Pedersen-hiding variant not implemented. | **OPEN (by design)** | `custody.md` §4 |
+| F-15 | DKG requires all n participants and aborts on any fault (no qualified-set recovery); transport authenticity rests on out-of-band fingerprint comparison. | **DOC** | `test_file_based_ceremony_…` |
+| F-16 | Custodian arithmetic is not constant-time (pure Python). Scalar randomisation (k + r·q) is the only mitigation. | **OPEN** | `Group.mul_blinded` |
+| F-17 | Rogue-key / mixed-epoch / forged-partial / swapped-file attacks on the custody protocols. | **FIXED/COVERED** — Schnorr PoK binds dealers, DLEQ binds partials to (key, epoch, context), signed broadcasts + sender checks bind files | `tests/test_custody.py` |
 
 ### Properties exercised by `ec_fhe_query/tests/test_crypto_audit.py`
 
@@ -372,3 +377,35 @@ now stated).
 ```bash
 pytest ec_fhe_engine ec_fhe_query torussql/tests/test_vault_audit.py -q
 ```
+
+---
+
+## 12. Threshold key custody (Laurent LSS, "z-MPC style")
+
+Full description: [`custody.md`](custody.md). Summary for reviewers.
+
+**Sharing.** Pure-pole Laurent series over F_q: f(z)=a₀+Σ_{j=1}^{t} b_j z^{-j}, t=k−1,
+secret = residue b₁, share yᵢ=f(xᵢ), xᵢ∈{1..n}, n≤32. With u=1/z this is the
+polynomial g(u)=a₀+b₁u+…, secret g′(0); reconstruction from a quorum S is the linear
+functional b₁=Σ λᵢyᵢ with λᵢ = −xᵢ^{k−1}(Σ_{j≠i}x_j)/Π_{j≠i}(xᵢ−x_j) (tested against
+Gaussian elimination). Perfect secrecy of any k−1 shares holds iff e_{k−2}(1/x_S)≠0 mod q;
+for points 1..n, n≤32 the numerator is a positive integer < q, and the property is
+verified exhaustively for every (k−1)-subset in the tests (n≤10).
+
+**DKG.** Each of n participants deals a random residue with Feldman commitments
+Cₘ=cₘG and a Schnorr proof of knowledge of b₁ (context-bound to session and index);
+y_j=Σᵢ sᵢ→j, X=Σᵢ Cᵢ₁. Weights w_m(x)=x^{-m} verify shares: y·G=Σ w_m(x)·Cₘ.
+
+**Use.** Envelope: K=KDF(e·X‖E‖X‖ctx). Opening: Dᵢ=yᵢ·E with DLEQ proof
+(logG Yᵢ = log_E Dᵢ), context = key_id‖epoch‖request context; combine Σλᵢ Dᵢ.
+
+**Reshare.** Quorum S deals Laurent sharings of λᵢyᵢ to a new committee; check
+C′ᵢ₁=λᵢ·Yᵢ, per-share commitments, and that the aggregated public key is unchanged.
+
+**Review questions.** (1) Is the Laurent-in-reciprocal construction (secret = g′(0))
+sound for the stated point sets, in particular the perfect-secrecy argument? (2) Is
+Feldman+PoK acceptable for a one-time custody ceremony, or should the Pedersen
+(GJKR) variant be required? (3) Is binding the DLEQ context to (key_id, epoch,
+request context) sufficient against cross-protocol reuse? (4) Is ECDLP-based custody an
+acceptable replacement for information-theoretic custody given F-13, or should a
+hybrid be offered? (5) The opener learns K for the envelope; is that acceptable?

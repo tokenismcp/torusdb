@@ -460,6 +460,7 @@ class Connection:
                  token: str | None = None,
                  vault_path: str | None = None,
                  vault_passphrase: str | None = None,
+                 vault_custody=None,
                  sync_schema: bool = True,
                  timeout: float | None = 30.0):
         self._wire = _Conn(host, port, timeout=timeout, tls=tls,
@@ -470,7 +471,7 @@ class Connection:
         try:
             self.client = NoKeyClient(RemoteNoKeyServer(self._wire),
                                       authenticated=authenticated)
-            self._vault = VaultLog(vault_path, vault_passphrase)
+            self._vault = VaultLog(vault_path, vault_passphrase, vault_custody)
             self._vault.open_into(self.client)
             if sync_schema:
                 self.sync_schema()
@@ -640,6 +641,24 @@ class Connection:
         self._check_open()
         return self._wire.call("backup", [])
 
+    def rotate_vault_key(self) -> None:
+        """Re-seal the whole vault under a fresh key (threshold vaults: a fresh
+        envelope to the same custodians — no quorum needed to *write*)."""
+        self._check_open()
+        if self._in_tx:
+            raise ProgrammingError("finish the transaction first")
+        self._vault.rebase(self.client)
+
+    def reseal_vault(self, *, custody=None, vault_passphrase: str | None = None) -> None:
+        """Move the vault to a different protection: ``custody=`` (threshold key)
+        or ``vault_passphrase=`` (or neither, for an unsealed file). Use it to
+        migrate a passphrase vault to threshold custody, or to leave a
+        compromised threshold key for a fresh one."""
+        self._check_open()
+        if self._in_tx:
+            raise ProgrammingError("finish the transaction first")
+        self._vault.reseal(self.client, custody=custody, passphrase=vault_passphrase)
+
     def find_orphans(self) -> dict[str, list[int]]:
         """Rows on the server that this vault cannot decrypt (a crash between
         the server accepting an INSERT and the vault recording its mask).
@@ -704,6 +723,7 @@ def connect(host: str = "127.0.0.1", port: int = 8533, *,
             token: str | None = None,
             vault_path: str | None = None,
             vault_passphrase: str | None = None,
+            vault_custody=None,
             sync_schema: bool = True,
             timeout: float | None = 30.0) -> Connection:
     """Open a PEP 249 connection to a no-key TorusDB server.
@@ -719,6 +739,9 @@ def connect(host: str = "127.0.0.1", port: int = 8533, *,
         token: API token when the server runs with ``--token-file``
         vault_path: persist the mask vault here (append-only, 0600)
         vault_passphrase: seal the vault file under a passphrase
+        vault_custody: seal the vault under a THRESHOLD key
+            (``torussql.custody.ThresholdCustody``): a quorum of custodians is
+            needed to open it, and the key is never reassembled
         sync_schema: learn tables that exist on the server (schema only)
         timeout: socket timeout in seconds (default 30; None = block forever)
     """
@@ -726,4 +749,5 @@ def connect(host: str = "127.0.0.1", port: int = 8533, *,
                       tls=tls, cafile=cafile, certfile=certfile,
                       keyfile=keyfile, tls_insecure=tls_insecure, token=token,
                       vault_path=vault_path, vault_passphrase=vault_passphrase,
+                      vault_custody=vault_custody,
                       sync_schema=sync_schema, timeout=timeout)

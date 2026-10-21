@@ -23,24 +23,29 @@ TLS:
 """
 from __future__ import annotations
 
-from .nokey import (
-    Connection,
-    Cursor,
-    Warning,
-    Error,
-    InterfaceError,
-    DatabaseError,
-    DataError,
-    OperationalError,
-    IntegrityError,
-    InternalError,
-    ProgrammingError,
-    NotSupportedError,
-    NoKeyError,
-    AuthenticationError,
-    ServerBusyError,
-    connect,
-)
+# The driver proper needs the TorusDB engine package; the key-custody tools
+# (``torussql.custody``) and the wire codec do not. Driver names are therefore
+# imported lazily, so a custodian host can run without the engine installed.
+_DRIVER_NAMES = frozenset({
+    "Connection", "Cursor", "Warning", "Error", "InterfaceError", "DatabaseError",
+    "DataError", "OperationalError", "IntegrityError", "InternalError",
+    "ProgrammingError", "NotSupportedError", "NoKeyError", "AuthenticationError",
+    "ServerBusyError", "connect",
+})
+
+
+def __getattr__(name: str):
+    if name in _DRIVER_NAMES:
+        from . import nokey
+        value = getattr(nokey, name)
+        globals()[name] = value
+        return value
+    raise AttributeError(f"module 'torussql' has no attribute {name!r}")
+
+
+def __dir__():
+    return sorted(set(globals()) | _DRIVER_NAMES)
+
 
 # ── PEP 249 §3 module-level attributes ───────────────────────────────────────
 

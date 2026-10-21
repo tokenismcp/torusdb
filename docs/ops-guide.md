@@ -180,6 +180,12 @@ conn = torussql.connect(..., vault_path="/secure/disk/owner.vault",
   its own vault, and a second reader needs the owner's vault to decrypt.
 * Leaving `vault_path` unset keeps the vault in memory only — fine for tests,
   fatal for real data.
+* **Threshold custody.** For production, seal the vault under a `k`-of-`n`
+  threshold key instead of a passphrase: `connect(…, vault_custody=ThresholdCustody(pub, quorum))`.
+  The key is generated without a dealer, held by `n` custodian daemons on separate
+  hosts, and *used* (never reassembled) by any `k` of them. Ceremony, daemons,
+  refresh, replacement and compromise response: [`custody.md`](custody.md).
+  Existing vaults migrate with `conn.reseal_vault(custody=…)`.
 
 ## 8. Transactions
 
