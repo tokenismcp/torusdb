@@ -1,0 +1,51 @@
+{
+  "name": "@torusdb/driver",
+  "version": "0.5.0",
+  "description": "No-key TorusDB client for Node/TypeScript \u2014 the server holds no keys and never decrypts",
+  "license": "Apache-2.0",
+  "author": "J1729 Labs <jlabsrd@gmail.com>",
+  "homepage": "https://github.com/j1729labs/torusdb",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/j1729labs/torusdb.git",
+    "directory": "torussql/drivers/typescript"
+  },
+  "bugs": {
+    "url": "https://github.com/j1729labs/torusdb/issues"
+  },
+  "keywords": [
+    "torusdb",
+    "homomorphic",
+    "encrypted-database",
+    "no-key",
+    "privacy"
+  ],
+  "type": "commonjs",
+  "main": "dist/torusdb.js",
+  "types": "dist/torusdb.d.ts",
+  "files": [
+    "dist/torusdb.js",
+    "dist/torusdb.d.ts",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "pretest": "tsc -p tsconfig.test.json",
+    "test": "node --test build-test/test/*.test.js",
+    "typecheck": "tsc -p tsconfig.test.json --noEmit && tsc --noEmit --esModuleInterop --strict --skipLibCheck --target ES2020 --module commonjs --types node example.ts",
+    "prepublishOnly": "npm run build",
+    "example": "ts-node example.ts"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0",
+    "ts-node": "^10.9.0",
+    "@types/node": "^20.0.0"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  }
+}

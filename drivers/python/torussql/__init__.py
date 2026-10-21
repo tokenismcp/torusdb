@@ -1,0 +1,60 @@
+# SPDX-License-Identifier: Apache-2.0
+"""torussql — PEP 249 DB-API 2.0 client driver for TorusDB.
+
+The driver speaks the **no-key delegation protocol**: it connects to a keyless
+server, holds the mask vault locally (the data owner's secret state), blinds on
+INSERT, and unblinds + decodes results — the server never holds a key and never
+decrypts.
+
+PEP 249 usage:
+
+    import torussql
+    conn = torussql.connect("127.0.0.1", 8533)
+    cur = conn.cursor()
+    cur.execute("INSERT INTO t (id, v) VALUES (%s, FRAC(%s,1))", (1, 8000))
+    cur.execute("SELECT SUM(v) FROM t")
+    row = cur.fetchone()   # (Fraction(8000, 1),)
+    conn.close()
+
+TLS:
+
+    conn = torussql.connect("db.example.com", 8533,
+                            tls=True, cafile="/etc/torusdb/ca.pem")
+"""
+from __future__ import annotations
+
+from .nokey import (
+    Connection,
+    Cursor,
+    Warning,
+    Error,
+    InterfaceError,
+    DatabaseError,
+    DataError,
+    OperationalError,
+    IntegrityError,
+    InternalError,
+    ProgrammingError,
+    NotSupportedError,
+    NoKeyError,
+    AuthenticationError,
+    ServerBusyError,
+    connect,
+)
+
+# ── PEP 249 §3 module-level attributes ───────────────────────────────────────
+
+apilevel     = "2.0"     # supports DB-API 2.0
+threadsafety = 1         # threads may share the module but NOT connections
+paramstyle   = "format"  # %s positional substitution
+
+__version__ = "0.5.0"
+
+__all__ = [
+    "connect", "Connection", "Cursor",
+    "apilevel", "threadsafety", "paramstyle",
+    "Warning", "Error", "InterfaceError", "DatabaseError",
+    "DataError", "OperationalError", "IntegrityError",
+    "InternalError", "ProgrammingError", "NotSupportedError",
+    "NoKeyError", "AuthenticationError", "ServerBusyError",
+]

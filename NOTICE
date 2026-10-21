@@ -1,0 +1,14 @@
+TorusSQL
+Copyright 2026 J1729 Labs
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+SCOPE. The Apache-2.0 license covers everything in THIS repository: the
+TorusSQL dialect (spec/), the open parser and static validator (parser/), the
+client drivers (drivers/), the keyless server (server/), the wire protocol
+(proto/), the CLI (torusctl/), benchmarks, fuzz/conformance suites and docs.
+
+NOT COVERED. The TorusDB homomorphic engine packages `ec-fhe-engine` and
+`ec-fhe-query` are proprietary to 4Chains Inc. / J1729 Labs, are NOT part of
+this repository, and are licensed separately. The Python driver and server
+require them at runtime; the TypeScript and Rust drivers and the parser do not.

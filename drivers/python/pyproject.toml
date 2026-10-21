@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "torussql"
+version = "0.5.0"
+description = "PEP 249 Python driver for TorusDB — encrypted SQL over the no-key delegation protocol"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+authors = [{ name = "J1729 Labs", email = "jlabsrd@gmail.com" }]
+keywords = ["torussql", "torusdb", "homomorphic-encryption", "sql", "encrypted-database"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Database :: Front-Ends",
+    "Topic :: Security :: Cryptography",
+]
+
+# Runtime: the driver contains the client side of the no-key protocol, which
+# is provided by the TorusDB engine package `ec-fhe-query` (it pulls in
+# `ec-fhe-engine` and `py_ecc`). The engine is distributed separately under
+# its own license; everything else here is Apache-2.0 and stdlib-only.
+dependencies = ["ec-fhe-query>=0.2.0,<1.0.0"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.urls]
+Homepage    = "https://torusdb.io"
+Repository  = "https://github.com/j1729labs/torusdb"
+"Bug Tracker" = "https://github.com/j1729labs/torusdb/issues"
+
+[tool.setuptools.packages.find]
+where   = ["."]
+include = ["torussql*"]
+
+[tool.pytest.ini_options]
+testpaths = ["../../tests"]

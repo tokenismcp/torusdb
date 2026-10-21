@@ -1,0 +1,25 @@
+{
+  "authenticated": false,
+  "results": [
+    {
+      "rows": 1000,
+      "insert_total_ms": 32.11,
+      "insert_per_row_us": 32.11,
+      "sum_ms": 0.15,
+      "sum_where_ms": 0.561,
+      "dot_ms": 5.448,
+      "count_ms": 0.019,
+      "plain_sum_us": 2.25
+    },
+    {
+      "rows": 5000,
+      "insert_total_ms": 165.61,
+      "insert_per_row_us": 33.12,
+      "sum_ms": 0.765,
+      "sum_where_ms": 2.716,
+      "dot_ms": 28.265,
+      "count_ms": 0.046,
+      "plain_sum_us": 10.37
+    }
+  ]
+}

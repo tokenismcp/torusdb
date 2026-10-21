@@ -1,0 +1,33 @@
+[package]
+name = "torusdb"
+version = "0.5.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "No-key TorusDB client — the server holds no keys and never decrypts"
+authors = ["J1729 Labs <jlabsrd@gmail.com>"]
+homepage = "https://github.com/j1729labs/torusdb"
+repository = "https://github.com/j1729labs/torusdb"
+documentation = "https://docs.rs/torusdb"
+readme = "README.md"
+keywords = ["torusdb", "homomorphic", "encrypted-database", "privacy", "no-key"]
+categories = ["database", "cryptography"]
+include = ["src/**/*", "examples/**/*", "tests/**/*", "README.md", "Cargo.toml"]
+
+[dependencies]
+num-bigint = "0.4"
+num-integer = "0.1"
+num-traits = "0.2"
+serde_json = "1"
+rand = "0.8"
+rustls = { version = "0.23", optional = true, default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = { version = "0.26", optional = true }
+
+[features]
+default = []
+# TLS (rustls + ring). Off by default; certificates AND hostnames are verified
+# unless ConnectOptions::tls_insecure is set explicitly.
+tls = ["dep:rustls", "dep:webpki-roots"]
+
+[[example]]
+name = "demo"
+path = "examples/demo.rs"

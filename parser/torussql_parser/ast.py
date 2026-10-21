@@ -1,0 +1,197 @@
+# SPDX-License-Identifier: Apache-2.0
+"""TorusSQL abstract syntax tree.
+
+Pure data — no engine, no crypto, no I/O. These nodes are the public AST a
+driver inspects after parsing and before sending a query over the wire.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any, Union
+
+
+# ── DDL / DML statements ─────────────────────────────────────────────────────
+@dataclass
+class CreateTable:
+    name: str
+    columns: list[tuple[str, str, str]]   # (name, type, policy), normalized
+
+
+@dataclass
+class DropTable:
+    name: str
+
+
+@dataclass
+class Insert:
+    table: str
+    columns: list[str]
+    values: list[Any]                     # int | str | None | ("frac", n, d)
+
+
+@dataclass
+class Update:
+    table: str
+    assignments: list[tuple[str, Any]]    # (column, literal)
+    where: "Where | None" = None
+
+
+@dataclass
+class Delete:
+    table: str
+    where: "Where | None" = None
+
+
+# ── SELECT projections ───────────────────────────────────────────────────────
+@dataclass
+class ColRef:
+    name: str
+
+
+@dataclass
+class SumExpr:
+    column: str
+
+
+@dataclass
+class DotExpr:
+    left: str
+    right: str
+
+
+@dataclass
+class ScalarMulExpr:
+    """k * col — per-row scalar multiply (one scaled value per row)."""
+    scalar: int
+    column: str
+
+
+@dataclass
+class ScaledSumExpr:
+    """k * SUM(col) — scale the encrypted aggregate."""
+    scalar: int
+    column: str
+
+
+@dataclass
+class CtMulExpr:
+    """col1 * col2 — formal ciphertext × ciphertext multiplication."""
+    left: str
+    right: str
+
+
+@dataclass
+class CountStar:
+    """COUNT(*) — plaintext count of the selected rows."""
+
+
+@dataclass
+class AvgExpr:
+    column: str
+
+
+@dataclass
+class MinExpr:
+    column: str
+
+
+@dataclass
+class MaxExpr:
+    column: str
+
+
+Proj = Union[ColRef, SumExpr, DotExpr, ScalarMulExpr, ScaledSumExpr, CtMulExpr,
+             CountStar, AvgExpr, MinExpr, MaxExpr]
+
+# Comparison operators allowed in WHERE (plaintext columns only).
+WHERE_OPS = ("=", "!=", "<>", "<", ">", "<=", ">=")
+
+
+@dataclass
+class Condition:
+    """A comparison atom: `column op literal`."""
+    column: str
+    op: str
+    value: Any
+
+
+@dataclass
+class InList:
+    """An `column IN (lit, ...)` atom."""
+    column: str
+    values: list[Any]
+
+
+Atom = Union[Condition, InList]
+
+
+@dataclass
+class Where:
+    """Predicate in disjunctive normal form: an OR of AND-groups of atoms.
+    Without parentheses, `AND` binds tighter than `OR`, so
+    `a AND b OR c` parses to or_terms = [[a, b], [c]]."""
+    or_terms: list[list] = field(default_factory=list)
+
+
+@dataclass
+class OrderBy:
+    column: str
+    descending: bool = False
+
+
+@dataclass
+class Having:
+    """A HAVING predicate on COUNT(*) of each group: COUNT(*) op <int>."""
+    op: str
+    value: int
+
+
+@dataclass
+class Join:
+    """JOIN clause: [INNER|LEFT [OUTER]] JOIN <table> [[AS] alias]
+    ON <left_col> = <right_col>.
+    Column refs may be qualified ('alias.col') or bare ('col')."""
+    table: str
+    on_left: str
+    on_right: str
+    alias: str | None = None
+    kind: str = "inner"               # "inner" | "left"
+
+    @property
+    def name(self) -> str:
+        """The instance name this join introduces (alias, else the table)."""
+        return self.alias or self.table
+
+
+@dataclass
+class Select:
+    table: str
+    projections: list[Proj] = field(default_factory=list)
+    star: bool = False
+    where: Where | None = None
+    order_by: OrderBy | None = None
+    limit: int | None = None
+    # Output-column aliases (from `AS`), aligned 1:1 with `projections`;
+    # an entry is None when that projection has no alias. Empty for `*`.
+    aliases: list = field(default_factory=list)
+    distinct: bool = False
+    group_by: list[str] = field(default_factory=list)   # plaintext columns
+    having: Having | None = None
+    joins: list["Join"] = field(default_factory=list)
+    table_alias: str | None = None
+
+    @property
+    def name(self) -> str:
+        """The instance name of the FROM table (alias, else the table)."""
+        return self.table_alias or self.table
+
+
+Query = Union[CreateTable, DropTable, Insert, Update, Delete, Select]
+
+
+# ── Normalized vocabularies (the dialect's closed sets) ──────────────────────
+TYPES = ("int", "str", "rational")
+POLICIES = ("plain", "encrypted", "paired")
+
+TYPE_KEYWORDS = {"INT": "int", "STR": "str", "RATIONAL": "rational"}
+POLICY_KEYWORDS = {"PLAIN": "plain", "ENC": "encrypted", "PAIRED": "paired"}

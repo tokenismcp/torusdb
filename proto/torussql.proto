@@ -1,0 +1,109 @@
+// TorusSQL wire protocol — v0.1
+//
+// The contract between an OPEN TorusSQL client and a CLOSED TorusDB engine.
+// It carries parsed statements, client-encrypted parameters, and result
+// cells. It deliberately says nothing about how ciphertext is structured or
+// how the engine evaluates a query — `Ciphertext.body` is opaque octets.
+//
+// Key custody is client-side: the client encrypts INSERT parameters and
+// decrypts SELECT results. The engine never receives a secret key and never
+// holds the plaintext of an ENC/PAIRED value.
+//
+// No protoc dependency is required to use TorusSQL: this schema is normative
+// for typed/binary transports, and `torussql-wire-v0.1.md` defines an
+// equivalent canonical JSON encoding (see `wire.py` for a reference codec).
+
+syntax = "proto3";
+
+package torussql.v1;
+
+// ── Opaque ciphertext ───────────────────────────────────────────────────────
+// The wire never describes engine internals. `scheme` is an opaque version
+// tag negotiated at handshake; `body` is engine-defined octets.
+message Ciphertext {
+  uint32 scheme = 1;
+  bytes  body   = 2;
+}
+
+// Exact rational a/b (b != 0). Used for PLAIN rational values only; encrypted
+// rationals travel as Ciphertext.
+message Rational {
+  sint64 num = 1;
+  sint64 den = 2;
+}
+
+// A value crossing the wire: plaintext (PLAIN columns / public scalars) or an
+// opaque ciphertext (ENC/PAIRED).
+message Value {
+  oneof kind {
+    sint64     int_val  = 1;   // INT plaintext
+    string     str_val  = 2;   // STR plaintext
+    Rational   rat_val  = 3;   // RATIONAL plaintext (PLAIN only)
+    Ciphertext cipher   = 4;   // ENC/PAIRED ciphertext (opaque)
+    bool       is_null  = 5;   // SQL NULL (value is true when set)
+  }
+}
+
+// ── Handshake ────────────────────────────────────────────────────────────────
+message Hello {
+  string client_name         = 1;
+  uint32 max_dialect_version  = 2;   // highest TorusSQL version the client speaks
+}
+
+message Welcome {
+  uint32 dialect_version = 1;        // negotiated version (<= client max)
+  uint32 scheme          = 2;        // ciphertext scheme tag for this session
+  // §5 decode-range contract: results whose plaintext magnitude exceeds these
+  // bounds are rejected with ErrorKind RANGE rather than wrapped.
+  uint64 decode_range_additive = 3;  // bound for SUM / scalar-mul results
+  uint64 decode_range_product  = 4;  // bound for *-/DOT (product) results
+  repeated string capabilities = 5;  // e.g. "sum","scalar_mul","ct_mul","dot"
+}
+
+// ── Execute ──────────────────────────────────────────────────────────────────
+// The statement is TorusSQL text with positional `?` placeholders. Every value
+// destined for an ENC/PAIRED column is supplied as a client-encrypted `param`,
+// NOT inlined in the text — so the engine receives only ciphertext for them.
+// PLAIN literals may be inlined or parameterized.
+message ExecuteRequest {
+  string         sql    = 1;
+  repeated Value params = 2;         // bound to `?` left-to-right
+}
+
+message Row {
+  repeated Value cells = 1;
+}
+
+message ResultSet {
+  repeated string columns = 1;
+  repeated Row    rows    = 2;
+}
+
+message ExecuteResponse {
+  oneof outcome {
+    ResultSet result   = 1;          // SELECT
+    uint64    affected = 2;          // INSERT / CREATE / DROP row count
+    Error     error    = 3;
+  }
+}
+
+// ── Errors (mirror spec §7 conformance error set) ────────────────────────────
+enum ErrorKind {
+  ERROR_KIND_UNSPECIFIED = 0;
+  PARSE       = 1;   // malformed statement
+  POLICY      = 2;   // operation illegal for a column's policy/type
+  UNSUPPORTED = 3;   // capability not in this dialect version
+  RANGE       = 4;   // result magnitude exceeds the negotiated decode range
+  INTERNAL    = 5;   // engine fault (no plaintext leaked)
+}
+
+message Error {
+  ErrorKind kind    = 1;
+  string    message = 2;
+}
+
+// ── Service ──────────────────────────────────────────────────────────────────
+service TorusSQL {
+  rpc Connect (Hello)          returns (Welcome);
+  rpc Execute (ExecuteRequest) returns (ExecuteResponse);
+}

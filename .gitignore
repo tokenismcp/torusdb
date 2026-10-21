@@ -1,0 +1,20 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+node_modules/
+target/
+build-test/
+*.tmp
+*.lock
+!Cargo.lock
+.venv/
+.DS_Store
+# local secrets / data
+*.vault
+tokens
+*.db
+*.db.journal
+*.bak
