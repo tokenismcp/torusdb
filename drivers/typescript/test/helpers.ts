@@ -6,9 +6,9 @@ import * as os from "os";
 import * as path from "path";
 import { Column } from "../src/torusdb";
 
-// build-test/test -> drivers/typescript/build-test/test ; repo root is 5 up
-const REPO = path.resolve(__dirname, "../../../../..");
-export const SERVER_PY = path.join(REPO, "torussql/server/nokey_server.py");
+// compiled to <root>/drivers/typescript/build-test/test -> repo root is 4 up
+const REPO = path.resolve(__dirname, "../../../..");
+export const SERVER_PY = path.join(REPO, "server/nokey_server.py");
 export const VECTORS = path.resolve(__dirname, "../../../vectors.json");
 
 export const ADMIN = "admin-token-0123456789";
@@ -16,7 +16,8 @@ export const RO = "ro-token-0123456789abc";
 export const RW = "rw-token-0123456789abc";
 
 export function findPython(): string | null {
-  const cands = [process.env.TORUSDB_PYTHON, path.join(REPO, ".venv/bin/python")];
+  const cands = [process.env.TORUSDB_PYTHON, path.join(REPO, ".venv/bin/python"),
+                 path.join(REPO, "../.venv/bin/python")];   // monorepo dev layout
   if (!process.env.TORUSDB_PYTHON) cands.push("python3");
   for (const c of cands) {
     if (!c) continue;
@@ -29,6 +30,16 @@ export function findPython(): string | null {
 
 /** Why integration tests are skipped (undefined = they run). */
 export function skipReason(): string | undefined {
+  const why = skipReasonInner();
+  // In CI (TORUSDB_REQUIRE_INTEGRATION=1) a missing server is a FAILURE,
+  // never a silent skip.
+  if (why && process.env.TORUSDB_REQUIRE_INTEGRATION) {
+    throw new Error(`integration tests are required but cannot run: ${why}`);
+  }
+  return why;
+}
+
+function skipReasonInner(): string | undefined {
   if (!fs.existsSync(SERVER_PY)) return `server not found at ${SERVER_PY}`;
   const py = findPython();
   if (!py) return "no usable Python interpreter (set TORUSDB_PYTHON)";

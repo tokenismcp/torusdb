@@ -111,6 +111,7 @@ jobs:
         env:
           TORUSDB_ENGINE_DIR: ${{ github.workspace }}/_engine
           TORUSDB_PYTHON: python
+          TORUSDB_REQUIRE_INTEGRATION: "1"
         run: |
           npm ci
           npm run typecheck
@@ -134,6 +135,7 @@ jobs:
         env:
           TORUSDB_ENGINE_DIR: ${{ github.workspace }}/_engine
           TORUSDB_PYTHON: python
+          TORUSDB_REQUIRE_INTEGRATION: "1"
         run: |
           cargo test
           cargo test --features tls

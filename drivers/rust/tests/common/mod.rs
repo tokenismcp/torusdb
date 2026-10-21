@@ -11,8 +11,14 @@ pub const ADMIN: &str = "admin-token-0123456789";
 pub const RW: &str = "rw-token-0123456789abc";
 pub const RO: &str = "ro-token-0123456789abc";
 
+/// Repository root (this crate lives at <root>/drivers/rust).
 pub fn repo() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..").canonicalize().unwrap()
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap()
+}
+
+/// Integration tests must not silently skip where a server is mandatory (CI).
+pub fn require_integration() -> bool {
+    std::env::var("TORUSDB_REQUIRE_INTEGRATION").is_ok()
 }
 
 pub fn vectors_path() -> PathBuf {
@@ -25,9 +31,10 @@ fn python() -> Option<String> {
         cands.push(p);
     } else {
         cands.push(repo().join(".venv/bin/python").to_string_lossy().into());
+        cands.push(repo().join("../.venv/bin/python").to_string_lossy().into()); // monorepo dev layout
         cands.push("python3".into());
     }
-    let server = repo().join("torussql/server/nokey_server.py");
+    let server = repo().join("server/nokey_server.py");
     if !server.exists() {
         return None;
     }
@@ -59,12 +66,16 @@ impl Server {
         let py = match python() {
             Some(p) => p,
             None => {
+                if require_integration() {
+                    panic!("TORUSDB_REQUIRE_INTEGRATION is set but no usable \
+                            Python interpreter/server was found (set TORUSDB_PYTHON)");
+                }
                 eprintln!("SKIP: no usable Python interpreter/server (set TORUSDB_PYTHON)");
                 return None;
             }
         };
         let mut child = Command::new(py)
-            .arg(repo().join("torussql/server/nokey_server.py"))
+            .arg(repo().join("server/nokey_server.py"))
             .args(["--host", "127.0.0.1", "--port", "0", "--log-level", "WARNING"])
             .args(extra)
             .env("PYTHONUNBUFFERED", "1")
