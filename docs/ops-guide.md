@@ -291,3 +291,12 @@ built-in replication or clustering (see §13).
 * Metadata (schema, row counts, access patterns, join keys, timing) is visible
   to the server.
 * No external cryptographic audit has been completed.
+
+## Resolving a lost COMMIT reply
+
+Drivers send a transaction id and, when a COMMIT reply is lost, ask the server
+`tx_status`. The server remembers the last `tx_ring` (default 100 000) committed
+ids, persisted in the snapshot/journal. Caveats: with no `--db` (in-memory) a
+server restart forgets them, and an id older than the ring reads `unknown`, which
+a driver treats as "never committed". Resolve in-doubt transactions promptly, and
+run production servers with `--db`.

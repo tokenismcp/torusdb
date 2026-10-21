@@ -134,15 +134,62 @@ afford to lose.
 `ping()`, `tables()`, `tableInfo(t)`, `stats()`, `checkpoint()`, `backup()`,
 `dropTable()` (the last four need an `admin` token when auth is on).
 
+## Trust model: the server is untrusted
+
+* **Schema.** The server never decides which columns are encrypted. Tables you
+  create here (or load from your own vault - the vault stores the policies) are
+  *trusted*. Tables only learned from the server via `syncSchema()` are
+  *untrusted*: plain reads work, but `insert`/`insertMany`/`update` throw
+  `UntrustedSchema` (a lying server could otherwise label an encrypted column
+  "plain" and receive it in the clear). Opt in with `trustServerSchema: true`
+  or `db.trustTable(name)`. Unknown policy strings are treated as encrypted.
+* **Replies** are validated (types, array lengths against the request, safe
+  integers, <= 90 digits per integer, frames capped at
+  `min(hello.max_frame, 64 MiB)`); anything else is a `ProtocolError`, never a
+  raw `TypeError`. Unsolicited bytes from the server kill the connection.
+* **Authenticated (MAC) mode.** `Client.connect(h, p, { authenticated: true })`
+  writes a hidden one-time-padded MAC `alpha*s` next to every encrypted cell
+  (`__mac__<col>`, same layout as the Python driver; alpha lives in the vault)
+  and verifies it on every SUM/AVG/DOT/read: a server that edits stored values
+  or lies about aggregates is caught (`IntegrityError`). Without it these
+  drivers do **not** detect a lying server. Use the same mode the table was
+  written in; the vault records it. Mixing modes on one table is refused only
+  when the vault says so - the server does not expose `__mac__` columns.
+* **Secrets.** Masks, the MAC key and the token are `#private` and redacted
+  from `util.inspect` / `JSON.stringify`. The token is refused on an
+  unencrypted non-loopback connection unless `allowInsecureToken: true`.
+
+## Lost COMMIT replies
+
+`begin()` sends a random transaction id. If a COMMIT's reply is lost (timeout,
+dropped connection) the driver reconnects and asks `tx_status(txid)`:
+`committed` keeps the new masks; `unknown` restores the vault and throws;
+if the status cannot be obtained it throws `TransactionInDoubt` (`.txid`),
+keeping BOTH vault states. Writes are refused until you `await db.reconnect()`
+and `await db.resolveTransaction(txid)` (asks the server) or
+`resolveTransaction(txid, true|false)` (you know the answer). The vault is
+restored only on a definite server answer. A `Busy ... timed out` reply inside
+a transaction drops the local transaction immediately.
+
+## Concurrency
+
+Every public operation (including `begin`/`commit`/`rollback` and a whole
+`transaction(fn)`) is serialized on the client, so concurrent callers cannot
+interleave inside a transaction. Calls made *inside* `transaction(fn)` re-enter.
+
 ## Differences from the Python driver
 
 * No SQL, no PEP 249 cursor: use the methods above.
-* Vault persistence is a plain JSON snapshot written on demand - not the
-  Python driver's append-only checksummed log, no passphrase sealing, no
-  automatic save after every statement.
-* No authenticated (SPDZ MAC) mode; ORDER BY / GROUP BY / MIN / MAX /
-  scalar-mul are not provided (JOIN, SUM, AVG, COUNT, DOT are).
+* Vault persistence is a plain JSON snapshot written on demand (atomic, 0600,
+  directory fsync) - not the Python driver's append-only checksummed log, no
+  passphrase sealing, no automatic save after every statement, and an in-doubt
+  COMMIT is held in memory only (`saveVault` refuses while one is unresolved).
+* ORDER BY / GROUP BY / MIN / MAX / scalar-mul are not provided (JOIN, SUM,
+  AVG, COUNT, DOT are). Join WHERE over joined tables is a client-side
+  post-filter on PLAIN columns (`eq("dname", "Eng", "d")`).
 * No client certificates (mutual TLS) option yet.
+* Integers from the server are limited to 90 digits; sums over > 100 000 rows
+  are chunked (the server rejects longer lists).
 
 ## Build, test
 

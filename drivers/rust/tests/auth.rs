@@ -65,7 +65,7 @@ fn rw_reads_and_writes_ro_only_reads() {
     w.insert("t", row(2, 20)).unwrap();
     assert_eq!(w.sum("t", "v", all()).unwrap(), Decoded::Int(BigInt::from(30)));
 
-    let mut r = Client::connect_with(&s.addr, &with(RO)).unwrap();
+    let mut r = Client::connect_with(&s.addr, &ConnectOptions { trust_server_schema: true, ..with(RO) }).unwrap(); // so the SERVER-side check is what refuses
     assert_eq!(r.count("t", all()).unwrap(), 2);
     assert_eq!(r.insert("t", row(3, 5)).unwrap_err().kind, Kind::Forbidden);
     assert_eq!(r.delete_rows("t", eq_int("k", 1)).unwrap_err().kind, Kind::Forbidden);

@@ -5,6 +5,7 @@
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+pub mod fake;
 use torusdb::Column;
 
 pub const ADMIN: &str = "admin-token-0123456789";

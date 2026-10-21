@@ -32,6 +32,12 @@ pub enum Kind {
     Interface,
     /// A value or aggregate outside the exactly representable range.
     OutOfBudget,
+    /// A MAC check failed: the server lied (authenticated mode).
+    Integrity,
+    /// Write to a table whose encryption policies were only learned from the server.
+    UntrustedSchema,
+    /// A COMMIT whose outcome could not be determined (see `Error::txid`).
+    TransactionInDoubt,
 }
 
 /// The error type of every fallible call.
@@ -39,11 +45,13 @@ pub enum Kind {
 pub struct Error {
     pub kind: Kind,
     pub message: String,
+    /// Set for `Kind::TransactionInDoubt`: pass it to `Client::resolve_transaction`.
+    pub txid: Option<String>,
 }
 
 impl Error {
     pub fn new(kind: Kind, message: impl Into<String>) -> Error {
-        Error { kind, message: message.into() }
+        Error { kind, message: message.into(), txid: None }
     }
     pub(crate) fn interface(m: impl Into<String>) -> Error {
         Error::new(Kind::Interface, m)
@@ -95,6 +103,9 @@ impl Error {
             Kind::Protocol => "ProtocolError".into(),
             Kind::Interface => "InterfaceError".into(),
             Kind::OutOfBudget => "OutOfBudget".into(),
+            Kind::Integrity => "IntegrityError".into(),
+            Kind::UntrustedSchema => "UntrustedSchema".into(),
+            Kind::TransactionInDoubt => "TransactionInDoubt".into(),
         }
     }
 }

@@ -57,7 +57,7 @@ let db = Client::connect_with("db.example.com:8533", &ConnectOptions {
   certificates (mutual TLS) yet.
 * A missing reply within the timeout gives `Kind::Timeout` and the connection
   is dropped (a late reply would desynchronize it). Lost connections give
-  `Kind::Connection`. The timeout applies to each read/write.
+  `Kind::Connection`. The timeout is a total budget per call.
 
 ## Errors
 
@@ -101,7 +101,7 @@ is open server-wide at a time (others wait, then get `Busy`).
 `insert_many(table, rows)` blinds every row locally and sends ONE
 `insert_many` RPC (all-or-nothing). Also `update`, `delete_rows` (tombstones),
 `select(table, &cols, pred)`, `column(...)`. Predicates run on the server
-against **plain** columns: `eq_int`, `eq`, `cmp(col, op, &v)`, `is_in`,
+against **plain** columns: `eq_int`, `eq`, `cmp(col, op, &v)`, `is_in` (the last three return `Result`),
 `and(&[..])`, `or(&[..])`, `all()`.
 
 ## JOIN
@@ -135,13 +135,55 @@ confidentiality is gone.
 `ping`, `tables`, `table_info`, `stats`, `checkpoint`, `backup`, `drop_table`
 (the last four need an `admin` token when auth is on).
 
+## Trust model: the server is untrusted
+
+* **Schema.** Tables you create (or load from your own vault - it stores the
+  policies) are *trusted*; tables only learned via `sync_schema()` are
+  *untrusted*: plain reads work, writes fail with `Kind::UntrustedSchema`
+  (otherwise a lying server could relabel an encrypted column "plain" and
+  receive it in the clear). Opt in with `trust_server_schema: true` or
+  `trust_table(name)`. Unknown policy strings are treated as encrypted.
+* **Replies** are validated: types, array lengths against the request, no
+  silent `filter_map` of bad items, <= 90 digits per integer, frames capped at
+  `min(hello.max_frame, 64 MiB)` (and per call), unsolicited bytes rejected.
+  Anything else is `Kind::Protocol`.
+* **Deadlines.** `timeout` is a TOTAL budget per call (and for DNS+connect and
+  the TLS handshake): a peer that drips bytes cannot extend it.
+* **Authenticated (MAC) mode.** `ConnectOptions { authenticated: true, .. }`
+  adds hidden one-time-padded MAC cells (`__mac__<col>`, alpha kept in the
+  vault, same layout as the Python driver) and verifies SUM/AVG/DOT/reads: a
+  server that edits stored values or lies about aggregates is caught
+  (`Kind::Integrity`). Without it these drivers do **not** detect a lying server.
+* **Secrets.** `Debug` for `ConnectOptions` and `Client` redacts the token,
+  CA bytes, masks and MAC key. The token is refused on an unencrypted
+  non-loopback connection unless `allow_insecure_token`.
+
+## Lost COMMIT replies
+
+`begin()` sends a random transaction id. If a COMMIT's reply is lost the
+client reconnects and asks `tx_status(txid)`: `committed` keeps the new masks;
+`unknown` restores the vault and returns the error; if the status cannot be
+obtained you get `Kind::TransactionInDoubt` with `err.txid`, and BOTH vault
+states are kept. Writes are refused until `reconnect()` and
+`resolve_transaction(&txid, None)` (asks the server) or
+`resolve_transaction(&txid, Some(true|false))`. The vault is restored only on a
+definite server answer; `Busy ... timed out` inside a transaction drops the
+local transaction at once.
+
 ## Differences from the Python driver
 
-* No SQL / PEP 249 cursor; no GROUP BY, ORDER BY, MIN/MAX, scalar-mul.
-* Vault is a plain JSON snapshot written on demand - not the Python driver's
-  append-only checksummed log, no passphrase, no save after every statement.
-* No authenticated (SPDZ MAC) mode.
+* No SQL / PEP 249 cursor; no GROUP BY, ORDER BY, MIN/MAX, scalar-mul. Join
+  WHERE over joined tables is a client-side post-filter on PLAIN columns
+  (`cmp_in("d", "dname", "=", &v)`).
+* Vault is a plain JSON snapshot written on demand (atomic, 0600, directory
+  fsync) - not the Python driver's append-only checksummed log, no passphrase;
+  an in-doubt COMMIT is held in memory only (`save_vault` refuses while one is
+  unresolved).
 * TLS only with `--features tls`; no mutual TLS.
+* Predicate builders `cmp`/`eq`/`is_in` are fallible (`Result`) so invalid
+  values are rejected instead of altered.
+* Integers from the server are limited to 90 digits; long id lists are chunked
+  (the server rejects lists over 200 000).
 
 ## Build & test
 
@@ -156,4 +198,4 @@ Integration tests start a real server subprocess (`$TORUSDB_PYTHON`, else
 `<repo>/.venv/bin/python`, else `python3`, running
 `torussql/server/nokey_server.py --port 0`). When none is found they print
 `SKIP` and return (they show as passed - check stderr). The vector tests read
-`../vectors.json`, so they only run from a checkout of the repository.
+`../vectors.json`, so they only run from a checkout of the repository; the published crate ships no tests (`include` omits `tests/`). Set `TORUSDB_REQUIRE_INTEGRATION=1` to fail instead of skip.

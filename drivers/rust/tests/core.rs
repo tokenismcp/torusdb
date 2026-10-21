@@ -83,9 +83,9 @@ fn predicates_in_comparison_and_or() {
     let Some(s) = Server::start(&[]) else { return };
     let mut db = connect(&s);
     seed_emp(&mut db, "emp");
-    assert_eq!(db.count("emp", is_in("id", &[ci(1), ci(3)])).unwrap(), 2);
-    assert_eq!(db.count("emp", cmp("id", ">", &ci(1))).unwrap(), 2);
-    assert_eq!(db.count("emp", and(&[eq_int("dept", 5), cmp("id", ">", &ci(1))])).unwrap(), 1);
+    assert_eq!(db.count("emp", is_in("id", &[ci(1), ci(3)]).unwrap()).unwrap(), 2);
+    assert_eq!(db.count("emp", cmp("id", ">", &ci(1)).unwrap()).unwrap(), 2);
+    assert_eq!(db.count("emp", and(&[eq_int("dept", 5), cmp("id", ">", &ci(1)).unwrap()])).unwrap(), 1);
     assert_eq!(db.count("emp", or(&[eq_int("id", 1), eq_int("id", 3)])).unwrap(), 2);
     assert_eq!(
         db.sum("emp", "salary", and(&[or(&[eq_int("id", 1), eq_int("id", 3)]), eq_int("dept", 9)])).unwrap(),
@@ -122,7 +122,7 @@ fn insert_many_uses_one_rpc_and_is_all_or_nothing() {
     let ids = db.insert_many("b", rows).unwrap();
     assert_eq!(ids, (0..200).collect::<Vec<i64>>());
     assert_eq!(db.sum("b", "v", all()).unwrap(), int(3 * (199 * 200 / 2)));
-    assert_eq!(db.sum("b", "v", cmp("k", ">", &ci(99))).unwrap(), int(3 * (199 * 200 / 2 - 99 * 100 / 2)));
+    assert_eq!(db.sum("b", "v", cmp("k", ">", &ci(99)).unwrap()).unwrap(), int(3 * (199 * 200 / 2 - 99 * 100 / 2)));
     assert!(db.insert_many("b", vec![]).unwrap().is_empty());
     assert!(db.stats().unwrap().to_string().contains("insert_many"));
     // a bad row anywhere rejects the batch before any RPC; no masks leak

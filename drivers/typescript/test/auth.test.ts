@@ -70,7 +70,7 @@ T("ro role can read blinded data but cannot write", async () => {
   const t = uniq("auth_ro");
   await w.createTable(t, COLS);
   await w.insert(t, { k: 1, v: 10 });
-  const r = await Client.connect(srv.host, srv.port, { token: RO });
+  const r = await Client.connect(srv.host, srv.port, { token: RO, trustServerSchema: true });  // so the SERVER-side check is what refuses
   try {
     assert.equal(await r.count(t), 1);
     await assert.rejects(r.insert(t, { k: 2, v: 5 }), kindOf("Forbidden"));

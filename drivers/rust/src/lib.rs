@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
 //! No-key TorusDB client for Rust (wire protocol v2).
 //!
 //! Talks the no-key delegation protocol to a keyless TorusDB server: the
@@ -10,6 +9,12 @@
 //! Python `torussql-parser`). Wire format, framing and field arithmetic match
 //! the other drivers; see `../vectors.json`.
 //!
+//! **Trust model.** The server is untrusted: every reply is validated, and the
+//! server never decides which columns are encrypted - the policies this client
+//! created (or loaded from its own vault) are the trust anchor. Tables whose
+//! schema was merely learned from the server are read-only for plain columns
+//! (see [`ConnectOptions::trust_server_schema`]).
+//!
 //! Cargo feature `tls` (off by default) adds TLS via rustls; certificates and
 //! hostnames are verified unless [`ConnectOptions::tls_insecure`] is set.
 
@@ -20,19 +25,29 @@ mod field;
 pub use error::{Error, Kind};
 pub use field::{decode, encode_int, encode_rational, n, reduce, Decoded};
 
-use conn::{Conn, TransportOpts};
+use conn::{Conn, TransportOpts, HARD_MAX_FRAME};
 use field::{md, rand_scalar};
 use num_bigint::BigInt;
-use num_traits::Zero;
+use num_integer::Integer;
+use num_traits::{Signed, Zero};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// Newest wire protocol this driver speaks.
 pub const PROTOCOL_VERSION: u64 = 2;
+/// Longest decimal string accepted for any integer from the server.
+pub const MAX_DIGITS: usize = 90;
 
 type Result<T> = std::result::Result<T, Error>;
+
+/// Server-side limit on list arguments is 200 000; stay well under it.
+const LIST_CHUNK: usize = 100_000;
+const MAC: &str = "__mac__";
+const POLICIES: [&str; 3] = ["plain", "encrypted", "paired"];
+const TYPES: [&str; 3] = ["int", "str", "rational"];
 
 // ── column spec / cell values ────────────────────────────────────────────────
 #[derive(Clone, Debug, PartialEq)]
@@ -73,6 +88,64 @@ impl From<Decoded> for CellIn {
     }
 }
 
+// ── strict reply validation ──────────────────────────────────────────────────
+fn proto(m: impl Into<String>) -> Error {
+    Error::protocol(m)
+}
+
+fn big(s: &Value, what: &str) -> Result<BigInt> {
+    let t = s.as_str().ok_or_else(|| proto(format!("bad integer in {}", what)))?;
+    let digits = t.strip_prefix('-').unwrap_or(t);
+    if digits.is_empty() || digits.len() > MAX_DIGITS || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(proto(format!("bad integer in {}", what)));
+    }
+    t.parse::<BigInt>().map_err(|_| proto(format!("bad integer in {}", what)))
+}
+
+const MAX_SAFE: i64 = (1 << 53) - 1;
+
+fn row_id(v: &Value, what: &str) -> Result<i64> {
+    match v.as_i64() {
+        Some(i) if (0..=MAX_SAFE).contains(&i) => Ok(i),
+        _ => Err(proto(format!("bad row id in {}", what))),
+    }
+}
+
+fn arr<'a>(v: &'a Value, what: &str, len: Option<usize>) -> Result<&'a Vec<Value>> {
+    let a = v.as_array().ok_or_else(|| proto(format!("{}: expected a list", what)))?;
+    if let Some(l) = len {
+        if a.len() != l {
+            return Err(proto(format!("{}: expected {} items, got {}", what, l, a.len())));
+        }
+    }
+    Ok(a)
+}
+
+fn string(v: &Value, what: &str) -> Result<String> {
+    v.as_str().map(String::from).ok_or_else(|| proto(format!("{}: expected a string", what)))
+}
+
+fn ids_from(v: &Value, what: &str) -> Result<Vec<i64>> {
+    arr(v, what, None)?.iter().map(|x| row_id(x, what)).collect()
+}
+
+fn norm_policy(p: &str) -> String {
+    // anything we do not recognise is treated as ENCRYPTED
+    if POLICIES.contains(&p) { p.to_string() } else { "encrypted".to_string() }
+}
+fn norm_type(t: &str) -> String {
+    if TYPES.contains(&t) { t.to_string() } else { "int".to_string() }
+}
+fn check_name(kind: &str, n: &str) -> Result<()> {
+    if n.is_empty() {
+        return Err(Error::interface(format!("{} name must not be empty", kind)));
+    }
+    if n.starts_with("__") {
+        return Err(Error::interface(format!("{} names starting with \"__\" are reserved: {}", kind, n)));
+    }
+    Ok(())
+}
+
 // ── wire value codec (mirrors proto/nokey_wire.py) ───────────────────────────
 fn wv(v: &CellIn) -> Result<Value> {
     Ok(match v {
@@ -96,49 +169,64 @@ fn wv_int(v: &BigInt) -> Value {
     json!({"t": "i", "v": v.to_string()})
 }
 
-fn big(s: &Value, what: &str) -> Result<BigInt> {
-    s.as_str()
-        .and_then(|t| BigInt::parse_bytes(t.as_bytes(), 10))
-        .ok_or_else(|| Error::protocol(format!("expected a decimal integer for {}", what)))
-}
-
 fn uwv(d: &Value) -> Result<CellIn> {
-    let tag = d.get("t").and_then(|t| t.as_str()).unwrap_or("");
+    let tag = d.get("t").and_then(|t| t.as_str()).ok_or_else(|| proto("bad wire value"))?;
     match tag {
         "n" => Ok(CellIn::Null),
-        "b" => Ok(CellIn::Bool(d["v"].as_bool().unwrap_or(false))),
+        "b" => Ok(CellIn::Bool(d["v"].as_bool().ok_or_else(|| proto("bad bool cell"))?)),
         "i" => Ok(CellIn::Int(big(&d["v"], "int cell")?)),
-        "s" => Ok(CellIn::Str(d["v"].as_str().unwrap_or("").to_string())),
+        "s" => Ok(CellIn::Str(string(&d["v"], "str cell")?)),
         "f" => {
             let (a, b) = (big(&d["n"], "numerator")?, big(&d["d"], "denominator")?);
             if b.is_zero() {
-                return Err(Error::protocol("zero denominator from server"));
+                return Err(proto("zero denominator from server"));
             }
             Ok(reduce(&a, &b).into())
         }
-        other => Err(Error::protocol(format!("bad wire tag {:?}", other))),
+        other => Err(proto(format!("bad wire tag {:?}", other))),
+    }
+}
+
+/// A blinded scalar from the server (must be an int cell), reduced mod N.
+fn scalar_cell(d: &Value) -> Result<BigInt> {
+    match uwv(d)? {
+        CellIn::Int(b) => Ok(md(&b)),
+        _ => Err(proto("blinded cell is not an integer")),
     }
 }
 
 // ── connection options ───────────────────────────────────────────────────────
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ConnectOptions {
     /// API token; required when the server runs with `--token-file`. Never
-    /// logged or included in errors.
+    /// logged, never in errors, redacted in `Debug`.
     pub token: Option<String>,
-    /// Socket timeout (default 30 s; `None` = block forever).
+    /// Total time budget per call (default 30 s; `None` = block forever).
+    /// Also bounds DNS + connect and the TLS handshake. Must not be zero.
     pub timeout: Option<Duration>,
     /// Wrap the connection in TLS (needs the `tls` cargo feature).
     pub tls: bool,
-    /// PEM CA certificate(s) to trust instead of the built-in web roots.
+    /// PEM CA certificate(s) to trust instead of the built-in web roots. Needs `tls`.
     pub ca_pem: Option<Vec<u8>>,
-    /// DANGEROUS: skip certificate verification. Local development only.
+    /// DANGEROUS: skip certificate verification. Local development only. Needs `tls`.
     pub tls_insecure: bool,
+    /// Send the token over an UNENCRYPTED connection to a non-loopback host
+    /// (refused by default: the token would travel in the clear).
+    pub allow_insecure_token: bool,
     /// Mask-vault file: loaded on connect if it exists; default path of
     /// `save_vault`/`load_vault`.
     pub vault_path: Option<PathBuf>,
     /// Learn tables that exist on the server but not here (schema only).
+    /// Tables learned this way are UNTRUSTED: plain reads work, writes are refused.
     pub sync_schema: bool,
+    /// Allow writes to tables whose policies were learned from the server.
+    /// DANGEROUS: a lying server can mark encrypted columns "plain" and make
+    /// this client send them in the clear.
+    pub trust_server_schema: bool,
+    /// Authenticated (SPDZ MAC) mode: every encrypted cell carries a one-time-
+    /// padded MAC alpha*s (hidden `__mac__<col>` cells, alpha kept in the
+    /// vault) and every affine result / read is verified (`Kind::Integrity`).
+    pub authenticated: bool,
 }
 
 impl Default for ConnectOptions {
@@ -149,9 +237,29 @@ impl Default for ConnectOptions {
             tls: false,
             ca_pem: None,
             tls_insecure: false,
+            allow_insecure_token: false,
             vault_path: None,
             sync_schema: true,
+            trust_server_schema: false,
+            authenticated: false,
         }
+    }
+}
+
+impl fmt::Debug for ConnectOptions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ConnectOptions")
+            .field("token", &self.token.as_ref().map(|_| "<redacted>"))
+            .field("timeout", &self.timeout)
+            .field("tls", &self.tls)
+            .field("ca_pem", &self.ca_pem.as_ref().map(|c| format!("<{} bytes>", c.len())))
+            .field("tls_insecure", &self.tls_insecure)
+            .field("allow_insecure_token", &self.allow_insecure_token)
+            .field("vault_path", &self.vault_path)
+            .field("sync_schema", &self.sync_schema)
+            .field("trust_server_schema", &self.trust_server_schema)
+            .field("authenticated", &self.authenticated)
+            .finish()
     }
 }
 
@@ -221,7 +329,10 @@ impl JoinStep {
 pub struct JoinOptions {
     /// Alias of the FROM table (default: its name).
     pub alias: Option<String>,
-    /// WHERE predicate on the FROM table (`Value::Null` / `None` = all rows).
+    /// WHERE predicate over PLAIN columns. Atoms on the FROM table (no alias,
+    /// or its alias) are evaluated by the server's index; atoms built with
+    /// [`cmp_in`] / [`is_in_of`] on another alias filter the joined rows
+    /// client-side. NULL operands make an atom false, as in SQL.
     pub where_: Option<Value>,
 }
 
@@ -252,16 +363,163 @@ fn plain_key(v: &CellIn) -> Option<String> {
 // ── the no-key client ────────────────────────────────────────────────────────
 type MaskKey = (String, i64, String);
 type Masks = HashMap<MaskKey, BigInt>;
-type Schema = HashMap<String, Vec<Column>>;
+type Undo = Vec<(MaskKey, Option<BigInt>)>;
+
+#[derive(Clone)]
+struct TableDef {
+    cols: Vec<Column>,
+    trusted: bool,
+}
+type Schema = HashMap<String, TableDef>;
+type BlindedRow = (serde_json::Map<String, Value>, Vec<(String, BigInt)>);
 
 pub struct Client {
     conn: Conn,
-    masks: Masks, // (table, rowid, col) -> r
+    masks: Masks, // (table, rowid, col) -> r   (SECRET)
     schema: Schema,
     in_tx: bool,
-    snapshot: Option<(Masks, Schema)>,
+    txid: Option<String>,
+    undo: Option<Undo>,         // mask journal of the open transaction
+    tx_schema: Option<Schema>,  // schema at begin()
+    in_doubt: HashMap<String, (Undo, Schema)>,
     vault_path: Option<PathBuf>,
     info: ServerInfo,
+    addr: String,
+    opts: ConnectOptions, // holds the token: private, redacted in Debug
+    alpha: BigInt,        // SECRET MAC key
+}
+
+impl fmt::Debug for Client {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Client")
+            .field("addr", &self.addr)
+            .field("closed", &self.conn.is_closed())
+            .field("in_transaction", &self.in_tx)
+            .field("masks", &format_args!("{} (redacted)", self.masks.len()))
+            .finish()
+    }
+}
+
+fn is_loopback(addr: &str) -> bool {
+    let host = match addr.rsplit_once(':') {
+        Some((h, _)) => h.trim_start_matches('[').trim_end_matches(']'),
+        None => addr,
+    };
+    host == "localhost"
+        || host.parse::<std::net::IpAddr>().map(|ip| ip.is_loopback()).unwrap_or(false)
+}
+
+fn validate_opts(addr: &str, o: &ConnectOptions) -> Result<()> {
+    if let Some(t) = o.timeout {
+        if t.is_zero() {
+            return Err(Error::interface("timeout must be positive (use None for no timeout)"));
+        }
+    }
+    if !o.tls && (o.ca_pem.is_some() || o.tls_insecure) {
+        return Err(Error::interface(
+            "`ca_pem` / `tls_insecure` were given without `tls: true`; refusing to continue unencrypted",
+        ));
+    }
+    if o.token.as_deref().map(|t| !t.is_empty()).unwrap_or(false)
+        && !o.tls
+        && !is_loopback(addr)
+        && !o.allow_insecure_token
+    {
+        return Err(Error::interface(format!(
+            "refusing to send the token to {} over an unencrypted connection; \
+             use tls: true (or allow_insecure_token: true if you really mean it)",
+            addr
+        )));
+    }
+    Ok(())
+}
+
+/// Connect + hello + auth.
+fn open_session(addr: &str, o: &ConnectOptions) -> Result<(Conn, ServerInfo)> {
+    let mut conn = Conn::open(
+        addr,
+        &TransportOpts {
+            timeout: o.timeout,
+            tls: o.tls,
+            tls_insecure: o.tls_insecure,
+            ca_pem: o.ca_pem.as_deref(),
+        },
+    )?;
+    let r = (|| -> Result<ServerInfo> {
+        let info = match conn.call("hello", json!([]), HARD_MAX_FRAME) {
+            Ok(h) => parse_hello(&h)?,
+            Err(e)
+                if e.kind == Kind::BadRequest
+                    && (e.message.contains("unknown method") || e.message.contains("_rpc_hello")) =>
+            {
+                ServerInfo { protocol: 1, ..Default::default() } // protocol-1 server
+            }
+            Err(e) => return Err(e),
+        };
+        if info.protocol > PROTOCOL_VERSION {
+            return Err(Error::interface(format!(
+                "server speaks protocol {}; this driver supports up to {} - upgrade the driver",
+                info.protocol, PROTOCOL_VERSION
+            )));
+        }
+        let mf = info.max_frame.map(|m| m as usize).unwrap_or(HARD_MAX_FRAME);
+        conn.max_read = mf.min(HARD_MAX_FRAME);
+        conn.max_write = mf;
+        if info.auth_required {
+            match o.token.as_deref() {
+                None | Some("") => {
+                    return Err(Error::new(
+                        Kind::Unauthenticated,
+                        "the server requires a token (set ConnectOptions::token)",
+                    ))
+                }
+                Some(t) => {
+                    conn.call("auth", json!([t]), 4096)?;
+                }
+            }
+        }
+        Ok(info)
+    })();
+    match r {
+        Ok(info) => Ok((conn, info)),
+        Err(e) => {
+            conn.close();
+            Err(e)
+        }
+    }
+}
+
+fn parse_hello(h: &Value) -> Result<ServerInfo> {
+    let o = h.as_object().ok_or_else(|| proto("hello: expected an object"))?;
+    let protocol = o
+        .get("protocol")
+        .and_then(|v| v.as_u64())
+        .filter(|p| *p >= 1)
+        .ok_or_else(|| proto("hello.protocol: expected a positive integer"))?;
+    let auth_required = o
+        .get("auth_required")
+        .and_then(|v| v.as_bool())
+        .ok_or_else(|| proto("hello.auth_required: expected a boolean"))?;
+    let mut info = ServerInfo { protocol, auth_required, ..Default::default() };
+    if let Some(s) = o.get("server") {
+        info.server = Some(string(s, "hello.server")?);
+    }
+    if let Some(m) = o.get("max_frame") {
+        let m = m.as_u64().filter(|m| *m >= 1024).ok_or_else(|| proto("hello.max_frame: bad value"))?;
+        info.max_frame = Some(m);
+    }
+    if let Some(p) = o.get("persistent") {
+        info.persistent = Some(p.as_bool().ok_or_else(|| proto("hello.persistent: expected a boolean"))?);
+    }
+    Ok(info)
+}
+
+fn chunks(xs: &[i64]) -> Vec<&[i64]> {
+    if xs.is_empty() {
+        vec![]
+    } else {
+        xs.chunks(LIST_CHUNK).collect()
+    }
 }
 
 impl Client {
@@ -271,26 +529,27 @@ impl Client {
     }
 
     pub fn connect_with(addr: &str, o: &ConnectOptions) -> Result<Client> {
-        let conn = Conn::open(
-            addr,
-            &TransportOpts {
-                timeout: o.timeout,
-                tls: o.tls,
-                tls_insecure: o.tls_insecure,
-                ca_pem: o.ca_pem.as_deref(),
-            },
-        )?;
+        validate_opts(addr, o)?;
+        let (conn, info) = open_session(addr, o)?;
         let mut c = Client {
             conn,
             masks: HashMap::new(),
             schema: HashMap::new(),
             in_tx: false,
-            snapshot: None,
+            txid: None,
+            undo: None,
+            tx_schema: None,
+            in_doubt: HashMap::new(),
             vault_path: o.vault_path.clone(),
-            info: ServerInfo { protocol: 1, ..Default::default() },
+            info,
+            addr: addr.to_string(),
+            opts: o.clone(),
+            alpha: BigInt::zero(),
         };
+        if o.authenticated {
+            c.alpha = BigInt::from(1) + md(&rand_scalar()).mod_floor(&(n() - 1));
+        }
         let r = (|| -> Result<()> {
-            c.handshake(o.token.as_deref())?;
             if let Some(p) = &o.vault_path {
                 if p.exists() {
                     c.load_vault(Some(p))?;
@@ -308,51 +567,6 @@ impl Client {
         Ok(c)
     }
 
-    fn handshake(&mut self, token: Option<&str>) -> Result<()> {
-        match self.call("hello", json!([])) {
-            Ok(h) => {
-                self.info = ServerInfo {
-                    protocol: h["protocol"].as_u64().unwrap_or(1),
-                    server: h["server"].as_str().map(String::from),
-                    auth_required: h["auth_required"].as_bool().unwrap_or(false),
-                    max_frame: h["max_frame"].as_u64(),
-                    persistent: h["persistent"].as_bool(),
-                };
-            }
-            Err(e)
-                if e.kind == Kind::BadRequest
-                    && (e.message.contains("unknown method") || e.message.contains("_rpc_hello")) =>
-            {
-                self.info = ServerInfo { protocol: 1, ..Default::default() }; // protocol-1 server
-            }
-            Err(e) => return Err(e),
-        }
-        if self.info.protocol > PROTOCOL_VERSION {
-            return Err(Error::interface(format!(
-                "server speaks protocol {}; this driver supports up to {} - upgrade the driver",
-                self.info.protocol, PROTOCOL_VERSION
-            )));
-        }
-        if self.info.auth_required {
-            match token {
-                None | Some("") => {
-                    return Err(Error::new(
-                        Kind::Unauthenticated,
-                        "the server requires a token (set ConnectOptions::token)",
-                    ))
-                }
-                Some(t) => {
-                    self.call("auth", json!([t]))?;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn call(&mut self, method: &str, args: Value) -> Result<Value> {
-        self.conn.call(method, args)
-    }
-
     /// What the server announced in `hello`.
     pub fn server_info(&self) -> &ServerInfo {
         &self.info
@@ -361,7 +575,9 @@ impl Client {
     /// Close the connection (an open transaction is rolled back by the server).
     pub fn close(&mut self) {
         self.in_tx = false;
-        self.snapshot = None;
+        self.undo = None;
+        self.tx_schema = None;
+        self.txid = None;
         self.conn.close();
     }
 
@@ -369,85 +585,151 @@ impl Client {
         self.conn.is_closed()
     }
 
+    /// One RPC with transaction-state bookkeeping.
+    fn call_max(&mut self, method: &str, args: Value, max_reply: usize) -> Result<Value> {
+        if self.conn.is_closed() {
+            return Err(self.conn.reason());
+        }
+        match self.conn.call(method, args, max_reply) {
+            Ok(v) => Ok(v),
+            Err(e) => {
+                if self.in_tx && method != "tx_commit" && method != "tx_rollback" {
+                    match e.kind {
+                        // the server rolls back when the session dies
+                        Kind::Connection | Kind::Timeout | Kind::Protocol => self.abort_local(),
+                        // the server aborted the transaction and keeps the session
+                        // aborted until ROLLBACK
+                        Kind::Busy if e.message.contains("timed out") => {
+                            self.abort_local();
+                            let _ = self.conn.call("tx_rollback", json!([]), 4096);
+                        }
+                        _ => {}
+                    }
+                }
+                Err(e)
+            }
+        }
+    }
+
+    fn call(&mut self, method: &str, args: Value) -> Result<Value> {
+        self.call_max(method, args, HARD_MAX_FRAME)
+    }
+
     // — operations —
     pub fn ping(&mut self) -> Result<bool> {
-        Ok(self.call("ping", json!([]))?.as_str() == Some("pong"))
+        Ok(self.call_max("ping", json!([]), 4096)?.as_str() == Some("pong"))
     }
     /// Server counters (admin token when auth is on).
     pub fn stats(&mut self) -> Result<Value> {
-        self.call("stats", json!([]))
+        let v = self.call("stats", json!([]))?;
+        if !v.is_object() {
+            return Err(proto("stats: expected an object"));
+        }
+        Ok(v)
     }
     pub fn checkpoint(&mut self) -> Result<i64> {
-        Ok(self.call("checkpoint", json!([]))?.as_i64().unwrap_or(0))
+        self.call_max("checkpoint", json!([]), 4096)?
+            .as_i64()
+            .ok_or_else(|| proto("checkpoint: expected an integer"))
     }
     /// Ask the server to write a checksummed backup (admin); returns its path.
     pub fn backup(&mut self) -> Result<String> {
-        Ok(self.call("backup", json!([]))?.as_str().unwrap_or("").to_string())
+        string(&self.call_max("backup", json!([]), 1 << 16)?, "backup")
     }
     pub fn tables(&mut self) -> Result<Vec<String>> {
-        Ok(self
-            .call("tables", json!([]))?
-            .as_array()
-            .ok_or_else(|| Error::protocol("tables: expected a list"))?
-            .iter()
-            .filter_map(|v| v.as_str().map(String::from))
-            .collect())
+        let v = self.call("tables", json!([]))?;
+        arr(&v, "tables", None)?.iter().map(|x| string(x, "tables item")).collect()
     }
     pub fn table_info(&mut self, table: &str) -> Result<TableInfo> {
         let v = self.call("table_info", json!([table]))?;
-        Ok(TableInfo {
-            rows: v["rows"].as_i64().unwrap_or(0),
-            deleted: v["deleted"]
-                .as_array()
-                .map(|a| a.iter().filter_map(|x| x.as_i64()).collect())
-                .unwrap_or_default(),
-        })
+        let o = v.as_object().ok_or_else(|| proto("table_info: expected an object"))?;
+        let rows = o
+            .get("rows")
+            .and_then(|r| r.as_i64())
+            .filter(|r| *r >= 0)
+            .ok_or_else(|| proto("table_info.rows: expected a non-negative integer"))?;
+        let deleted = ids_from(o.get("deleted").unwrap_or(&Value::Null), "table_info.deleted")?;
+        Ok(TableInfo { rows, deleted })
     }
 
-    /// Learn tables that exist on the server but not here (schema only).
+    /// Learn tables that exist on the server but not here. They are UNTRUSTED
+    /// (policies came from the server): plain reads work, writes are refused
+    /// unless `trust_server_schema`. Never overwrites a table already known.
     pub fn sync_schema(&mut self) -> Result<Vec<String>> {
         let mut added = vec![];
         for t in self.tables()? {
             if self.schema.contains_key(&t) {
                 continue;
             }
-            let cols = self.call("schema", json!([t]))?;
-            let cols: Vec<Column> = cols
-                .as_array()
-                .ok_or_else(|| Error::protocol("schema: expected a list"))?
-                .iter()
-                .map(|c| Column {
-                    name: c[0].as_str().unwrap_or("").into(),
-                    ty: c[1].as_str().unwrap_or("").into(),
-                    policy: c[2].as_str().unwrap_or("").into(),
-                })
-                .collect();
-            self.schema.insert(t.clone(), cols);
+            let v = self.call("schema", json!([t]))?;
+            let mut cols = vec![];
+            for c in arr(&v, "schema", None)? {
+                let a = arr(c, "schema column", Some(3))?;
+                cols.push(Column {
+                    name: string(&a[0], "column name")?,
+                    ty: norm_type(&string(&a[1], "column type")?),
+                    policy: norm_policy(&string(&a[2], "column policy")?),
+                });
+            }
+            self.schema.insert(t.clone(), TableDef { cols, trusted: false });
             added.push(t);
         }
         Ok(added)
     }
 
+    /// Mark a server-learned table as trusted for writes (you vouch for its policies).
+    pub fn trust_table(&mut self, table: &str) -> Result<()> {
+        let d = self
+            .schema
+            .get_mut(table)
+            .ok_or_else(|| Error::interface(format!("unknown table: {}", table)))?;
+        d.trusted = true;
+        Ok(())
+    }
+
     // — DDL —
     pub fn create_table(&mut self, name: &str, cols: Vec<Column>) -> Result<()> {
+        self.assert_writable()?;
+        check_name("table", name)?;
+        let mut seen = HashSet::new();
+        for c in &cols {
+            check_name("column", &c.name)?;
+            if !seen.insert(c.name.clone()) {
+                return Err(Error::interface(format!("duplicate column: {}", c.name)));
+            }
+            if !POLICIES.contains(&c.policy.as_str()) {
+                return Err(Error::interface(format!("bad policy for {}: {}", c.name, c.policy)));
+            }
+            if !TYPES.contains(&c.ty.as_str()) {
+                return Err(Error::interface(format!("bad type for {}: {}", c.name, c.ty)));
+            }
+        }
         let wire: Vec<Value> = cols.iter().map(|c| json!([c.name, c.ty, c.policy])).collect();
         self.call("create", json!([name, wire]))?;
-        self.schema.insert(name.to_string(), cols);
+        self.schema.insert(name.to_string(), TableDef { cols, trusted: true });
         Ok(())
     }
 
     /// Drop a table (admin). Forgets its masks.
     pub fn drop_table(&mut self, name: &str) -> Result<()> {
+        self.assert_writable()?;
         self.call("drop", json!([name]))?;
         self.schema.remove(name);
-        self.masks.retain(|k, _| k.0 != name);
+        let keys: Vec<MaskKey> = self.masks.keys().filter(|k| k.0 == name).cloned().collect();
+        for k in keys {
+            self.del_mask(&k);
+        }
         Ok(())
     }
 
-    fn cols(&self, table: &str) -> Result<&Vec<Column>> {
+    fn def(&self, table: &str) -> Result<&TableDef> {
         self.schema
             .get(table)
             .ok_or_else(|| Error::interface(format!("unknown table: {}", table)))
+    }
+
+    fn cols(&self, table: &str) -> Result<&Vec<Column>> {
+        Ok(&self.def(table)?.cols)
     }
 
     fn col(&self, table: &str, name: &str) -> Result<&Column> {
@@ -459,6 +741,59 @@ impl Client {
 
     fn policy(&self, table: &str, col: &str) -> Result<String> {
         Ok(self.col(table, col)?.policy.clone())
+    }
+
+    fn assert_writable(&self) -> Result<()> {
+        if !self.in_doubt.is_empty() {
+            let mut ids: Vec<&String> = self.in_doubt.keys().collect();
+            ids.sort();
+            return Err(Error::interface(format!(
+                "unresolved in-doubt transaction(s) {}: call resolve_transaction() before writing",
+                ids.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+            )));
+        }
+        Ok(())
+    }
+
+    fn assert_trusted(&self, table: &str) -> Result<()> {
+        if !self.def(table)?.trusted && !self.opts.trust_server_schema {
+            return Err(Error::new(
+                Kind::UntrustedSchema,
+                format!(
+                    "refusing to write to {}: its encryption policies were learned from the server, \
+                     which could mislabel an encrypted column as plain. Create the table from this \
+                     client / load the vault that created it, or set trust_server_schema (or trust_table()).",
+                    table
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    // — mask vault with an undo journal (cheap transactions) —
+    fn set_mask(&mut self, k: MaskKey, r: BigInt) {
+        if let Some(u) = &mut self.undo {
+            u.push((k.clone(), self.masks.get(&k).cloned()));
+        }
+        self.masks.insert(k, r);
+    }
+    fn del_mask(&mut self, k: &MaskKey) {
+        if let Some(u) = &mut self.undo {
+            u.push((k.clone(), self.masks.get(k).cloned()));
+        }
+        self.masks.remove(k);
+    }
+    fn apply_undo(masks: &mut Masks, u: Undo) {
+        for (k, prev) in u.into_iter().rev() {
+            match prev {
+                Some(p) => {
+                    masks.insert(k, p);
+                }
+                None => {
+                    masks.remove(&k);
+                }
+            }
+        }
     }
 
     // — blinding —
@@ -478,12 +813,33 @@ impl Client {
         }
     }
 
+    /// Blinded wire cells (value + optional MAC) and the masks to remember.
+    #[allow(clippy::type_complexity)]
+    fn blind_cell(
+        &self,
+        table: &str,
+        col: &str,
+        v: &CellIn,
+    ) -> Result<(Vec<(String, Value)>, Vec<(String, BigInt)>)> {
+        let s = Self::encode_cell(v, table, col)?;
+        let r = rand_scalar();
+        let mut cells = vec![(col.to_string(), wv_int(&md(&(&s + &r))))];
+        let mut masks = vec![(col.to_string(), r)];
+        if self.opts.authenticated {
+            let r2 = rand_scalar();
+            cells.push((format!("{}{}", MAC, col), wv_int(&md(&(md(&(&self.alpha * &s)) + &r2)))));
+            masks.push((format!("{}{}", MAC, col), r2));
+        }
+        Ok((cells, masks))
+    }
+
     #[allow(clippy::type_complexity)]
     fn blind_row(
         &self,
         table: &str,
         row: &[(&str, CellIn)],
     ) -> Result<(serde_json::Map<String, Value>, Vec<(String, BigInt)>)> {
+        self.assert_trusted(table)?;
         let cols = self.cols(table)?;
         let mut seen = HashSet::new();
         for (k, _) in row {
@@ -507,10 +863,11 @@ impl Client {
             if c.policy == "plain" {
                 wire.insert(c.name.clone(), wv(v)?);
             } else {
-                let s = Self::encode_cell(v, table, &c.name)?;
-                let r = rand_scalar();
-                wire.insert(c.name.clone(), wv_int(&md(&(&s + &r))));
-                pending.push((c.name.clone(), r));
+                let (cells, masks) = self.blind_cell(table, &c.name, v)?;
+                for (n, w) in cells {
+                    wire.insert(n, w);
+                }
+                pending.extend(masks);
             }
         }
         Ok((wire, pending))
@@ -518,65 +875,80 @@ impl Client {
 
     /// INSERT: blind encrypted cells, keep the masks locally. Returns the row id.
     pub fn insert(&mut self, table: &str, row: Vec<(&str, CellIn)>) -> Result<i64> {
+        self.assert_writable()?;
         let (wire, pending) = self.blind_row(table, &row)?;
-        let rowid = self
-            .call("insert", json!([table, Value::Object(wire)]))?
-            .as_i64()
-            .ok_or_else(|| Error::protocol("insert: expected a row id"))?;
+        let v = self.call_max("insert", json!([table, Value::Object(wire)]), 4096)?;
+        let rowid = row_id(&v, "insert")?;
         for (col, r) in pending {
-            self.masks.insert((table.to_string(), rowid, col), r);
+            self.set_mask((table.to_string(), rowid, col), r);
         }
         Ok(rowid)
     }
 
-    /// Bulk insert: all rows are blinded locally and sent in ONE `insert_many`
-    /// RPC (all-or-nothing on the server). Returns the new row ids.
+    /// Bulk insert: all rows are blinded locally and sent in `insert_many` round
+    /// trips of at most 50 000 rows (all-or-nothing: wrapped in a transaction
+    /// when more than one is needed). Returns the new row ids.
     pub fn insert_many(&mut self, table: &str, rows: Vec<Vec<(&str, CellIn)>>) -> Result<Vec<i64>> {
+        self.assert_writable()?;
         if rows.is_empty() {
             return Ok(vec![]);
         }
-        let mut wires = vec![];
-        let mut pendings = vec![];
+        let mut blinded = vec![];
         for r in &rows {
-            let (w, p) = self.blind_row(table, r)?;
-            wires.push(Value::Object(w));
-            pendings.push(p);
+            blinded.push(self.blind_row(table, r)?);
         }
-        let ids = self.call("insert_many", json!([table, wires]))?;
-        let ids: Vec<i64> = ids
-            .as_array()
-            .ok_or_else(|| Error::protocol("insert_many: expected a list"))?
-            .iter()
-            .filter_map(|v| v.as_i64())
-            .collect();
-        if ids.len() != rows.len() {
-            return Err(Error::protocol("insert_many returned a wrong number of row ids"));
-        }
-        for (rid, p) in ids.iter().zip(pendings) {
-            for (col, r) in p {
-                self.masks.insert((table.to_string(), *rid, col), r);
+        const PER: usize = 50_000;
+        let table = table.to_string();
+        let send = move |db: &mut Client, blinded: Vec<BlindedRow>| -> Result<Vec<i64>> {
+            let mut all = vec![];
+            let mut it = blinded.into_iter().peekable();
+            while it.peek().is_some() {
+                let part: Vec<_> = it.by_ref().take(PER).collect();
+                let wires: Vec<Value> = part.iter().map(|(w, _)| Value::Object(w.clone())).collect();
+                let v = db.call_max("insert_many", json!([table, wires]), part.len() * 24 + 4096)?;
+                let ids = arr(&v, "insert_many", Some(part.len()))?
+                    .iter()
+                    .map(|x| row_id(x, "insert_many"))
+                    .collect::<Result<Vec<i64>>>()?;
+                for (rid, (_, pending)) in ids.iter().zip(part) {
+                    for (col, r) in pending {
+                        db.set_mask((table.clone(), *rid, col), r);
+                    }
+                }
+                all.extend(ids);
             }
+            Ok(all)
+        };
+        if blinded.len() > PER {
+            self.atomically(|db| send(db, blinded))
+        } else {
+            send(self, blinded)
         }
-        Ok(ids)
     }
 
     /// UPDATE ... SET col = value WHERE pred. Atomic (implicit transaction when
     /// none is open). Returns the number of rows changed.
     pub fn update(&mut self, table: &str, set: Vec<(&str, CellIn)>, pred: Value) -> Result<usize> {
+        self.assert_writable()?;
+        self.assert_trusted(table)?;
         for (c, _) in &set {
             self.col(table, c)?;
         }
+        let pred = wire_pred(&pred)?;
         self.atomically(|db| {
             let idxs = db.matching(table, pred)?;
             for i in &idxs {
                 for (col, v) in &set {
                     if db.policy(table, col)? == "plain" {
-                        db.call("update_cell", json!([table, i, col, wv(v)?]))?;
+                        db.call_max("update_cell", json!([table, i, col, wv(v)?]), 4096)?;
                     } else {
-                        let s = Self::encode_cell(v, table, col)?;
-                        let r = rand_scalar();
-                        db.call("update_cell", json!([table, i, col, wv_int(&md(&(&s + &r)))]))?;
-                        db.masks.insert((table.to_string(), *i, col.to_string()), r);
+                        let (cells, masks) = db.blind_cell(table, col, v)?;
+                        for (n, w) in cells {
+                            db.call_max("update_cell", json!([table, i, n, w]), 4096)?;
+                        }
+                        for (n, r) in masks {
+                            db.set_mask((table.to_string(), *i, n), r);
+                        }
                     }
                 }
             }
@@ -586,12 +958,20 @@ impl Client {
 
     /// DELETE FROM table WHERE pred (tombstones). Returns how many rows were removed.
     pub fn delete_rows(&mut self, table: &str, pred: Value) -> Result<i64> {
+        self.assert_writable()?;
         self.cols(table)?;
+        let pred = wire_pred(&pred)?;
         let idxs = self.matching(table, pred)?;
-        if idxs.is_empty() {
-            return Ok(0);
+        let mut n = 0;
+        for part in chunks(&idxs) {
+            let k = self
+                .call_max("delete_rows", json!([table, part]), 4096)?
+                .as_i64()
+                .filter(|k| *k >= 0 && *k as usize <= part.len())
+                .ok_or_else(|| proto("delete_rows: implausible count"))?;
+            n += k;
         }
-        Ok(self.call("delete_rows", json!([table, idxs]))?.as_i64().unwrap_or(0))
+        Ok(n)
     }
 
     fn atomically<T>(&mut self, f: impl FnOnce(&mut Client) -> Result<T>) -> Result<T> {
@@ -616,44 +996,190 @@ impl Client {
         self.in_tx
     }
 
-    /// Open a transaction. The client snapshots its mask vault and schema so a
-    /// rollback (or failed commit) restores them exactly.
+    /// Ids of COMMITs whose outcome is still unknown.
+    pub fn in_doubt_transactions(&self) -> Vec<String> {
+        let mut v: Vec<String> = self.in_doubt.keys().cloned().collect();
+        v.sort();
+        v
+    }
+
+    /// Open a transaction (with a fresh random id, so a lost COMMIT can be
+    /// settled via `tx_status`). Every mask change is journaled so a rollback
+    /// (or failed commit) restores the vault exactly.
     pub fn begin(&mut self) -> Result<()> {
+        self.assert_writable()?;
         if self.in_tx {
             return Err(Error::interface("a transaction is already open"));
         }
-        let snap = (self.masks.clone(), self.schema.clone());
-        self.call("tx_begin", json!([]))?; // if this fails nothing changed
-        self.snapshot = Some(snap);
+        let mut b = [0u8; 16];
+        rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut b);
+        let txid: String = b.iter().map(|x| format!("{:02x}", x)).collect();
+        self.call_max("tx_begin", json!([txid]), 4096)?; // if this fails nothing changed
+        self.txid = Some(txid);
+        self.undo = Some(vec![]);
+        self.tx_schema = Some(self.schema.clone());
         self.in_tx = true;
         Ok(())
     }
 
-    fn restore(&mut self) {
-        if let Some((m, s)) = self.snapshot.take() {
-            self.masks = m;
+    /// The server definitely holds no transaction for us: drop the local one.
+    fn abort_local(&mut self) {
+        if let Some(u) = self.undo.take() {
+            Self::apply_undo(&mut self.masks, u);
+        }
+        if let Some(s) = self.tx_schema.take() {
             self.schema = s;
         }
+        self.txid = None;
         self.in_tx = false;
     }
 
-    /// Commit. No-op outside a transaction. A failed commit restores the
-    /// pre-transaction vault (the server did not commit).
+    fn end_local(&mut self) {
+        self.undo = None;
+        self.tx_schema = None;
+        self.txid = None;
+        self.in_tx = false;
+    }
+
+    /// Commit. No-op outside a transaction. If the reply is lost the outcome is
+    /// settled with `tx_status` on a fresh connection; the vault is restored ONLY
+    /// when the server definitely did not commit. If that cannot be learned the
+    /// result is `Kind::TransactionInDoubt` (with `txid`) and BOTH states are kept.
     pub fn commit(&mut self) -> Result<()> {
         if !self.in_tx {
             return Ok(());
         }
-        match self.call("tx_commit", json!([])) {
+        let txid = self.txid.clone().unwrap_or_default();
+        match self.conn.call("tx_commit", json!([]), 4096) {
             Ok(_) => {
-                self.snapshot = None;
-                self.in_tx = false;
+                self.end_local();
                 Ok(())
             }
+            Err(e) if matches!(e.kind, Kind::Connection | Kind::Timeout | Kind::Protocol) => {
+                self.settle_lost_commit(&txid, e)
+            }
             Err(e) => {
-                self.restore();
+                // the server ANSWERED with an error: it holds no committed transaction
+                self.abort_local();
+                let _ = self.conn.call("tx_rollback", json!([]), 4096);
                 Err(e)
             }
         }
+    }
+
+    fn move_to_in_doubt(&mut self, txid: &str) {
+        let undo = self.undo.take().unwrap_or_default();
+        let schema = self.tx_schema.take().unwrap_or_else(|| self.schema.clone());
+        self.in_doubt.insert(txid.to_string(), (undo, schema));
+        self.end_local();
+    }
+
+    fn ask_status(txid: &str, conn: &mut Conn) -> Result<String> {
+        for i in 0.. {
+            let s = string(&conn.call("tx_status", json!([txid]), 4096)?, "tx_status")?;
+            if s != "open" || i >= 10 {
+                return Ok(s);
+            }
+            std::thread::sleep(Duration::from_millis(100)); // the dead session may still be unwinding
+        }
+        unreachable!()
+    }
+
+    fn settle_lost_commit(&mut self, txid: &str, cause: Error) -> Result<()> {
+        self.conn.close(); // the old session (and its tx) must go first
+        let fresh = open_session(&self.addr, &self.opts).and_then(|(mut c, info)| {
+            match Self::ask_status(txid, &mut c) {
+                Ok(s) => Ok((c, info, s)),
+                Err(e) => {
+                    c.close();
+                    Err(e)
+                }
+            }
+        });
+        let (conn, info, status) = match fresh {
+            Ok(x) => x,
+            Err(e) => {
+                self.move_to_in_doubt(txid);
+                let mut err = Error::new(
+                    Kind::TransactionInDoubt,
+                    format!(
+                        "COMMIT of transaction {} was sent but its reply was lost ({}) and the outcome \
+                         could not be learned ({}). The client keeps both vault states; call \
+                         reconnect() then resolve_transaction(\"{}\", None).",
+                        txid, cause.message, e.message, txid
+                    ),
+                );
+                err.txid = Some(txid.to_string());
+                return Err(err);
+            }
+        };
+        match status.as_str() {
+            "committed" => {
+                self.conn = conn;
+                self.info = info;
+                self.end_local(); // it DID commit: keep the new masks
+                Ok(())
+            }
+            "unknown" => {
+                self.conn = conn;
+                self.info = info;
+                self.abort_local();
+                Err(Error::new(
+                    cause.kind,
+                    format!("COMMIT of transaction {} did not take effect ({}); rolled back", txid, cause.message),
+                ))
+            }
+            other => {
+                let mut c = conn;
+                c.close();
+                self.move_to_in_doubt(txid);
+                let mut err = Error::new(
+                    Kind::TransactionInDoubt,
+                    format!("transaction {} is still {:?} on the server", txid, other),
+                );
+                err.txid = Some(txid.to_string());
+                Err(err)
+            }
+        }
+    }
+
+    /// Re-open the connection (same address/credentials).
+    pub fn reconnect(&mut self) -> Result<()> {
+        self.conn.close();
+        let (conn, info) = open_session(&self.addr, &self.opts)?;
+        self.conn = conn;
+        self.info = info;
+        self.end_local();
+        Ok(())
+    }
+
+    /// Settle an in-doubt COMMIT. With `Some(committed)` trust the caller;
+    /// with `None` ask the server (`tx_status`) over the current connection.
+    pub fn resolve_transaction(&mut self, txid: &str, committed: Option<bool>) -> Result<bool> {
+        if !self.in_doubt.contains_key(txid) {
+            return Err(Error::interface(format!("no in-doubt transaction {}", txid)));
+        }
+        let committed = match committed {
+            Some(c) => c,
+            None => {
+                let status = Self::ask_status(txid, &mut self.conn)?;
+                if status == "open" {
+                    let mut err = Error::new(
+                        Kind::TransactionInDoubt,
+                        format!("transaction {} is still open on the server", txid),
+                    );
+                    err.txid = Some(txid.to_string());
+                    return Err(err);
+                }
+                status == "committed"
+            }
+        };
+        let (undo, schema) = self.in_doubt.remove(txid).unwrap();
+        if !committed {
+            Self::apply_undo(&mut self.masks, undo);
+            self.schema = schema;
+        }
+        Ok(committed)
     }
 
     /// Roll back server state and the local mask vault. No-op outside a transaction.
@@ -661,8 +1187,8 @@ impl Client {
         if !self.in_tx {
             return Ok(());
         }
-        let r = self.call("tx_rollback", json!([]));
-        self.restore(); // masks restored even if the RPC failed
+        let r = self.conn.call("tx_rollback", json!([]), 4096);
+        self.abort_local(); // masks restored even if the RPC failed
         r.map(|_| ())
     }
 
@@ -687,14 +1213,23 @@ impl Client {
 
     // — selection —
     fn matching(&mut self, table: &str, pred: Value) -> Result<Vec<i64>> {
-        self.cols(table)?;
-        Ok(self
-            .call("matching_rowids", json!([table, pred]))?
-            .as_array()
-            .ok_or_else(|| Error::protocol("matching_rowids: expected a list"))?
-            .iter()
-            .filter_map(|v| v.as_i64())
-            .collect())
+        let cols = self.cols(table)?;
+        if let Some(groups) = pred.get("or").and_then(|g| g.as_array()) {
+            for atom in groups.iter().filter_map(|g| g.as_array()).flatten() {
+                if let Some(name) = atom.get("c").and_then(|c| c.as_str()) {
+                    if let Some(c) = cols.iter().find(|c| c.name == name) {
+                        if c.policy != "plain" {
+                            return Err(Error::interface(format!(
+                                "predicates on encrypted column '{}' are not supported",
+                                name
+                            )));
+                        }
+                    }
+                }
+            }
+        }
+        let v = self.call("matching_rowids", json!([table, pred]))?;
+        ids_from(&v, "matching_rowids")
     }
 
     fn mask(&self, table: &str, i: i64, col: &str) -> Result<&BigInt> {
@@ -718,28 +1253,57 @@ impl Client {
         Ok(())
     }
 
+    /// (Σ blinded cells − Σ masks) of one physical column, chunked.
+    fn sum_one(&mut self, table: &str, c: &str, idxs: &[i64]) -> Result<BigInt> {
+        let mut b = BigInt::zero();
+        for part in chunks(idxs) {
+            let v = self.call_max("blinded_sum", json!([table, c, part]), 4096)?;
+            b = md(&(b + md(&big(&v, "blinded_sum")?)));
+        }
+        let mut m = BigInt::zero();
+        for i in idxs {
+            m = md(&(m + self.mask(table, *i, c)?));
+        }
+        Ok(md(&(b - m)))
+    }
+
+    /// Σ over rows, MAC-verified when authenticated.
+    fn sum_scalar(&mut self, table: &str, col: &str, idxs: &[i64]) -> Result<BigInt> {
+        let y = self.sum_one(table, col, idxs)?;
+        if self.opts.authenticated {
+            let m = self.sum_one(table, &format!("{}{}", MAC, col), idxs)?;
+            if m != md(&(&self.alpha * &y)) {
+                return Err(Error::new(
+                    Kind::Integrity,
+                    format!("MAC check failed on sum({}) - server returned a forged/incorrect aggregate", col),
+                ));
+            }
+        }
+        Ok(y)
+    }
+
     /// Π_lin: SUM over matched rows (the server never holds a key).
     pub fn sum(&mut self, table: &str, col: &str, pred: Value) -> Result<Decoded> {
+        self.encrypted_col(table, col)?;
+        let pred = wire_pred(&pred)?;
         let idxs = self.matching(table, pred)?;
         self.sum_ids(table, col, &idxs)
     }
 
     fn sum_ids(&mut self, table: &str, col: &str, idxs: &[i64]) -> Result<Decoded> {
         self.encrypted_col(table, col)?;
-        let blinded = big(&self.call("blinded_sum", json!([table, col, idxs]))?, "blinded_sum")?;
-        let mut mask = BigInt::zero();
-        for i in idxs {
-            mask = md(&(&mask + self.mask(table, *i, col)?));
-        }
-        decode(&md(&(blinded - mask)))
+        decode(&self.sum_scalar(table, col, idxs)?)
     }
 
     pub fn count(&mut self, table: &str, pred: Value) -> Result<usize> {
+        let pred = wire_pred(&pred)?;
         Ok(self.matching(table, pred)?.len())
     }
 
     /// AVG = SUM / COUNT as an exact rational (`None` over zero rows).
     pub fn avg(&mut self, table: &str, col: &str, pred: Value) -> Result<Option<Decoded>> {
+        self.encrypted_col(table, col)?;
+        let pred = wire_pred(&pred)?;
         let idxs = self.matching(table, pred)?;
         if idxs.is_empty() {
             return Ok(None);
@@ -752,8 +1316,29 @@ impl Client {
         Ok(Some(reduce(&a, &(b * BigInt::from(idxs.len())))))
     }
 
+    /// DOT needs both columns PAIRED and INT (rational inner products collapse).
+    fn check_dot(&self, table: &str, col: &str) -> Result<()> {
+        let c = self.col(table, col)?;
+        if c.policy != "paired" {
+            return Err(Error::new(
+                Kind::PlanError,
+                format!("DOT requires `paired` policy on column '{}'", col),
+            ));
+        }
+        if c.ty != "int" {
+            return Err(Error::new(
+                Kind::PlanError,
+                format!("DOT requires INT columns (column '{}' is {})", col, c.ty),
+            ));
+        }
+        Ok(())
+    }
+
     /// Π_mult: encrypted inner product Σ aᵢ·bᵢ via Beaver triples.
     pub fn dot(&mut self, table: &str, left: &str, right: &str, pred: Value) -> Result<Decoded> {
+        self.check_dot(table, left)?;
+        self.check_dot(table, right)?;
+        let pred = wire_pred(&pred)?;
         let idxs = self.matching(table, pred)?;
         self.dot_pairs(table, left, &idxs, table, right, &idxs)
     }
@@ -767,54 +1352,77 @@ impl Client {
         rc: &str,
         rids: &[i64],
     ) -> Result<Decoded> {
-        self.encrypted_col(lt, lc)?;
-        self.encrypted_col(rt, rc)?;
+        self.check_dot(lt, lc)?;
+        self.check_dot(rt, rc)?;
         if lids.is_empty() {
             return Ok(Decoded::Int(BigInt::zero()));
         }
         let ls = self.unblind_cells(lt, lc, lids)?;
         let rs = self.unblind_cells(rt, rc, rids)?;
-        let mut openings: Vec<Value> = vec![];
-        let mut es = vec![];
+        let mut es: Vec<(BigInt, BigInt)> = vec![];
         let mut triples: Vec<(BigInt, BigInt, BigInt)> = vec![];
         for k in 0..lids.len() {
             let (u, v) = (rand_scalar(), rand_scalar());
             let w = md(&(&u * &v));
-            let (e, g) = (md(&(&ls[k] - &u)), md(&(&rs[k] - &v)));
-            openings.push(json!([e.to_string(), g.to_string()]));
-            es.push((e, g));
+            es.push((md(&(&ls[k] - &u)), md(&(&rs[k] - &v))));
             triples.push((u, v, w));
         }
-        let egs = self.call("mult_combine_batch", json!([openings]))?;
-        let egs = egs
-            .as_array()
-            .filter(|a| a.len() == es.len())
-            .ok_or_else(|| Error::protocol("mult_combine_batch returned a wrong number of results"))?;
+        let mut egs: Vec<BigInt> = vec![];
+        for part in es.chunks(LIST_CHUNK) {
+            let openings: Vec<Value> = part.iter().map(|(e, g)| json!([e.to_string(), g.to_string()])).collect();
+            let v = self.call_max("mult_combine_batch", json!([openings]), part.len() * (MAX_DIGITS + 8) + 4096)?;
+            for x in arr(&v, "mult_combine_batch", Some(part.len()))? {
+                egs.push(big(x, "mult_combine_batch")?);
+            }
+        }
         let mut acc = BigInt::zero();
         for (k, (e, g)) in es.iter().enumerate() {
-            let eg = big(&egs[k], "mult_combine_batch")?;
             let (u, v, w) = &triples[k];
-            acc = md(&(acc + w + e * v + g * u + eg));
+            if self.opts.authenticated && md(&egs[k]) != md(&(e * g)) {
+                return Err(Error::new(
+                    Kind::Integrity,
+                    "server returned a forged product term in DOT (e*g mismatch)",
+                ));
+            }
+            acc = md(&(acc + w + e * v + g * u + &egs[k]));
         }
         decode(&acc)
     }
 
-    /// Blinded cells minus masks = the encoded scalars (not yet decoded).
+    /// Blinded cells minus masks = the encoded scalars (not yet decoded);
+    /// MAC-verified per cell when authenticated.
     fn unblind_cells(&mut self, table: &str, col: &str, ids: &[i64]) -> Result<Vec<BigInt>> {
-        let ws = self.call("blinded_cells", json!([table, col, ids]))?;
-        let ws = ws
-            .as_array()
-            .filter(|a| a.len() == ids.len())
-            .ok_or_else(|| Error::protocol("blinded_cells: wrong number of cells"))?;
-        let mut out = vec![];
-        for (w, i) in ws.iter().zip(ids) {
-            let b = match uwv(w)? {
-                CellIn::Int(b) => b,
-                _ => return Err(Error::protocol("blinded cell is not an integer")),
-            };
-            out.push(md(&(b - self.mask(table, *i, col)?)));
+        let fetch = |db: &mut Client, c: &str| -> Result<Vec<BigInt>> {
+            let mut out = vec![];
+            for part in chunks(ids) {
+                let v = db.call_max(
+                    "blinded_cells",
+                    json!([table, c, part]),
+                    part.len() * (MAX_DIGITS + 40) + 4096,
+                )?;
+                let ws = arr(&v, "blinded_cells", Some(part.len()))?;
+                for (w, i) in ws.iter().zip(part) {
+                    out.push(md(&(scalar_cell(w)? - db.mask(table, *i, c)?)));
+                }
+            }
+            Ok(out)
+        };
+        let ss = fetch(self, col)?;
+        if self.opts.authenticated {
+            let ms = fetch(self, &format!("{}{}", MAC, col))?;
+            for (k, (s, m)) in ss.iter().zip(&ms).enumerate() {
+                if *m != md(&(&self.alpha * s)) {
+                    return Err(Error::new(
+                        Kind::Integrity,
+                        format!(
+                            "MAC check failed reading {} (row {}) - the stored encrypted value was tampered with",
+                            col, ids[k]
+                        ),
+                    ));
+                }
+            }
         }
-        Ok(out)
+        Ok(ss)
     }
 
     /// Plain or decrypted values of `col` for the given row ids (`None` id -> Null).
@@ -826,13 +1434,16 @@ impl Client {
         let mut got: HashMap<i64, CellIn> = HashMap::new();
         if !uniq.is_empty() {
             if policy == "plain" {
-                let ws = self.call("plain_cells", json!([table, col, uniq]))?;
-                let ws = ws
-                    .as_array()
-                    .filter(|a| a.len() == uniq.len())
-                    .ok_or_else(|| Error::protocol("plain_cells: wrong number of cells"))?;
-                for (w, i) in ws.iter().zip(&uniq) {
-                    got.insert(*i, uwv(w)?);
+                for part in chunks(&uniq) {
+                    let v = self.call_max(
+                        "plain_cells",
+                        json!([table, col, part]),
+                        part.len() * (MAX_DIGITS * 2 + 60) + 4096,
+                    )?;
+                    let ws = arr(&v, "plain_cells", Some(part.len()))?;
+                    for (w, i) in ws.iter().zip(part) {
+                        got.insert(*i, uwv(w)?);
+                    }
                 }
             } else {
                 let ss = self.unblind_cells(table, col, &uniq)?;
@@ -849,6 +1460,7 @@ impl Client {
 
     /// SELECT cols FROM table WHERE pred: one `Vec<CellIn>` per row, in column order.
     pub fn select(&mut self, table: &str, columns: &[&str], pred: Value) -> Result<Vec<Vec<CellIn>>> {
+        let pred = wire_pred(&pred)?;
         let idxs = self.matching(table, pred)?;
         let ids: Vec<Option<i64>> = idxs.iter().map(|i| Some(*i)).collect();
         let mut vecs = vec![];
@@ -869,9 +1481,24 @@ impl Client {
         let mut aliases = vec![first.clone()];
         let mut tables: HashMap<String, String> = HashMap::new();
         tables.insert(first.clone(), left.to_string());
-        let pred = opts.where_.clone().unwrap_or(Value::Null);
+
+        // split WHERE: FROM-table atoms go to the server, others filter the joined rows
+        let mut push = Value::Null;
+        let mut post: Option<Value> = None;
+        if let Some(w) = &opts.where_ {
+            if !w.is_null() {
+                let all_first = atoms_of(w)?
+                    .iter()
+                    .all(|a| a.get("a").and_then(|x| x.as_str()).map(|x| x == first).unwrap_or(true));
+                if all_first {
+                    push = strip_alias(w);
+                } else {
+                    post = Some(w.clone());
+                }
+            }
+        }
         let mut tuples: Vec<Vec<Option<i64>>> =
-            self.matching(left, pred)?.into_iter().map(|i| vec![Some(i)]).collect();
+            self.matching(left, push)?.into_iter().map(|i| vec![Some(i)]).collect();
 
         for st in steps {
             let alias = st.alias.clone().unwrap_or_else(|| st.table.clone());
@@ -925,6 +1552,57 @@ impl Client {
             aliases.push(alias.clone());
             tables.insert(alias, st.table.clone());
         }
+
+        if let Some(w) = post {
+            // fetch the PLAIN columns the predicate needs, then evaluate with SQL NULL semantics
+            let mut need: Vec<(String, String)> = vec![];
+            let atoms = atoms_of(&w)?;
+            for a in &atoms {
+                let al = a.get("a").and_then(|x| x.as_str()).unwrap_or(&first).to_string();
+                let c = a.get("c").and_then(|x| x.as_str()).ok_or_else(|| Error::interface("predicate atom without a column"))?.to_string();
+                let table = tables
+                    .get(&al)
+                    .ok_or_else(|| Error::interface(format!("unknown alias in WHERE: {}", al)))?
+                    .clone();
+                if self.col(&table, &c)?.policy != "plain" {
+                    return Err(Error::interface("WHERE may only reference PLAIN columns"));
+                }
+                if !need.contains(&(al.clone(), c.clone())) {
+                    need.push((al, c));
+                }
+            }
+            let mut vals: HashMap<(String, String), Vec<CellIn>> = HashMap::new();
+            for (al, c) in need {
+                let p = aliases.iter().position(|a| *a == al).unwrap();
+                let ids: Vec<Option<i64>> = tuples.iter().map(|t| t[p]).collect();
+                let v = self.column(&tables[&al], &c, &ids)?;
+                vals.insert((al, c), v);
+            }
+            let groups = w["or"].as_array().cloned().unwrap_or_default();
+            let mut keep = vec![];
+            for (i, t) in tuples.into_iter().enumerate() {
+                let mut ok = false;
+                'g: for g in &groups {
+                    let mut all = true;
+                    for a in g.as_array().cloned().unwrap_or_default() {
+                        let al = a.get("a").and_then(|x| x.as_str()).unwrap_or(&first).to_string();
+                        let c = a["c"].as_str().unwrap_or("").to_string();
+                        if !atom_matches(&vals[&(al, c)][i], &a)? {
+                            all = false;
+                            break;
+                        }
+                    }
+                    if all {
+                        ok = true;
+                        break 'g;
+                    }
+                }
+                if ok {
+                    keep.push(t);
+                }
+            }
+            tuples = keep;
+        }
         Ok(JoinResult { aliases, tables, tuples })
     }
 
@@ -976,17 +1654,18 @@ impl Client {
         self.dot_pairs(&j.tables[alias_a], col_a, &la, &j.tables[alias_b], col_b, &lb)
     }
 
-    /// Rows on the server this vault cannot decrypt (a crash between the
-    /// server accepting an INSERT and the vault being saved).
+    /// Live rows on the server this vault cannot decrypt (a crash between the
+    /// server accepting an INSERT and the vault being saved). Driven by the live
+    /// row ids the server returns, never by a server-claimed row count.
     pub fn find_orphans(&mut self) -> Result<HashMap<String, Vec<i64>>> {
         let mut out = HashMap::new();
         let tables: Vec<(String, Vec<String>)> = self
             .schema
             .iter()
-            .map(|(t, cols)| {
+            .map(|(t, d)| {
                 (
                     t.clone(),
-                    cols.iter().filter(|c| c.policy != "plain").map(|c| c.name.clone()).collect(),
+                    d.cols.iter().filter(|c| c.policy != "plain").map(|c| c.name.clone()).collect(),
                 )
             })
             .collect();
@@ -994,15 +1673,10 @@ impl Client {
             if enc.is_empty() {
                 continue;
             }
-            let info = self.table_info(&t)?;
-            let dead: HashSet<i64> = info.deleted.iter().copied().collect();
-            let bad: Vec<i64> = (0..info.rows)
-                .filter(|i| {
-                    !dead.contains(i)
-                        && enc
-                            .iter()
-                            .any(|c| !self.masks.contains_key(&(t.clone(), *i, c.clone())))
-                })
+            let live = self.matching(&t, Value::Null)?;
+            let bad: Vec<i64> = live
+                .into_iter()
+                .filter(|i| enc.iter().any(|c| !self.masks.contains_key(&(t.clone(), *i, c.clone()))))
                 .collect();
             if !bad.is_empty() {
                 out.insert(t, bad);
@@ -1012,27 +1686,54 @@ impl Client {
     }
 
     // — vault persistence —
-    /// Write the mask vault as JSON ATOMICALLY (temp file + fsync + rename)
-    /// with mode 0600 (unix). The vault is the owner's one long-lived secret.
+    /// Write the mask vault (masks, the schema policies you created, and the
+    /// MAC key) as JSON ATOMICALLY (temp file + fsync + rename + directory
+    /// fsync) with mode 0600 (unix). Missing parent directories are created.
+    /// Refused while a COMMIT is in doubt or a transaction is open.
     pub fn save_vault(&mut self, file: Option<&Path>) -> Result<()> {
         let target = file
             .map(PathBuf::from)
             .or_else(|| self.vault_path.clone())
             .ok_or_else(|| Error::interface("no vault path given"))?;
+        if !self.in_doubt.is_empty() {
+            return Err(Error::interface(
+                "cannot save the vault while a COMMIT is in doubt; resolve_transaction() first",
+            ));
+        }
+        if self.in_tx {
+            return Err(Error::interface("cannot save the vault inside an open transaction"));
+        }
         let entries: Vec<Value> = self
             .masks
             .iter()
             .map(|((t, i, c), r)| json!([t, i, c, r.to_string()]))
             .collect();
-        let body = json!({"version": 1, "masks": entries}).to_string();
-        let dir = target.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+        let mut schema = serde_json::Map::new();
+        for (t, d) in &self.schema {
+            if d.trusted {
+                let cols: Vec<Value> = d.cols.iter().map(|c| json!([c.name, c.ty, c.policy])).collect();
+                schema.insert(t.clone(), Value::Array(cols));
+            }
+        }
+        let mut doc = json!({"version": 2, "masks": entries, "schema": schema,
+                              "authenticated": self.opts.authenticated});
+        if self.opts.authenticated {
+            doc["alpha"] = json!(self.alpha.to_string());
+        }
+        let body = doc.to_string();
+        let dir = target
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."))
+            .to_path_buf();
+        let io = |e: std::io::Error| Error::interface(format!("vault write failed: {}", e));
+        std::fs::create_dir_all(&dir).map_err(io)?;
         let tmp = dir.join(format!(
             ".{}.{}.{:08x}.tmp",
             target.file_name().and_then(|s| s.to_str()).unwrap_or("vault"),
             std::process::id(),
             rand::random::<u32>()
         ));
-        let io = |e: std::io::Error| Error::interface(format!("vault write failed: {}", e));
         let res = (|| -> std::io::Result<()> {
             use std::io::Write;
             let mut o = std::fs::OpenOptions::new();
@@ -1050,7 +1751,12 @@ impl Client {
                 use std::os::unix::fs::PermissionsExt;
                 std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
             }
-            std::fs::rename(&tmp, &target)
+            std::fs::rename(&tmp, &target)?;
+            // make the rename itself durable
+            if let Ok(d) = std::fs::File::open(&dir) {
+                let _ = d.sync_all();
+            }
+            Ok(())
         })();
         if let Err(e) = res {
             let _ = std::fs::remove_file(&tmp);
@@ -1062,34 +1768,86 @@ impl Client {
         Ok(())
     }
 
-    /// Replace the in-memory mask vault with the one in `file`.
+    /// Replace the in-memory mask vault (and trusted schema) with the one in `file`.
     pub fn load_vault(&mut self, file: Option<&Path>) -> Result<()> {
         let src = file
             .map(PathBuf::from)
             .or_else(|| self.vault_path.clone())
             .ok_or_else(|| Error::interface("no vault path given"))?;
+        if self.in_tx {
+            return Err(Error::interface("cannot load a vault inside an open transaction"));
+        }
+        let bad = |m: &str| Error::interface(format!("{} is not a valid TorusDB vault: {}", src.display(), m));
         let text = std::fs::read_to_string(&src)
             .map_err(|e| Error::interface(format!("cannot read vault {}: {}", src.display(), e)))?;
-        let doc: Value = serde_json::from_str(&text)
-            .map_err(|_| Error::interface(format!("{} is not a TorusDB vault", src.display())))?;
-        let list = match (doc["version"].as_i64(), doc["masks"].as_array()) {
-            (Some(1), Some(l)) => l,
-            _ => return Err(Error::interface(format!("{} is not a TorusDB vault", src.display()))),
+        let doc: Value = serde_json::from_str(&text).map_err(|_| bad("not JSON"))?;
+        let version = doc["version"].as_i64();
+        let list = match (version, doc["masks"].as_array()) {
+            (Some(1), Some(l)) | (Some(2), Some(l)) => l,
+            _ => return Err(bad("wrong version/shape")),
         };
-        let mut m = HashMap::new();
+        let mask_re = |s: &str| !s.is_empty() && s.len() <= MAX_DIGITS && s.bytes().all(|b| b.is_ascii_digit());
+        let mut m: Masks = HashMap::new();
         for e in list {
-            let bad = || Error::interface("corrupt vault entry");
-            let a = e.as_array().filter(|a| a.len() == 4).ok_or_else(bad)?;
-            m.insert(
-                (
-                    a[0].as_str().ok_or_else(bad)?.to_string(),
-                    a[1].as_i64().ok_or_else(bad)?,
-                    a[2].as_str().ok_or_else(bad)?.to_string(),
-                ),
-                big(&a[3], "vault mask")?,
-            );
+            let a = e.as_array().filter(|a| a.len() == 4).ok_or_else(|| bad("corrupt mask entry"))?;
+            let t = a[0].as_str().ok_or_else(|| bad("corrupt mask entry"))?;
+            let i = a[1].as_i64().filter(|i| (0..=MAX_SAFE).contains(i)).ok_or_else(|| bad("bad row id"))?;
+            let c = a[2].as_str().ok_or_else(|| bad("corrupt mask entry"))?;
+            let r = a[3].as_str().filter(|s| mask_re(s)).ok_or_else(|| bad("bad mask"))?;
+            let rv: BigInt = r.parse().map_err(|_| bad("bad mask"))?;
+            if rv >= *n() {
+                return Err(bad("mask out of range"));
+            }
+            m.insert((t.to_string(), i, c.to_string()), rv);
+        }
+        let mut sch: Schema = HashMap::new();
+        if version == Some(2) {
+            if let Some(s) = doc.get("schema").filter(|s| !s.is_null()) {
+                let s = s.as_object().ok_or_else(|| bad("bad schema"))?;
+                for (t, cols) in s {
+                    let mut cs = vec![];
+                    for c in cols.as_array().ok_or_else(|| bad("bad schema"))? {
+                        let a = c.as_array().filter(|a| a.len() == 3).ok_or_else(|| bad("bad schema column"))?;
+                        let nm = a[0].as_str().ok_or_else(|| bad("bad schema column"))?;
+                        cs.push(Column {
+                            name: nm.to_string(),
+                            ty: norm_type(a[1].as_str().unwrap_or("")),
+                            policy: norm_policy(a[2].as_str().unwrap_or("")),
+                        });
+                    }
+                    sch.insert(t.clone(), TableDef { cols: cs, trusted: true });
+                }
+            }
+        }
+        let auth = doc["authenticated"].as_bool().unwrap_or(false);
+        let mut alpha = None;
+        if auth {
+            let a = doc["alpha"]
+                .as_str()
+                .filter(|s| mask_re(s))
+                .and_then(|s| s.parse::<BigInt>().ok())
+                .filter(|a| !a.is_zero() && a < n())
+                .ok_or_else(|| bad("bad MAC key"))?;
+            if !self.opts.authenticated {
+                return Err(Error::interface(format!(
+                    "{} was created in authenticated (MAC) mode; connect with authenticated: true",
+                    src.display()
+                )));
+            }
+            alpha = Some(a);
+        } else if self.opts.authenticated && !m.is_empty() {
+            return Err(Error::interface(format!(
+                "{} was created without MACs; refusing to run authenticated mode on it",
+                src.display()
+            )));
         }
         self.masks = m;
+        for (t, d) in sch {
+            self.schema.insert(t, d); // vault policies are the trust anchor
+        }
+        if let Some(a) = alpha {
+            self.alpha = a;
+        }
         if self.vault_path.is_none() {
             self.vault_path = Some(src);
         }
@@ -1113,17 +1871,35 @@ pub fn all() -> Value {
     Value::Null
 }
 
-/// `col <op> value` with op one of `= != < <= > >=`.
-pub fn cmp(col: &str, op: &str, v: &CellIn) -> Value {
-    json!({"or": [[{"c": col, "op": op, "v": wv(v).unwrap_or(json!({"t": "n"}))}]]})
+const OPS: [&str; 7] = ["=", "!=", "<>", "<", "<=", ">", ">="];
+
+/// `col <op> value` with op one of `= != <> < <= > >=`. Invalid values
+/// (zero denominator, unknown operator) are rejected, never silently altered.
+pub fn cmp(col: &str, op: &str, v: &CellIn) -> Result<Value> {
+    if !OPS.contains(&op) {
+        return Err(Error::interface(format!("bad operator: {}", op)));
+    }
+    Ok(json!({"or": [[{"c": col, "op": op, "v": wv(v)?}]]}))
 }
-pub fn eq(col: &str, v: &CellIn) -> Value {
+/// Like [`cmp`] for a joined table instance: only valid in [`JoinOptions::where_`].
+pub fn cmp_in(alias: &str, col: &str, op: &str, v: &CellIn) -> Result<Value> {
+    let mut p = cmp(col, op, v)?;
+    p["or"][0][0]["a"] = json!(alias);
+    Ok(p)
+}
+pub fn eq(col: &str, v: &CellIn) -> Result<Value> {
     cmp(col, "=", v)
 }
 /// `col IN (values)`.
-pub fn is_in(col: &str, vs: &[CellIn]) -> Value {
-    let w: Vec<Value> = vs.iter().map(|v| wv(v).unwrap_or(json!({"t": "n"}))).collect();
-    json!({"or": [[{"c": col, "in": w}]]})
+pub fn is_in(col: &str, vs: &[CellIn]) -> Result<Value> {
+    let w = vs.iter().map(wv).collect::<Result<Vec<Value>>>()?;
+    Ok(json!({"or": [[{"c": col, "in": w}]]}))
+}
+/// Like [`is_in`] for a joined table instance.
+pub fn is_in_of(alias: &str, col: &str, vs: &[CellIn]) -> Result<Value> {
+    let mut p = is_in(col, vs)?;
+    p["or"][0][0]["a"] = json!(alias);
+    Ok(p)
 }
 fn groups(p: &Value) -> Vec<Value> {
     p["or"].as_array().cloned().unwrap_or_default()
@@ -1147,4 +1923,93 @@ pub fn and(preds: &[Value]) -> Value {
 /// a OR b OR ...
 pub fn or(preds: &[Value]) -> Value {
     json!({"or": preds.iter().flat_map(groups).collect::<Vec<_>>()})
+}
+
+fn atoms_of(p: &Value) -> Result<Vec<Value>> {
+    let g = p.get("or").and_then(|g| g.as_array()).ok_or_else(|| Error::interface("malformed predicate"))?;
+    let mut out = vec![];
+    for grp in g {
+        for a in grp.as_array().ok_or_else(|| Error::interface("malformed predicate"))? {
+            out.push(a.clone());
+        }
+    }
+    Ok(out)
+}
+
+fn strip_alias(p: &Value) -> Value {
+    let mut q = p.clone();
+    if let Some(gs) = q.get_mut("or").and_then(|g| g.as_array_mut()) {
+        for g in gs {
+            if let Some(atoms) = g.as_array_mut() {
+                for a in atoms {
+                    if let Some(o) = a.as_object_mut() {
+                        o.remove("a");
+                    }
+                }
+            }
+        }
+    }
+    q
+}
+
+/// Predicate as sent to a single-table RPC: alias-qualified atoms are refused.
+fn wire_pred(p: &Value) -> Result<Value> {
+    if p.is_null() {
+        return Ok(Value::Null);
+    }
+    for a in atoms_of(p)? {
+        if a.get("a").is_some() {
+            return Err(Error::interface("alias-qualified predicates are only valid in JoinOptions::where_"));
+        }
+    }
+    Ok(p.clone())
+}
+
+fn cmp_cells(a: &CellIn, b: &CellIn) -> Option<std::cmp::Ordering> {
+    fn num(v: &CellIn) -> Option<(BigInt, BigInt)> {
+        match v {
+            CellIn::Int(i) => Some((i.clone(), BigInt::from(1))),
+            CellIn::Bool(b) => Some((BigInt::from(*b as i32), BigInt::from(1))),
+            CellIn::Rational(a, b) => Some((a.clone(), b.clone())),
+            _ => None,
+        }
+    }
+    if let (Some((an, ad)), Some((bn, bd))) = (num(a), num(b)) {
+        if ad.is_positive() && bd.is_positive() {
+            return Some((an * &bd).cmp(&(bn * &ad)));
+        }
+    }
+    if let (CellIn::Str(x), CellIn::Str(y)) = (a, b) {
+        return Some(x.cmp(y));
+    }
+    None
+}
+
+fn atom_matches(val: &CellIn, a: &Value) -> Result<bool> {
+    use std::cmp::Ordering::*;
+    if *val == CellIn::Null {
+        return Ok(false); // SQL: a NULL operand makes the atom false
+    }
+    if let Some(list) = a.get("in").and_then(|l| l.as_array()) {
+        for w in list {
+            if cmp_cells(val, &uwv(w)?) == Some(Equal) {
+                return Ok(true);
+            }
+        }
+        return Ok(false);
+    }
+    let rhs = uwv(&a["v"])?;
+    let c = cmp_cells(val, &rhs);
+    let op = a["op"].as_str().unwrap_or("");
+    Ok(match (op, c) {
+        ("!=", None) | ("<>", None) => true,
+        (_, None) => false,
+        ("=", Some(o)) => o == Equal,
+        ("!=", Some(o)) | ("<>", Some(o)) => o != Equal,
+        ("<", Some(o)) => o == Less,
+        (">", Some(o)) => o == Greater,
+        ("<=", Some(o)) => o != Greater,
+        (">=", Some(o)) => o != Less,
+        _ => return Err(Error::interface(format!("bad operator: {}", op))),
+    })
 }

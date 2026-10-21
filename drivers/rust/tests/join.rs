@@ -154,7 +154,7 @@ fn left_join_aggregates_skip_null_side_and_where_on_left() {
     let j = db.join("dept", &[JoinStep::new("proj", "did", "did").alias("p").left()], &opts).unwrap();
     assert_eq!(j.count(), 4);
     assert_eq!(db.join_sum(&j, "p", "budget").unwrap(), int(1800));
-    let opts = JoinOptions { alias: Some("e".into()), where_: Some(is_in("eid", &[ci(1), ci(3)])) };
+    let opts = JoinOptions { alias: Some("e".into()), where_: Some(is_in("eid", &[ci(1), ci(3)]).unwrap()) };
     let j = db.join("emp", &[JoinStep::new("dept", "did", "did").alias("d")], &opts).unwrap();
     assert_eq!(j.count(), 2);
     assert_eq!(db.join_sum(&j, "e", "salary").unwrap(), int(170));
