@@ -11,6 +11,13 @@ Versioning: [Versioning Policy](docs/versioning.md).
 Hardening release: SQL joins completed, server and drivers made operable, a
 cryptographic self-audit, and the open repository made self-contained.
 
+### Added — scheduling, synchronous replication, atomic IF [NOT] EXISTS (late 0.5.0)
+
+- `BEGIN` waits first-come-first-served; `--tx-idle-timeout` aborts idle transactions.
+- `--sync-replicas N` synchronous replication (`--sync-timeout`, `--sync-strict`).
+- `IF [NOT] EXISTS` is executed atomically by the server in all three drivers.
+- Streamed snapshots; stricter server-side predicate validation.
+
 ### Added — SQL conveniences (late 0.5.0)
 
 - `BETWEEN`, `NOT IN`, `IS [NOT] NULL`, `[NOT] LIKE`, `OFFSET`, `CREATE TABLE IF NOT EXISTS`,
