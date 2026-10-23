@@ -43,6 +43,14 @@ class ReshareSpec:
             raise CustodyError(f"resharing needs exactly {self.old.k} distinct current holders")
         laurent.Params(self.new_k, self.new_n, self.old.g.order)      # validates
 
+    def params(self, old_ids_digest: str = "") -> dict:
+        """Specification signed into every reshare broadcast: old key and epoch,
+        dealing quorum, new k/n and the old committee's identity-list digest."""
+        return {"group": self.old.group, "old_key_id": self.old.key_id,
+                "old_epoch": self.old.epoch, "old_pub": self.old.digest,
+                "quorum": sorted(self.quorum), "new_k": self.new_k,
+                "new_n": self.new_n, "old_ids": old_ids_digest}
+
     @property
     def new_params(self) -> laurent.Params:
         return laurent.Params(self.new_k, self.new_n, self.old.g.order)
@@ -69,7 +77,15 @@ def reshare_finish(spec: ReshareSpec, my_index: int, broadcasts: dict[int, Broad
     p = spec.new_params
     if set(broadcasts) != set(spec.quorum) or set(shares_in) != set(spec.quorum):
         raise DKGError("need a dealing from every member of the quorum")
+    if not isinstance(my_index, int) or not 1 <= my_index <= spec.new_n:
+        raise DKGError(f"my_index must be in 1..{spec.new_n}")
     lam = spec.lam()
+    for i in spec.quorum:                 # structural checks first: no IndexError, clear blame
+        b = broadcasts[i]
+        if b.index != i:
+            raise DKGError("broadcast index does not match its dealer slot", i)
+        if len(b.commitments) != p.k:
+            raise DKGError("wrong number of commitments", i)
     for i in spec.quorum:
         b = broadcasts[i]
         if not g.eq(b.commitments[1], g.mul(spec.old.verification_key(i), lam[i])):

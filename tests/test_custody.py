@@ -487,14 +487,17 @@ def test_signed_broadcasts_and_encrypted_shares(tmp_path):
     tampered["body"]["bcast"]["commitments"][0] = g.hex(g.G)
     with pytest.raises(CustodyError, match="bad signature"):
         ident.open_broadcast(g, a.public, tampered, "dkg", session)
-    enc = ident.encrypt_share(g, b.public, session, 1, 2, 123456789)
-    assert ident.decrypt_share(b, session, enc) == 123456789
+    enc = ident.encrypt_share(a, b.public, session, 2, 123456789)
+    assert ident.decrypt_share(b, session, enc, a.public) == 123456789
     assert "123456789" not in json.dumps(enc)
     with pytest.raises(CustodyError):
-        ident.decrypt_share(a, session, enc)                            # not addressed to a
-    enc["ct"] = enc["ct"][:-2] + ("00" if enc["ct"][-2:] != "00" else "01")
-    with pytest.raises(CustodyError, match="authentication"):
-        ident.decrypt_share(b, session, enc)
+        ident.decrypt_share(a, session, enc, a.public)                  # not addressed to a
+    with pytest.raises(CustodyError, match="signature"):
+        ident.decrypt_share(b, session, enc, b.public)                  # not signed by that dealer
+    forged = dict(enc)
+    forged["ct"] = enc["ct"][:-2] + ("00" if enc["ct"][-2:] != "00" else "01")
+    with pytest.raises(CustodyError, match="signature"):               # tampering breaks the signature
+        ident.decrypt_share(b, session, forged, a.public)
 
 
 def test_identity_file_roundtrip_and_fingerprint(tmp_path):

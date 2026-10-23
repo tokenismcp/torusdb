@@ -30,6 +30,7 @@ broadcast, and participants should compare ``transcript`` hashes out of band.
 from __future__ import annotations
 
 import hashlib
+import json
 from dataclasses import dataclass
 
 from . import laurent
@@ -72,9 +73,21 @@ def _pok_ctx(session: bytes, index: int) -> bytes:
     return b"dkg-pok\x00" + session + index.to_bytes(4, "big")
 
 
-def transcript_hash(g: Group, session: bytes, broadcasts: dict[int, Broadcast]) -> str:
-    """Compare this value across participants (out of band) before trusting the key."""
-    h = hashlib.sha256(b"torussql/custody/transcript\x00" + session)
+def dkg_params(group: str, k: int, n: int, ids_digest: str = "") -> dict:
+    """The ceremony specification that is signed into every broadcast and hashed
+    into the transcript: group, quorum, size and (file ceremonies) the digest of
+    the participant identity list."""
+    return {"group": group, "k": k, "n": n, "ids": ids_digest}
+
+
+def transcript_hash(g: Group, session: bytes, broadcasts: dict[int, Broadcast],
+                    params: dict | None = None) -> str:
+    """Compare this value across participants (out of band) before trusting the
+    key. Covers the session, the ceremony specification (group, k, n, identity
+    list digest) and every broadcast."""
+    h = hashlib.sha256(b"torussql/custody/transcript/v2\x00" + session)
+    spec = json.dumps(params or {}, sort_keys=True, separators=(",", ":")).encode()
+    h.update(len(spec).to_bytes(4, "big") + spec)
     for i in sorted(broadcasts):
         h.update(broadcasts[i].digest(g))
     return h.hexdigest()
@@ -93,7 +106,7 @@ def deal(g: Group, p: laurent.Params, index: int, secret: int | None, session: b
     """Create a Laurent sharing of ``secret`` (random if None) and its
     commitments. Used by the DKG (random secret) and by resharing (given)."""
     coeffs = laurent.new_coeffs(g.rand_scalar() if secret is None else secret, p)
-    comms = tuple(g.mul(g.G, c) for c in coeffs)
+    comms = tuple(g.mul_blinded(g.G, c) for c in coeffs)
     if with_pok:
         _, pok = schnorr_prove(g, coeffs[1], _pok_ctx(session, index))
     else:
@@ -109,15 +122,17 @@ def check_dealing(g: Group, p: laurent.Params, b: Broadcast, my_x: int, my_share
     if need_pok and not schnorr_verify(g, b.commitments[1], b.proof, _pok_ctx(session, b.index)):
         raise DKGError("invalid proof of knowledge", b.index)
     w = laurent.commit_check_weights(my_x, p.t, g.order)
-    if not g.eq(g.mul(g.G, my_share), g.msm(zip(w, b.commitments))):
+    if not g.eq(g.mul_blinded(g.G, my_share), g.msm(zip(w, b.commitments))):
         raise DKGError("share does not match its commitments", b.index)
 
 
 class Participant:
     """One custodian's side of the ceremony."""
 
-    def __init__(self, group: str, k: int, n: int, index: int, session: bytes):
+    def __init__(self, group: str, k: int, n: int, index: int, session: bytes,
+                 ids_digest: str = ""):
         self.g = get_group(group)
+        self.ids_digest = ids_digest
         self.p = laurent.Params(k, n, self.g.order)
         if not 1 <= index <= n:
             raise ValueError("index must be in 1..n")
@@ -146,7 +161,8 @@ class Participant:
         ks = KeyShare(self.index, y, pub)
         if not ks.verify():                                  # pragma: no cover
             raise DKGError("aggregate share failed verification")
-        return ks, pub, transcript_hash(g, self.session, broadcasts)
+        return ks, pub, transcript_hash(g, self.session, broadcasts,
+                                        dkg_params(g.name, p.k, p.n, self.ids_digest))
 
 
 def run_local_ceremony(k: int, n: int, group: str = "secp256k1") -> tuple[list[KeyShare], PublicKey, str]:

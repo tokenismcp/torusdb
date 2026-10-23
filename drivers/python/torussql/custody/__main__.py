@@ -34,7 +34,8 @@ from pathlib import Path
 from . import (CustodyError, KeyShare, Participant, PublicKey, ReshareSpec, Quorum,
                ThresholdCustody, get_group, reshare_deal, reshare_finish,
                run_local_ceremony, transcript_hash, unwrap_key, wrap_key)
-from .identity import (Identity, export_dealing, fingerprint, import_dealings)
+from .dkg import dkg_params
+from .identity import (Identity, export_dealing, fingerprint, ids_digest, import_dealings)
 from .net import Custodian, CustodianServer, RemoteCustodian
 
 
@@ -81,6 +82,21 @@ def _load_ids(path: str):
     return g, pubs, d
 
 
+def _hostport(spec: str) -> tuple[str, int]:
+    """``host:port`` / ``[v6]:port`` / bare ``v6:port`` -> (host, port)."""
+    host, sep, port = spec.rpartition(":")
+    if not sep or not host or not port.isdigit():
+        raise SystemExit(f"expected HOST:PORT (IPv6 as [addr]:port), got {spec!r}")
+    if host.startswith("[") and host.endswith("]"):
+        host = host[1:-1]
+    return host, int(port)
+
+
+def _write_public(path: str, data: str) -> None:
+    from .keys import _atomic
+    _atomic(path, data.encode(), 0o644)
+
+
 def _session(s: str) -> bytes:
     return bytes.fromhex(s)
 
@@ -89,7 +105,7 @@ def cmd_identity_new(a):
     idn = Identity.new(a.group, a.index)
     idn.save(a.out, _pass(a, "New identity passphrase: ", confirm=True))
     pub = Path(a.out).with_suffix(".pub.json")
-    pub.write_text(json.dumps(idn.public_json(), indent=1))
+    _write_public(str(pub), json.dumps(idn.public_json(), indent=1))
     print(f"identity {a.index} written to {a.out}; public part: {pub}")
     print(f"fingerprint: {idn.fingerprint()}")
 
@@ -109,7 +125,7 @@ def cmd_ids_merge(a):
         if str(d["index"]) in parts:
             raise SystemExit(f"duplicate participant index {d['index']}")
         parts[str(d["index"])] = {"public": d["public"], "fingerprint": fp}
-    Path(a.out).write_text(json.dumps({"group": group, "participants": parts}, indent=1))
+    _write_public(a.out, json.dumps({"group": group, "participants": parts}, indent=1))
     _load_ids(a.out)                                 # validates the merged file
     whole = hashlib.sha256(json.dumps(parts, sort_keys=True).encode()).hexdigest()[:32]
     print(f"wrote {a.out}. COMPARE THESE (computed from the keys) OUT OF BAND:")
@@ -125,10 +141,12 @@ def cmd_new_session(_a):
 def cmd_dkg_start(a):
     g, pubs, _ = _load_ids(a.ids)
     idn = Identity.load(a.identity, _pass(a, "Identity passphrase: "))
-    part = Participant(g.name, a.k, a.n, idn.index, _session(a.session))
+    dig = ids_digest(g, pubs)
+    part = Participant(g.name, a.k, a.n, idn.index, _session(a.session), dig)
     # every private share (including our own, share_i_to_i) is written ENCRYPTED to
     # its recipient; nothing secret is left on disk in the clear
-    files = export_dealing(idn, "dkg", _session(a.session), part.round1(), pubs, a.out)
+    files = export_dealing(idn, "dkg", _session(a.session), part.round1(), pubs, a.out,
+                           dkg_params(g.name, a.k, a.n, dig))
     print(f"wrote {len(files)} files to {a.out}: send broadcast_{idn.index}.json to everyone "
           f"and share_{idn.index}_to_J.json to participant J only")
 
@@ -137,8 +155,12 @@ def cmd_dkg_finish(a):
     g, pubs, _ = _load_ids(a.ids)
     idn = Identity.load(a.identity, _pass(a, "Identity passphrase: "))
     sess = _session(a.session)
-    part = Participant(g.name, a.k, a.n, idn.index, sess)
-    bc, sh = import_dealings(idn, "dkg", sess, a.inbox, pubs, list(range(1, a.n + 1)))
+    dig = ids_digest(g, pubs)
+    if len(pubs) != a.n:
+        raise SystemExit(f"ids file lists {len(pubs)} participants but --n is {a.n}")
+    part = Participant(g.name, a.k, a.n, idn.index, sess, dig)
+    bc, sh = import_dealings(idn, "dkg", sess, a.inbox, pubs, list(range(1, a.n + 1)),
+                             dkg_params(g.name, a.k, a.n, dig))
     ks, pub, tx = part.finish(bc, sh)
     ks.save(a.out, _pass(a, "New share passphrase: ", confirm=True))
     pub.save(a.public_out)
@@ -174,6 +196,12 @@ def cmd_public_show(a):
 def _read_tokens(path: str):
     """``name:token[:perm,perm]`` lines; perms default to ``key`` (least privilege)."""
     tokens, perms = {}, {}
+    try:
+        if os.stat(path).st_mode & 0o077:
+            print(f"WARNING: token file {path} is readable by other users (chmod 600)",
+                  file=sys.stderr)
+    except OSError:
+        pass
     for n, line in enumerate(Path(path).read_text().splitlines(), 1):
         line = line.strip()
         if not line or line.startswith("#"):
@@ -212,10 +240,10 @@ def cmd_serve(a):
         if a.cafile:
             ctx.load_verify_locations(a.cafile)
             ctx.verify_mode = ssl.CERT_REQUIRED
-    host, _, port = a.listen.rpartition(":")
+    host, port = _hostport(a.listen)
     if host not in ("127.0.0.1", "localhost", "::1") and not a.tls and not a.insecure_no_tls:
         raise SystemExit("refusing a non-loopback listen without --tls (tokens are bearer secrets)")
-    srv = CustodianServer(host or "127.0.0.1", int(port), cust, ssl_ctx=ctx)
+    srv = CustodianServer(host, port, cust, ssl_ctx=ctx)
     what = ([f"key share {ks.index}/{ks.public.n} epoch {ks.epoch} key {ks.public.key_id}"] if ks else []) \
         + (["mask store"] if masks else [])
     print(f"custodian [{', '.join(what)}] on {srv.address[0]}:{srv.address[1]}", flush=True)
@@ -249,7 +277,8 @@ def _cluster(path: str, token_env: str, gen=None):
     if not tok:
         raise SystemExit("set the caller token in the environment variable named by --token-env")
     nodes = [RemoteCustodian(n["host"], int(n["port"]), tok, group=None, tls=d.get("tls", False),
-                             cafile=d.get("cafile"), tls_insecure=d.get("tls_insecure", False))
+                             cafile=d.get("cafile"), tls_insecure=d.get("tls_insecure", False),
+                             allow_insecure=d.get("allow_insecure", False))
              for n in d["nodes"]]
     return ThresholdMaskStore(nodes, int(d["k"]), xs=[int(n["x"]) for n in d["nodes"]], gen=gen)
 
@@ -300,10 +329,11 @@ def cmd_open_test(a):
         raise SystemExit("set the caller token in the environment variable named by --token-env "
                          "(tokens are never accepted on the command line)")
     custs = []
-    for spec in a.custodian:                 # host:port
-        host, _, port = spec.rpartition(":")
-        custs.append(RemoteCustodian(host, int(port), tok, group=pub.g, tls=a.tls,
-                                     cafile=a.cafile, tls_insecure=a.tls_insecure))
+    for spec in a.custodian:                 # HOST:PORT or [IPv6]:PORT — never a token on argv
+        host, port = _hostport(spec)
+        custs.append(RemoteCustodian(host, port, tok, group=pub.g, tls=a.tls,
+                                     cafile=a.cafile, tls_insecure=a.tls_insecure,
+                                     allow_insecure=a.allow_insecure))
     K, hdr = wrap_key(pub, b"open-test")
     got = unwrap_key(pub, hdr, Quorum(pub, custs).shared_point)
     print("quorum opened a fresh envelope: OK" if got == K else "MISMATCH")
@@ -321,7 +351,8 @@ def cmd_reshare_start(a):
     g, new_pubs, _ = _load_ids(a.new_ids)
     idn = Identity.load(a.identity, _pass(a, "Identity passphrase: "))
     spec = _spec(a, old)
-    files = export_dealing(idn, "reshare", spec.session, reshare_deal(spec, ks), new_pubs, a.out)
+    files = export_dealing(idn, "reshare", spec.session, reshare_deal(spec, ks), new_pubs, a.out,
+                           spec.params())
     print(f"wrote {len(files)} files to {a.out}")
 
 
@@ -330,7 +361,8 @@ def cmd_reshare_finish(a):
     spec = _spec(a, old)
     g, old_pubs, _ = _load_ids(a.old_ids)
     idn = Identity.load(a.identity, _pass(a, "Identity passphrase: "))
-    bc, sh = import_dealings(idn, "reshare", spec.session, a.inbox, old_pubs, sorted(spec.quorum))
+    bc, sh = import_dealings(idn, "reshare", spec.session, a.inbox, old_pubs, sorted(spec.quorum),
+                             spec.params())
     ks, new = reshare_finish(spec, idn.index, bc, sh)
     ks.save(a.out, _pass(a, "New share passphrase: ", confirm=True))
     new.save(a.public_out)
@@ -383,6 +415,8 @@ def main(argv=None):
                    help="environment variable holding the caller token")
     p.add_argument("--tls", action="store_true"); p.add_argument("--cafile")
     p.add_argument("--tls-insecure", action="store_true")
+    p.add_argument("--allow-insecure", action="store_true",
+                   help="allow plaintext TCP to a non-loopback host (trusted networks only)")
     for name, fn in (("reshare-start", cmd_reshare_start), ("reshare-finish", cmd_reshare_finish)):
         p = add(name, fn)
         p.add_argument("--public", required=True); p.add_argument("--quorum", required=True)

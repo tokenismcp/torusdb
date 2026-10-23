@@ -18,8 +18,19 @@ Access control: every caller has a named token and an explicit permission set
 only**). Writers cannot read, readers cannot write, and administrative actions
 need ``mask_admin``. Requests are rate/size limited, unauthenticated peers get a
 tiny frame budget and a short deadline, repeated failures lock the source out,
-and every decision is written to an append-only audit log. Use TLS on any
+and every authenticated decision AND every failed or unauthenticated attempt is
+written to a bounded, rate-limited, owner-only (0600) audit log. Use TLS on any
 network you do not fully control (tokens are bearer secrets).
+
+``approve(caller, E, context)``: an optional hook called for every key-service
+request with the CANONICAL hex encoding of E (parsed to a group element and
+re-encoded, so case/whitespace/aliasing tricks cannot dodge a deny-list) and
+the caller-chosen ``context``. It is a *service-level* rate or human decision
+("should this custodian answer right now?"), NOT a per-vault policy: the
+custodian is a decryption oracle on points, E carries no vault identity, and
+``context`` is purely informational — it is chosen by the caller, only enters the
+DLEQ proof hash, and authorizes nothing. ``LocalCustodian`` uses the same
+signature (caller is ``"local"``).
 """
 from __future__ import annotations
 
@@ -27,9 +38,11 @@ import hashlib
 import hmac
 import json
 import logging
+import os
 import socket
 import socketserver
 import ssl
+import stat
 import threading
 import time
 from collections import defaultdict, deque
@@ -45,6 +58,8 @@ from .threshold import Partial, partial_decrypt
 log = logging.getLogger("torusdb.custodian")
 
 PRE_AUTH_FRAME = 4096
+PRE_AUTH_MAX_FRAMES = 16          # frames a connection may send before authenticating
+_LOOPBACK = {"127.0.0.1", "::1", "localhost"}
 ALL_PERMS = frozenset({"key", "mask_write", "mask_read", "mask_admin"})
 _REQUIRES = {
     "partial": "key",
@@ -62,6 +77,25 @@ def _tok_hash(t: str) -> str:
     return hashlib.sha256(t.encode()).hexdigest()
 
 
+def _check_token_strength(name: str, tok) -> None:
+    """Sanity check only (it cannot prove a token is random): length >= 16, at
+    least 8 distinct characters and an estimated >= 64 bits of character-level
+    entropy. Generate real tokens with ``secrets.token_urlsafe(32)``."""
+    import math
+    from collections import Counter
+    if not isinstance(tok, str) or len(tok) < 16:
+        raise CustodyError("caller tokens must be \u226516 characters")
+    cnt = Counter(tok)
+    ent = -sum(c / len(tok) * math.log2(c / len(tok)) for c in cnt.values()) * len(tok)
+    if len(cnt) < 8 or ent < 64:
+        raise CustodyError(f"caller token for {name!r} is too weak (repetitive / low entropy); "
+                           f"use secrets.token_urlsafe(32)")
+
+
+def _is_loopback(host: str) -> bool:
+    return host in _LOOPBACK or host.startswith("127.")
+
+
 @dataclass
 class Limits:
     """Hardening knobs for the mask service (all optional)."""
@@ -77,12 +111,12 @@ class Custodian:
                  permissions: dict[str, set] | None = None,
                  masks: MaskShareStore | None = None, limits: Limits | None = None,
                  approve=None, audit_path: str | None = None,
-                 rate_per_minute: int = 30):
+                 rate_per_minute: int = 30, audit_max_bytes: int = 64 * 1024 * 1024,
+                 unauth_audit_per_minute: int = 20):
         if not tokens:
             raise CustodyError("a custodian needs at least one caller token")
-        for tok in tokens.values():
-            if len(tok) < 16:
-                raise CustodyError("caller tokens must be ≥16 characters")
+        for name, tok in tokens.items():
+            _check_token_strength(name, tok)
         if share is None and masks is None:
             raise CustodyError("a custodian needs a key share, a mask store, or both")
         hashes = [_tok_hash(t) for t in tokens.values()]
@@ -99,6 +133,18 @@ class Custodian:
         self.limits = limits or Limits()
         self._approve = approve
         self._audit_path = audit_path
+        self._audit_max = audit_max_bytes
+        self._audit_lock = threading.Lock()
+        self._audit_fd = -1
+        self._audit_size = 0
+        self._ua_per_min = unauth_audit_per_minute
+        self._ua_lock = threading.Lock()
+        self._ua_ip: dict[str, deque] = {}
+        self._ua_all: deque = deque()
+        self._ua_suppressed = 0
+        self._denials: dict[str, tuple] = {}
+        if audit_path:
+            self._open_audit()
         self._rate = rate_per_minute
         self._hits: dict[str, deque] = defaultdict(deque)
         self._reveals: dict[str, deque] = defaultdict(deque)
@@ -108,10 +154,18 @@ class Custodian:
 
     # ── admin ────────────────────────────────────────────────────────────────
     def replace_share(self, share: KeyShare) -> None:
-        """Install the refreshed share (same key, new epoch)."""
-        if self._share is None or share.public.key_id != self._share.public.key_id:
-            raise CustodyError("refusing a share of a different key")
+        """Install the refreshed share: same key, SAME custodian index, and a
+        strictly newer epoch (a replaced/rolled-back file is refused)."""
         with self._lock:
+            cur = self._share
+            if cur is None or share.public.key_id != cur.public.key_id:
+                raise CustodyError("refusing a share of a different key")
+            if share.index != cur.index:
+                raise CustodyError(f"refusing a share for custodian {share.index} "
+                                   f"(this daemon is custodian {cur.index})")
+            if share.epoch <= cur.epoch:
+                raise CustodyError(f"refusing a share of epoch {share.epoch} "
+                                   f"(current epoch is {cur.epoch})")
             self._share = share
 
     def info(self) -> dict:
@@ -153,6 +207,20 @@ class Custodian:
         return found
 
     # ── audit ────────────────────────────────────────────────────────────────
+    def _open_audit(self) -> None:
+        flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(self._audit_path, flags, 0o600)
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode):
+                raise CustodyError(f"audit path {self._audit_path} is not a regular file")
+            if st.st_mode & 0o077:
+                os.fchmod(fd, 0o600)                       # tighten a lax pre-existing file
+        except BaseException:
+            os.close(fd)
+            raise
+        self._audit_fd, self._audit_size = fd, st.st_size
+
     def _audit(self, caller: str, peer: str, op: str, detail: dict, outcome: str) -> None:
         rec = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "caller": caller, "peer": peer,
                "op": op, "outcome": outcome}
@@ -163,9 +231,50 @@ class Custodian:
         line = json.dumps(rec)                                  # json escapes newlines
         log.info("%s", line)
         if self._audit_path:
-            with self._lock, open(self._audit_path, "a") as f:
-                f.write(line + "\n")
-                f.flush()
+            data = (line + "\n").encode()
+            with self._audit_lock:
+                if self._audit_size + len(data) > self._audit_max:      # bounded: rotate once
+                    os.close(self._audit_fd)
+                    os.replace(self._audit_path, self._audit_path + ".1")
+                    self._open_audit()
+                os.write(self._audit_fd, data)
+                self._audit_size += len(data)
+
+    def audit_unauth(self, peer: str, op: str, outcome: str, detail: dict | None = None) -> None:
+        """Audit a failed / unauthenticated attempt. Rate-limited per source IP
+        and globally (a flood cannot fill the log); suppressed events are
+        counted and reported in one summary line. Never records a token."""
+        ip = peer.rsplit(":", 1)[0]
+        now = time.monotonic()
+        with self._ua_lock:
+            if len(self._ua_ip) > 1000:
+                self._ua_ip.clear()
+            q = self._ua_ip.setdefault(ip, deque())
+            for d in (q, self._ua_all):
+                while d and now - d[0] > 60:
+                    d.popleft()
+            if len(q) >= self._ua_per_min or len(self._ua_all) >= 4 * self._ua_per_min:
+                self._ua_suppressed += 1
+                return
+            q.append(now)
+            self._ua_all.append(now)
+            sup, self._ua_suppressed = self._ua_suppressed, 0
+        if sup:
+            self._audit("-", "-", "audit", {"suppressed": sup},
+                        "unauthenticated events suppressed (rate-limited)")
+        self._audit("-", peer, op, detail or {}, outcome)
+
+    def _audit_denial(self, caller: str, peer: str, op: str, outcome: str) -> None:
+        """Audit a rate/quota denial at most once per 10 s per caller (the rest are
+        counted into the next line), so a refused flood cannot flood the log."""
+        now = time.monotonic()
+        with self._ua_lock:
+            last, sup = self._denials.get(caller, (-1e9, 0))
+            if now - last < 10:
+                self._denials[caller] = (last, sup + 1)
+                return
+            self._denials[caller] = (now, 0)
+        self._audit(caller, peer, op, {"suppressed_since_last": sup}, outcome)
 
     def _rate_ok(self, table: dict, caller: str, cost: int, cap: int | None) -> bool:
         if cap is None:
@@ -199,23 +308,27 @@ class Custodian:
     def _m_partial(self, caller, peer, E_hex, ctx_hex=""):
         if self._share is None:
             raise CustodyError("this custodian holds no key share")
-        g = self._share.public.g
+        # rate limit FIRST: malformed requests also cost budget, so an
+        # authenticated caller cannot flood the audit log with junk
+        if not self._rate_ok(self._hits, caller, 1, self._rate):
+            self._audit_denial(caller, peer, "partial", "denied: rate limit")
+            raise CustodyError("rate limit exceeded")
+        share = self._share
+        g = share.public.g
         try:
             E = g.from_hex(E_hex)
             ctx = bytes.fromhex(ctx_hex)
             if len(ctx) > 1024 or g.is_identity(E):
                 raise InvalidPoint("bad request")
-        except (InvalidPoint, ValueError, TypeError):
+        except (InvalidPoint, ValueError, TypeError, AttributeError):
             self._audit(caller, peer, "partial", {"E": str(E_hex)[:16]}, "rejected: malformed")
             raise CustodyError("malformed request")
-        if not self._rate_ok(self._hits, caller, 1, self._rate):
-            self._audit(caller, peer, "partial", {}, "denied: rate limit")
-            raise CustodyError("rate limit exceeded")
-        efp = hashlib.sha256(E_hex.encode()).hexdigest()[:16]
-        if self._approve and not self._approve(caller, E_hex, ctx):
+        E_canon = g.hex(E)               # canonical encoding: what policy sees is what is used
+        efp = hashlib.sha256(E_canon.encode()).hexdigest()[:16]
+        if self._approve and not self._approve(caller, E_canon, ctx):
             self._audit(caller, peer, "partial", {"E": efp}, "denied: policy")
             raise CustodyError("request declined by custodian policy")
-        part = partial_decrypt(self._share, E, ctx)
+        part = partial_decrypt(share, E, ctx)
         self._audit(caller, peer, "partial", {"E": efp}, "served")
         return part.to_json(g)
 
@@ -263,7 +376,7 @@ class Custodian:
     def _m_mask_get(self, caller, peer, gen, table, col, items):
         self._check_items(items)
         if not self._rate_ok(self._reveals, caller, len(items), self.limits.reveal_rows_per_minute):
-            self._audit(caller, peer, "mask_get", {"rows": len(items)}, "denied: reveal quota")
+            self._audit_denial(caller, peer, "mask_get", "denied: reveal quota")
             raise CustodyError("reveal quota exceeded")
         try:
             vals, x = self._store().get(int(gen), str(table), str(col),
@@ -332,17 +445,31 @@ class _Handler(socketserver.StreamRequestHandler):
         peer = f"{self.client_address[0]}:{self.client_address[1]}"
         caller = None
         fails = 0
+        pre_frames = 0
         started = time.monotonic()
         while True:
             limit = srv.max_frame if caller else PRE_AUTH_FRAME
+            if caller is None:
+                # total pre-auth deadline, enforced on every read (slow-loris safe)
+                remaining = srv.auth_deadline - (time.monotonic() - started)
+                if remaining <= 0 or pre_frames >= PRE_AUTH_MAX_FRAMES:
+                    return
+                try:
+                    self.connection.settimeout(remaining)
+                except OSError:
+                    return
             try:
                 payload = read_frame(self.rfile, limit)
-            except (ValueError, EOFError, OSError, ssl.SSLError):
+            except (EOFError, OSError, ssl.SSLError):
+                return
+            except ValueError:
+                if caller is None:
+                    cust.audit_unauth(peer, "frame", "rejected: bad frame")
                 return
             if payload is None:
                 return
-            if caller is None and time.monotonic() - started > srv.auth_deadline:
-                return
+            if caller is None:
+                pre_frames += 1
             try:
                 req = json.loads(payload)
                 m, a = req["m"], req.get("a", [])
@@ -353,22 +480,31 @@ class _Handler(socketserver.StreamRequestHandler):
                 elif m == "auth":
                     try:
                         caller = cust.authenticate(a[0], peer)
-                    except CustodyError:
+                    except CustodyError as exc:
                         fails += 1
+                        cust.audit_unauth(peer, "auth", f"denied: {exc}")
                         raise
                     self.connection.settimeout(srv.idle_timeout)
                     out = {"caller": caller}
                 else:
                     if caller is None:
+                        cust.audit_unauth(peer, "request", "denied: unauthenticated",
+                                          {"method": str(m)[:32]})
                         raise CustodyError("authenticate first")
                     out = cust.dispatch(caller, peer, m, a)
                 resp = {"ok": out}
             except CustodyError as exc:
                 resp = {"err": f"{type(exc).__name__}: {exc}"}
             except (KeyError, IndexError, TypeError, ValueError, RecursionError, OverflowError):
+                if caller is None:
+                    cust.audit_unauth(peer, "request", "rejected: malformed")
                 resp = {"err": "BadRequest: malformed request"}
-            except Exception:                                          # noqa: BLE001
-                log.exception("custodian internal error")
+            except Exception as exc:                                   # noqa: BLE001
+                if caller is None:                    # pre-auth: no traceback spam
+                    log.warning("custodian pre-auth internal error: %s", type(exc).__name__)
+                    cust.audit_unauth(peer, "request", "error: internal")
+                else:
+                    log.exception("custodian internal error")
                 resp = {"err": "InternalError: internal custodian error"}
             try:
                 data = json.dumps(resp).encode()
@@ -386,20 +522,49 @@ class CustodianServer(socketserver.ThreadingTCPServer):
     daemon_threads = True
 
     def __init__(self, host: str, port: int, custodian: Custodian, *,
-                 ssl_ctx: ssl.SSLContext | None = None, idle_timeout: float = 60.0,
+                 ssl_ctx: ssl.SSLContext | None = None, idle_timeout: float = 30.0,
                  auth_deadline: float = 10.0, max_frame: int = 16 * 1024 * 1024,
-                 max_connections: int = 128):
+                 max_connections: int = 128, max_per_ip: int = 64):
+        if ":" in host:
+            self.address_family = socket.AF_INET6
         super().__init__((host, port), _Handler)
         self.custodian = custodian
         self.idle_timeout, self.auth_deadline = idle_timeout, auth_deadline
         self.max_frame = max_frame
         self._ssl_ctx = ssl_ctx
         self._sem = threading.BoundedSemaphore(max_connections)
+        self._max_per_ip = max_per_ip
+        self._per_ip: dict[str, int] = {}
+        self._ip_lock = threading.Lock()
+
+    def process_request(self, request, client_address) -> None:
+        """Enforce the connection caps BEFORE a handler thread is spawned."""
+        ip = client_address[0]
+        if not self._sem.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        with self._ip_lock:
+            if self._per_ip.get(ip, 0) >= self._max_per_ip:
+                self._sem.release()
+                self.shutdown_request(request)
+                return
+            self._per_ip[ip] = self._per_ip.get(ip, 0) + 1
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self._release(ip)
+            raise
+
+    def _release(self, ip: str) -> None:
+        with self._ip_lock:
+            left = self._per_ip.get(ip, 1) - 1
+            if left <= 0:
+                self._per_ip.pop(ip, None)
+            else:
+                self._per_ip[ip] = left
+        self._sem.release()
 
     def finish_request(self, request, client_address) -> None:
-        if not self._sem.acquire(blocking=False):
-            request.close()                                   # connection cap
-            return
         try:
             if self._ssl_ctx is not None:
                 request.settimeout(self.auth_deadline)
@@ -409,7 +574,7 @@ class CustodianServer(socketserver.ThreadingTCPServer):
                     return
             self.RequestHandlerClass(request, client_address, self)
         finally:
-            self._sem.release()
+            self._release(client_address[0])
 
     @property
     def address(self):
@@ -424,7 +589,12 @@ class RemoteCustodian:
     def __init__(self, host: str, port: int, token: str, *, group=None, tls: bool = False,
                  cafile: str | None = None, tls_insecure: bool = False,
                  certfile: str | None = None, keyfile: str | None = None,
-                 timeout: float = 30.0):
+                 timeout: float = 30.0, allow_insecure: bool = False):
+        if not tls and not allow_insecure and not _is_loopback(host):
+            raise CustodyError(
+                f"refusing plaintext TCP to non-loopback host {host!r}: the bearer token and "
+                f"requests would travel in the clear — use tls=True (or allow_insecure=True "
+                f"if the network is fully trusted)")
         self.host, self.port, self.token, self.g = host, port, token, group
         self.tls, self.cafile, self.insecure = tls, cafile, tls_insecure
         self.certfile, self.keyfile, self.timeout = certfile, keyfile, timeout

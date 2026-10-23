@@ -84,6 +84,21 @@ python -m torussql.custody dkg-finish --identity id1.json --ids ids.json --k 2 -
 #   everyone compares the printed transcript hash and public key; keep public.json
 ```
 
+Every broadcast is signed together with the ceremony specification (group, k, n,
+digest of `ids.json`; for a reshare also old key_id/epoch/public-key digest, dealing
+quorum and new k/n), the signer and expected sender index; the transcript hash
+covers the same specification. Every private share file is encrypted to its
+recipient **and signed by its dealer** (session, i, j, ciphertext): a substituted
+or forged file is rejected as such, without blaming the honest dealer. (Reshare does
+not bind the *new* committee's identity list into the signed specification; new
+holders are bound only by the shares being encrypted to their keys.) File formats
+are versioned (`TORUSSHARE2`, `TORUSID2`, `torussql-share/2`); v1 files are refused.
+Identity, share and vault files are sealed under separate passphrase-derivation
+labels with the header as authenticated data, so one file type cannot be accepted
+as another. Each participant has ONE identity key used for both signing and
+share-decryption DH — an accepted, domain-separated design (distinct signature
+context prefixes and a labelled KDF), not split into two keys.
+
 The ceremony **aborts and names the culprit** on a bad share, bad commitment, a
 missing/forged proof, a bad signature or swapped files, and must then be restarted
 without them. *Dev/test only:* `keygen-local` runs the whole ceremony in one
@@ -96,12 +111,40 @@ python -m torussql.custody serve --share share1.json --listen 0.0.0.0:8601 \
     --token-file tokens --tls --cert c.crt --key c.key --audit /var/log/custodian.audit --passphrase-env PW
 ```
 
-`tokens` holds `caller:token` lines (≥16 chars). The daemon refuses a non-loopback
-listen without `--tls`, rate-limits each caller (default 30/min), refuses malformed
-or off-curve points, and appends a JSON audit line for every decision (caller, key
-epoch, a hash of the request — never a share). `SIGHUP` reloads a refreshed share.
-A custodian can also be given an `approve(caller, E, context)` callback in code to
-require human or policy approval.
+`tokens` holds `caller:token` lines (≥16 chars, at least 8 distinct characters and
+~64 bits of estimated entropy — a sanity check only; generate tokens with
+`secrets.token_urlsafe(32)`). The daemon refuses a non-loopback listen without
+`--tls`, rate-limits each caller (default 30/min; malformed requests count against
+the limit *before* anything is written to the audit log), refuses malformed or
+off-curve points, and appends a JSON audit line for every authenticated decision
+(caller, key epoch, a hash of the canonical request — never a share).
+**Failed and unauthenticated attempts are audited too** (failed auth, lockout,
+unauthenticated requests, malformed pre-auth frames), but rate-limited per source IP
+and globally, with a one-line "suppressed N events" summary, so a flood cannot fill
+the log; the file is created `0600` (`O_NOFOLLOW`) and rotated once at 64 MiB. Auth
+failures lock out the source *IP* (not the connection) for 30 s after 5 failures.
+Connections are capped globally and per IP, pre-authentication reads have a hard
+10 s total deadline and a 16-frame budget, idle authenticated connections are
+dropped after 30 s. `hello`/`ping` are unauthenticated and disclose key_id, epoch,
+index, k, n (public metadata). `SIGHUP` reloads a refreshed share; the daemon only
+accepts a share of the **same key and same custodian index with a strictly newer
+epoch** (a replaced or rolled-back file is refused).
+
+`approve(caller, E, context)` is an optional in-code hook, called for every
+key-service request with the *canonical* hex of `E` (the request is parsed to a
+group element and re-encoded first, so case/whitespace tricks cannot bypass a
+deny-list; `LocalCustodian` uses the same signature with `caller="local"`). It is a
+**service-level rate or human decision** ("should this custodian answer now?"), not
+a per-vault policy: the custodian is a decryption oracle on points, `E` carries no
+vault identity and can be blinded by the caller (`E+rG`, `−E`), and **`context` is
+informational — it is chosen by the caller, only enters the proof hash, and
+authorizes nothing**. Do not build per-ciphertext or per-context access control on
+it.
+
+Clients: `RemoteCustodian` refuses plaintext TCP to a non-loopback host unless
+`tls=True` (or `allow_insecure=True` on a fully trusted network). `open-test` takes
+the token only from `--token-env` (never argv) and accepts `HOST:PORT` or
+`[IPv6]:PORT`.
 
 ### 2.3 Using it from the driver
 
@@ -138,13 +181,20 @@ conn = torussql.connect(host, port, token=db_token, vault_path="owner.vault",
 **Protects**
 * The vault file at rest, and the *authority to open it*: it takes `k` custodians
   (separate hosts, separate admins) to produce the opening key.
-* No single custodian, and no coalition below `k`, learns anything about `x` —
-  perfect secrecy of the sharing for the evaluation points used (tested for every
-  `(k−1)`-subset up to n=10).
-* A faulty custodian cannot corrupt an opening undetected (DLEQ), cannot be
-  impersonated (tokens/TLS), and its decisions are auditable.
-* The key is never reassembled by generation, use, refresh or reshare — the test
-  suite runs those paths with the reconstruction function disabled.
+* No single custodian, and no coalition below `k`, learns anything about the
+  *shares-as-a-sharing*: the Laurent sharing itself is perfectly hiding for the
+  evaluation points used (tested for every `(k−1)`-subset up to n=10). But the
+  Feldman commitments make `X` and every `Yᵢ` public, so secrecy of `x` is
+  **computational** (ECDLP), not information-theoretic.
+* A faulty custodian cannot corrupt an opening undetected (DLEQ). Callers are
+  authenticated by bearer tokens; **TLS/mTLS is optional on the daemon and must be
+  enabled on any untrusted network** (the client refuses plaintext to non-loopback
+  hosts unless told otherwise). Authenticated decisions and failed attempts are
+  audited (the latter rate-limited and bounded).
+* By design the code never reassembles the key: no function does, and the tests
+  monkeypatch `laurent.reconstruct` to fail during generation, use, refresh and
+  reshare. That test is evidence for the shipped code paths, not a proof — it
+  cannot rule out a different code path recomputing the key.
 
 **Does not protect**
 * **An opened vault lives in the owner process's memory.** To unblind results the
@@ -166,8 +216,23 @@ conn = torussql.connect(host, port, token=db_token, vault_path="owner.vault",
   Harmless for an encryption key; do not reuse this DKG where uniformity matters.
 * The DKG needs all `n` participants; any failure restarts the ceremony.
 * Transport of ceremony files is only as trustworthy as the fingerprint comparison.
-* Pure Python: arithmetic is not constant-time. The scalar is randomised
-  (`k + r·q`) to blunt timing correlation; run custodians on isolated hosts.
+* Pure Python: **arithmetic is NOT constant-time** (`py_ecc` uses variable-time
+  big-int double-and-add; run time depends on the scalar's Hamming weight). Every
+  multiplication by a secret scalar (key shares, identity keys, proof nonces,
+  dealing coefficients) is computed as `k·P = (k−r)·P + r·P` with a fresh random
+  `r`; this only *decorrelates* repeated measurements from `k` and does not make
+  the arithmetic constant time or defeat a local/co-resident observer. A caller
+  with a token chooses `E`, so `yᵢ·E` timing is observable by a networked
+  attacker to the extent the rate limit allows. For high-value deployments use a
+  constant-time library (libsecp256k1 / coincurve) and isolated hosts.
+* Secret dataclass fields (`KeyShare.y`, `Identity.secret`) are excluded from
+  `repr` and refuse pickling/copying; this is hygiene, not memory protection.
+* `PublicKey.key_id` covers only the group and `X` (stable across refresh and
+  reshare, on purpose). `PublicKey.digest` additionally covers k, n, epoch and all
+  commitments and is checked when a public-key file is loaded; `public.json` is
+  still an unauthenticated trust anchor — pin its `key_id`/`digest` out of band.
+* Sealed-file freshness/rollback is not protected at the custody layer; see the
+  vault notes.
 * Nothing can force a custodian to **erase** an old share after a reshare.
 * Sealing uses the stdlib HMAC-keystream construction (finding F-10).
 * No independent audit has been done.

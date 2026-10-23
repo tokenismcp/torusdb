@@ -13,9 +13,14 @@ here. Points are opaque objects; ``encode``/``decode`` give a canonical 64-byte
 form (``x ‖ y``, all-zero for the identity) and ``decode`` validates the curve
 equation, so a malformed or off-curve point is always rejected.
 
-Constant-time arithmetic is **not** available in pure Python. ``mul_blinded``
-randomises the scalar (k + r·order) as a cheap defence against timing
-correlation; run custodians on isolated hosts regardless.
+Constant-time arithmetic is **not** available in pure Python: ``py_ecc`` uses
+variable-time big-int double-and-add, so scalar-multiplication time depends on
+the scalar. ``mul_blinded`` splits the scalar, k·P = (k−r)·P + r·P with a fresh
+random r, so the two multiplications are individually decorrelated from k.
+That is a mitigation of repeated-measurement correlation only — it does NOT
+make the arithmetic constant time and it does not stop a local observer who
+can measure both halves. For high-value deployments use a constant-time
+library (libsecp256k1 / coincurve) and run custodians on isolated hosts.
 """
 from __future__ import annotations
 
@@ -70,8 +75,14 @@ class Group:
         return self.add(a, self.neg(b))
 
     def mul_blinded(self, a, k: int):
-        """k·a with the scalar randomised by a multiple of the group order."""
-        return self.mul(a, (k % self.order) + secrets.randbelow(1 << 64) * self.order)
+        """k·a computed as (k−r)·a + r·a with a fresh random r in [1, q).
+
+        (The previous k + r·q variant was a no-op: ``mul`` reduces mod q.)
+        Use it for every multiplication by a secret scalar. This decorrelates
+        the work from k across calls; it is NOT constant-time arithmetic."""
+        q = self.order
+        r = secrets.randbelow(q - 1) + 1
+        return self.add(self.mul(a, (k - r) % q), self.mul(a, r))
 
     def msm(self, pairs):
         """Σ kᵢ·Pᵢ for (k, P) pairs."""

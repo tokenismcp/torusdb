@@ -271,7 +271,7 @@ def test_a_custodian_that_declines_cannot_be_forced(keyset, db, tmp_path):
     with torussql.connect(*db, vault_path=vault, vault_custody=ThresholdCustody(
             pub, Quorum(pub, [LocalCustodian(s) for s in shares]))) as c:
         _seed(c)
-    refusing = [LocalCustodian(s, approve=lambda E, ctx: False) for s in shares[:3]]
+    refusing = [LocalCustodian(s, approve=lambda caller, E, ctx: False) for s in shares[:3]]
     with pytest.raises(VaultLocked):
         torussql.connect(*db, vault_path=vault, vault_custody=ThresholdCustody(
             pub, Quorum(pub, refusing + [LocalCustodian(shares[3])], timeout=5)))

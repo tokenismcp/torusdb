@@ -110,8 +110,8 @@ def wrap_key(pub: PublicKey, context: bytes = b"") -> tuple[int, dict]:
     """Create a fresh sealing key for ``context``. Needs only the PUBLIC key."""
     g = pub.g
     e = g.rand_scalar()
-    E = g.mul(g.G, e)
-    S = g.mul(pub.X, e)
+    E = g.mul_blinded(g.G, e)
+    S = g.mul_blinded(pub.X, e)
     return _derive(pub, S, E, context), {
         "v": 1, "group": pub.group, "key_id": pub.key_id, "k": pub.k, "n": pub.n,
         "E": g.hex(E), "ctx": context.hex()}

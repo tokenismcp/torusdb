@@ -334,8 +334,8 @@ now stated).
 | F-13 | **Threshold custody (`torussql.custody`) is computational**: security of the shared key rests on ECDLP in secp256k1 / BN254 (not post-quantum), unlike the information-theoretic LSS custody in `keymgmt`. | **DOC** — tradeoff stated in `custody.md` §3 | — |
 | F-14 | Feldman-style DKG lets a last-speaking adversary bias the distribution of the public key X (no effect on an encryption key). Pedersen-hiding variant not implemented. | **OPEN (by design)** | `custody.md` §4 |
 | F-15 | DKG requires all n participants and aborts on any fault (no qualified-set recovery); transport authenticity rests on out-of-band fingerprint comparison. | **DOC** | `test_file_based_ceremony_…` |
-| F-16 | Custodian arithmetic is not constant-time (pure Python). Scalar randomisation (k + r·q) is the only mitigation. | **OPEN** | `Group.mul_blinded` |
-| F-17 | Rogue-key / mixed-epoch / forged-partial / swapped-file attacks on the custody protocols. | **FIXED/COVERED** — Schnorr PoK binds dealers, DLEQ binds partials to (key, epoch, context), signed broadcasts + sender checks bind files | `tests/test_custody.py` |
+| F-16 | Custodian arithmetic is NOT constant-time (pure-Python big-int double-and-add; run time depends on the scalar). The only mitigation is scalar *splitting* k·P=(k−r)·P+r·P with fresh r (an earlier k+r·q "blinding" was a no-op and was removed). Splitting merely decorrelates repeated measurements; it does not make the arithmetic constant time. | **OPEN** — for high-value deployments use a constant-time library (libsecp256k1 / coincurve) and isolate custodian hosts. | `Group.mul_blinded`, `tests/test_custody_audit2.py` |
+| F-17 | Rogue-key / mixed-epoch / forged-partial / swapped-file attacks on the custody protocols. | **FIXED/COVERED** — Schnorr PoK binds dealers, DLEQ binds partials to (key, epoch, context); signed broadcasts bind kind, session, signer, expected sender and the ceremony spec (group/k/n/ids digest); private share files are dealer-signed so a substituted file is rejected without blaming the honest dealer. Residual: the DKG is not robust (any fault aborts); reshare does not bind the new committee's identity list; identity key is reused for signing and DH (domain-separated); `public.json` is an unauthenticated trust anchor | `tests/test_custody.py`, `tests/test_custody_audit2.py` |
 
 ### Properties exercised by `core/tests/test_crypto_audit.py`
 
@@ -389,7 +389,8 @@ polynomial g(u)=a₀+b₁u+…, secret g′(0); reconstruction from a quorum S i
 functional b₁=Σ λᵢyᵢ with λᵢ = −xᵢ^{k−1}(Σ_{j≠i}x_j)/Π_{j≠i}(xᵢ−x_j) (tested against
 Gaussian elimination). Perfect secrecy of any k−1 shares holds iff e_{k−2}(1/x_S)≠0 mod q;
 for points 1..n, n≤32 the numerator is a positive integer < q, and the property is
-verified exhaustively for every (k−1)-subset in the tests (n≤10).
+verified exhaustively for every (k−1)-subset in the tests (n≤10). This is perfect secrecy of the *sharing*; because Feldman commitments
+publish X and every Yᵢ, secrecy of x itself is computational (ECDLP).
 
 **DKG.** Each of n participants deals a random residue with Feldman commitments
 Cₘ=cₘG and a Schnorr proof of knowledge of b₁ (context-bound to session and index);

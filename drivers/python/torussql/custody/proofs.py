@@ -38,9 +38,9 @@ class SchnorrProof:
 
 def schnorr_prove(g: Group, x: int, context: bytes, base=None) -> tuple[object, SchnorrProof]:
     base = g.G if base is None else base
-    P = g.mul(base, x)
+    P = g.mul_blinded(base, x)                     # x, k are secret: split-scalar multiply
     k = g.rand_scalar()
-    R = g.mul(base, k)
+    R = g.mul_blinded(base, k)
     c = g.hash_to_scalar(b"schnorr", context, *_ser(g, base, P, R))
     return P, SchnorrProof(R, (k + c * x) % g.order)
 
@@ -69,7 +69,7 @@ class DleqProof:
 
 def dleq_prove(g: Group, x: int, B1, B2, P1, P2, context: bytes) -> DleqProof:
     k = g.rand_scalar()
-    R1, R2 = g.mul(B1, k), g.mul(B2, k)
+    R1, R2 = g.mul_blinded(B1, k), g.mul_blinded(B2, k)   # secret nonce
     c = g.hash_to_scalar(b"dleq", context, *_ser(g, B1, P1, B2, P2, R1, R2))
     return DleqProof(R1, R2, (k + c * x) % g.order)
 

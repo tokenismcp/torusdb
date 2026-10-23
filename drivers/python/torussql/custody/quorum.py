@@ -21,7 +21,12 @@ class Custodian(Protocol):
 
 
 class LocalCustodian:
-    """A share held in this process (tests, single-host deployments)."""
+    """A share held in this process (tests, single-host deployments).
+
+    ``approve(caller, E, context) -> bool`` has the SAME signature as the
+    network ``Custodian``: ``caller`` is ``"local"`` and ``E`` is the canonical
+    hex encoding of the point. It is a service-level rate/human decision, not a
+    per-vault policy; ``context`` is informational and authorizes nothing."""
 
     def __init__(self, share: KeyShare, approve=None):
         self.share = share
@@ -29,7 +34,8 @@ class LocalCustodian:
         self.requests = 0
 
     def partial(self, E, context: bytes = b"") -> Partial:
-        if self._approve and not self._approve(E, context):
+        g = self.share.public.g
+        if self._approve and not self._approve("local", g.hex(E), context):
             raise QuorumError("custodian declined the request")
         self.requests += 1
         return partial_decrypt(self.share, E, context)
