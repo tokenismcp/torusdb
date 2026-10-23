@@ -179,3 +179,39 @@ def test_replication_is_admin_only_and_refuses_foreign_clusters(pair):
             call("repl_fetch", [p.srv.engine.cluster_id, 9, [0, 0], 10, 0])
         with pytest.raises(torussql.Error, match="too far behind"):
             call("repl_fetch", [p.srv.engine.cluster_id, 1, [0, 3], 10, 0])
+
+
+# ── synchronous replication ──────────────────────────────────────────────────
+def test_sync_commit_waits_for_the_replica_and_degrades_or_errors_without_one(tmp_path):
+    p = Running(db=str(tmp_path / "p"), tokens=dict(TOKENS), sync_replicas=1, sync_timeout=1.0)
+    r = None
+    try:
+        with p.connect(token=ADMIN) as c:
+            c.execute("CREATE TABLE t (id INT PLAIN)")
+            t0 = time.monotonic()
+            c.execute("INSERT INTO t (id) VALUES (0)")          # no replica yet: degrades
+            assert 0.8 < time.monotonic() - t0 < 5
+            assert p.srv.engine.stats_snapshot()["requests"]
+        r = replica(p, str(tmp_path / "r"))
+        wait_for(lambda: count(r) == 1, what="bootstrap")
+        with p.connect(token=ADMIN) as c:
+            t0 = time.monotonic()
+            for i in range(1, 6):
+                c.execute(f"INSERT INTO t (id) VALUES ({i})")
+                # at the moment the client has its answer the replica has the row
+                assert r.srv.engine.repl_pos == tuple(p.srv.engine._ring.end), i
+            assert time.monotonic() - t0 < 4
+            c.begin()
+            c.execute("INSERT INTO t (id) VALUES (100)")
+            c.commit()
+            assert r.srv.engine.repl_pos == tuple(p.srv.engine._ring.end)
+        r.stop(); r = None
+        p.srv.engine.cfg.sync_strict = True
+        with p.connect(token=ADMIN) as c:
+            with pytest.raises(torussql.Error, match="did not confirm"):
+                c.execute("INSERT INTO t (id) VALUES (200)")
+            assert c.execute("SELECT COUNT(*) FROM t WHERE id = 200").rows == [[1]]   # it did commit
+    finally:
+        if r:
+            r.stop()
+        p.stop()

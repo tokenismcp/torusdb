@@ -252,8 +252,14 @@ class RemoteNoKeyServer:
     def __init__(self, conn: _Conn):
         self._c = conn
 
-    def create(self, table, columns):
-        self._c.call("create", [table, [list(c) for c in columns]])
+    def create(self, table, columns, if_not_exists=False):
+        args = [table, [list(c) for c in columns]]
+        if if_not_exists:
+            args.append(True)
+        return self._c.call("create", args) is not False
+
+    def drop_if_exists(self, table):
+        return self._c.call("drop", [table, True]) is not False
 
     def drop(self, table):
         self._c.call("drop", [table])

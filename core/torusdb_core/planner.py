@@ -205,7 +205,7 @@ def plan_query(q: Query, catalog: Catalog) -> Plan:
     if isinstance(q, DropTable):
         if q.name not in catalog.tables:
             if q.if_exists:
-                return Plan(kind="noop", raw=q, table=q.name)
+                return Plan(kind="drop_if_exists", raw=q, table=q.name)
             raise PlanError(f"no such table: {q.name}")
         return Plan(kind="drop", raw=q, table=q.name)
     if isinstance(q, (CreateIndex, DropIndex)):

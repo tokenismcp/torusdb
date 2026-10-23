@@ -90,11 +90,17 @@ class NoKeyServer:
         self._rows: dict[str, TableStore] = {}
 
     # — catalog / storage (server sees plaintext cols + blinded scalars) —
-    def create(self, table: str, columns: list[tuple[str, str, str]]) -> None:
+    def create(self, table: str, columns: list[tuple[str, str, str]],
+               if_not_exists: bool = False) -> bool:
+        """Create a table; returns False (and changes nothing) when it already
+        exists and ``if_not_exists`` is set."""
         if table in self._schema:
+            if if_not_exists:
+                return False
             raise PlanError(f"table {table!r} already exists")
         self._schema[table] = columns
         self._rows[table] = self._storage.new_table(table)
+        return True
 
     def drop(self, table: str):
         """Remove a table. Returns what :meth:`undrop` needs to bring it back."""
@@ -103,6 +109,12 @@ class NoKeyServer:
         if saved[1] is not None and getattr(self._storage, "paged", False):
             meta = self._storage.forget(table, saved[1])
         return saved + (meta,)
+
+    def drop_if_exists(self, table: str) -> bool:
+        if table not in self._schema:
+            return False
+        self.drop(table)
+        return True
 
     def undrop(self, table: str, saved) -> None:
         schema, store, meta = saved
@@ -379,6 +391,10 @@ class NoKeyClient:
         plan = plan_query(parse(sql), _CatalogView(self._schema))
         if plan.kind == "noop":                  # IF [NOT] EXISTS that has nothing to do
             return 0
+        if plan.kind == "drop_if_exists":        # unknown to this client: ask the server
+            if self.server.drop_if_exists(plan.table):
+                self._forget_table(plan.table)
+            return 0
         if plan.kind == "create":
             return self._create(plan)
         if plan.kind == "drop":
@@ -406,7 +422,11 @@ class NoKeyClient:
         q = plan.raw
         cols = [(c.name, c.type, c.policy) for c in
                 _spec_columns(q)]
-        self.server.create(q.name, cols)
+        if not self.server.create(q.name, cols, q.if_not_exists):
+            # it exists on the server but this client did not know it: adopt the
+            # server's schema, read-only until the caller vouches for it
+            cols = [tuple(c) for c in self.server.schema(q.name)]
+            self._untrusted.add(q.name)
         self._schema[q.name] = cols
         for (name, typ, pol) in cols:
             self._coltype[(q.name, name)] = typ

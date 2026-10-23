@@ -698,6 +698,10 @@ impl Client {
 
     // — DDL —
     pub fn create_table(&mut self, name: &str, cols: Vec<Column>) -> Result<()> {
+        self.create_table_impl(name, cols, false)
+    }
+
+    fn create_table_impl(&mut self, name: &str, cols: Vec<Column>, if_not_exists: bool) -> Result<()> {
         self.assert_writable()?;
         check_name("table", name)?;
         let mut seen = HashSet::new();
@@ -714,29 +718,26 @@ impl Client {
             }
         }
         let wire: Vec<Value> = cols.iter().map(|c| json!([c.name, c.ty, c.policy])).collect();
-        self.call("create", json!([name, wire]))?;
+        let args = if if_not_exists { json!([name, wire, true]) } else { json!([name, wire]) };
+        match self.call("create", args)? {
+            // already existed: nothing changed and nothing adopted (sync_schema learns it, untrusted)
+            Value::Bool(false) => return Ok(()),
+            Value::Null => {}
+            _ => return Err(proto("create: unexpected reply")),
+        }
         self.schema.insert(name.to_string(), TableDef { cols, trusted: true });
         Ok(())
     }
 
-    /// `CREATE TABLE IF NOT EXISTS`: a no-op when the table already exists on the server
-    /// (the existing table is left untouched and is NOT adopted as trusted).
+    /// `CREATE TABLE IF NOT EXISTS` (atomic on the server): a no-op when the table already
+    /// exists; the existing table is NOT adopted as trusted (use `sync_schema`).
     pub fn create_table_if_not_exists(&mut self, name: &str, cols: Vec<Column>) -> Result<()> {
-        self.assert_writable()?;
-        if self.tables()?.iter().any(|t| t == name) {
-            return Ok(());
-        }
-        self.create_table(name, cols)
+        self.create_table_impl(name, cols, true)
     }
 
-    /// `DROP TABLE IF EXISTS`.
+    /// `DROP TABLE IF EXISTS` (atomic on the server).
     pub fn drop_table_if_exists(&mut self, name: &str) -> Result<()> {
-        self.assert_writable()?;
-        if !self.tables()?.iter().any(|t| t == name) {
-            self.schema.remove(name);
-            return Ok(());
-        }
-        self.drop_table(name)
+        self.drop_table_impl(name, true)
     }
 
     /// `CREATE INDEX ON table (col)`: PLAIN columns only (role rw+; rolled back with the transaction).
@@ -757,14 +758,19 @@ impl Client {
         Ok(())
     }
 
-    /// Drop a table (admin). Forgets its masks. Errors if the table does not exist
-    /// (the server's `drop` RPC alone would silently accept that).
+    /// Drop a table (admin). Forgets its masks. A missing table is the server's error.
     pub fn drop_table(&mut self, name: &str) -> Result<()> {
+        self.drop_table_impl(name, false)
+    }
+
+    fn drop_table_impl(&mut self, name: &str, if_exists: bool) -> Result<()> {
         self.assert_writable()?;
-        if !self.tables()?.iter().any(|t| t == name) {
-            return Err(Error::new(Kind::BadRequest, format!("no such table: {}", name)));
+        let args = if if_exists { json!([name, true]) } else { json!([name]) };
+        match self.call("drop", args)? {
+            Value::Bool(false) => return Ok(()), // did not exist: touch nothing locally
+            Value::Null => {}
+            _ => return Err(proto("drop: unexpected reply")),
         }
-        self.call("drop", json!([name]))?;
         self.schema.remove(name);
         let keys: Vec<MaskKey> = self.masks.keys().filter(|k| k.0 == name).cloned().collect();
         for k in keys {

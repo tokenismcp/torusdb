@@ -180,6 +180,7 @@ class Follower(threading.Thread):
         self.applied = 0
         self.primary_end: tuple[int, int] | None = None
         self.fatal: str | None = None
+        self.rid = uuid.uuid4().hex                        # stable id for this replica process
 
     def run(self) -> None:
         from torussql.nokey import _Conn, Error
@@ -193,7 +194,7 @@ class Follower(threading.Thread):
                 eng = self.engine
                 resp = conn.call("repl_fetch", [eng.cluster_id, eng.timeline,
                                                 list(eng.repl_pos), self.batch,
-                                                int(self.poll * 1000)])
+                                                int(self.poll * 1000), self.rid])
                 self.last_contact = time.time()
                 self.primary_end = tuple(resp["end"])
                 if resp["records"]:

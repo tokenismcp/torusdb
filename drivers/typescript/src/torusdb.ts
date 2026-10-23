@@ -898,10 +898,6 @@ export class Client {
   createTable(name: string, columns: Column[], opts: { ifNotExists?: boolean } = {}): Promise<void> {
     return this.exclusive(async () => {
       this.assertWritable();
-      if (opts.ifNotExists) {                      // SQL-level convenience: no-op when the table exists
-        const have = arr(await this.call("tables", []), "tables").map((t) => str(t, "tables item"));
-        if (have.includes(name)) return;
-      }
       checkName("table", name);
       const seen = new Set<string>();
       for (const c of columns) {
@@ -911,7 +907,11 @@ export class Client {
         if (!POLICIES.includes(c.policy)) throw usage(`bad policy for ${c.name}: ${c.policy}`);
         if (!TYPES.includes(c.type)) throw usage(`bad type for ${c.name}: ${c.type}`);
       }
-      await this.call("create", [name, columns.map((c) => [c.name, c.type, c.policy])]);
+      const r = await this.call("create", opts.ifNotExists
+        ? [name, columns.map((c) => [c.name, c.type, c.policy]), true]    // atomic IF NOT EXISTS
+        : [name, columns.map((c) => [c.name, c.type, c.policy])]);
+      if (r === false) return;                     // already existed: nothing changed, nothing adopted (syncSchema learns it, untrusted)
+      if (r !== null && r !== undefined) throw proto("create: unexpected reply");
       this.#schema.set(name, { cols: columns.map((c) => ({ name: c.name, type: c.type, policy: c.policy })), trusted: true });
     });
   }
@@ -920,13 +920,9 @@ export class Client {
   dropTable(name: string, opts: { ifExists?: boolean } = {}): Promise<void> {
     return this.exclusive(async () => {
       this.assertWritable();
-      // the server's `drop` RPC silently accepts a missing table, so check first (like the SQL engine)
-      const have = arr(await this.call("tables", []), "tables").map((t) => str(t, "tables item"));
-      if (!have.includes(name)) {
-        if (opts.ifExists) { this.#schema.delete(name); return; }
-        throw new TorusError("BadRequest", `no such table: ${name}`);
-      }
-      await this.call("drop", [name]);
+      const r = await this.call("drop", opts.ifExists ? [name, true] : [name]);   // atomic IF EXISTS; a missing table is the server's error
+      if (r === false) return;                     // did not exist: touch nothing locally
+      if (r !== null && r !== undefined) throw proto("drop: unexpected reply");
       this.#schema.delete(name);
       const prefix = name + SEP;
       for (const k of [...this.#masks.keys()]) if (k.startsWith(prefix)) this.delMask(k);

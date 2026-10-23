@@ -271,3 +271,34 @@ fn index_rpcs_need_role_rw() {
     assert_eq!(r.drop_index("t", "age").unwrap_err().kind, Kind::Forbidden);
     assert_eq!(r.table_info("t").unwrap().indexes, vec!["age"]);
 }
+
+#[test]
+fn if_not_exists_is_atomic_across_clients() {
+    let Some(srv) = Server::start(&[]) else { return };
+    let cols = || vec![Column { name: "id".into(), ty: "int".into(), policy: "plain".into() }];
+    let addr = srv.addr.clone();
+    for i in 0..20 {
+        let t = format!("race_{}", i);
+        let hs: Vec<_> = (0..2)
+            .map(|_| {
+                let (addr, t) = (addr.clone(), t.clone());
+                let c = cols();
+                std::thread::spawn(move || {
+                    let mut db = Client::connect(&addr).unwrap();
+                    db.create_table_if_not_exists(&t, c)
+                })
+            })
+            .collect();
+        for h in hs {
+            h.join().unwrap().unwrap();
+        }
+    }
+    let mut a = Client::connect(&srv.addr).unwrap();
+    // not adopted: the table was learned, untrusted
+    a.create_table_if_not_exists("race_0", cols()).unwrap();
+    assert_eq!(a.insert("race_0", vec![("id", ci(1))]).unwrap_err().kind, Kind::UntrustedSchema);
+    a.drop_table_if_exists("race_0").unwrap();
+    a.drop_table_if_exists("race_0").unwrap();
+    assert!(!a.tables().unwrap().contains(&"race_0".to_string()));
+    assert!(a.drop_table("race_0").unwrap_err().message.contains("no such table"));
+}

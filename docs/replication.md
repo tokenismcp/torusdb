@@ -39,10 +39,26 @@ guessing; re-bootstrap it. Bootstrap streams a checksummed snapshot file in
 512 KiB chunks (`repl_snapshot_*`); producing it pauses the primary's writers
 for the time it takes to write the snapshot.
 
+## Synchronous replication
+
+```bash
+torusdb-server ... --sync-replicas 1 --sync-timeout 10 [--sync-strict]
+```
+
+With `--sync-replicas N` a commit is acknowledged to the client only after N live
+replicas have confirmed it (a replica confirms a commit by asking for the *next* one,
+i.e. after it applied and journaled it). Without enough replicas for `--sync-timeout`
+seconds the primary either **degrades to asynchronous** (default; logged and counted in
+`stats.sync_timeouts`) or, with `--sync-strict`, answers *Busy* — the commit is still
+durable on the primary, so the client must check `tx_status` before retrying (the
+drivers already do this for lost replies). Confirmation is not automatic fail-over: you
+still promote by hand, and a lagging or disconnected replica is simply not counted.
+
 ## Guarantees and limits
 
-* **Asynchronous:** commits acknowledged to clients may be lost on a primary crash if
-  the replica had not fetched them yet. There is no synchronous mode yet.
+* **Asynchronous by default:** commits acknowledged to clients may be lost on a primary
+  crash if the replica had not fetched them yet; use `--sync-replicas` to close that
+  window (at the price of commit latency).
 * A replica only ever sees commits that were durable in the primary's journal.
 * No automatic fail-over, no cascading replicas, no multi-primary.
 * The bootstrap snapshot is streamed to disk on the primary (writers are paused while

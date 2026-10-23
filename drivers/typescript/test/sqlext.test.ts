@@ -196,3 +196,26 @@ test("create_index / drop_index need role rw", { skip }, async () => {
     a.close(); r.close();
   } finally { await srv.stop(); }
 });
+
+test("IF NOT EXISTS / IF EXISTS are atomic on the server (concurrent clients)", { skip }, async () => {
+  const srv = await startServer();
+  const a = await Client.connect(srv.host, srv.port);
+  const b = await Client.connect(srv.host, srv.port);
+  const cols = [{ name: "id", type: "int" as const, policy: "plain" as const }];
+  try {
+    for (let i = 0; i < 20; i++) {
+      const t = `race_${i}`;
+      await Promise.all([a.createTable(t, cols, { ifNotExists: true }), b.createTable(t, cols, { ifNotExists: true })]);
+      assert.ok((await a.tables()).includes(t));
+    }
+    // the loser did not adopt the table (trust only comes from creating it / the vault)
+    const loser = await Client.connect(srv.host, srv.port);
+    await loser.createTable("race_0", cols, { ifNotExists: true });
+    await assert.rejects(loser.insert("race_0", { id: 1 }), kind("UntrustedSchema"));
+    await Promise.all([a.dropTable("race_0", { ifExists: true }), b.dropTable("race_0", { ifExists: true })]);
+    assert.ok(!(await a.tables()).includes("race_0"));
+    // plain drop of a missing table is the SERVER's error
+    await assert.rejects(a.dropTable("race_0"), (e: any) => e instanceof TorusError && /no such table/.test(e.message));
+    loser.close();
+  } finally { a.close(); b.close(); await srv.stop(); }
+});

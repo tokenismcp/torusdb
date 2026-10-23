@@ -119,6 +119,7 @@ class ServerConfig:
     max_frame: int = 32 * 1024 * 1024
     tx_wait: float = 10.0             # how long others wait for an open tx
     tx_timeout: float = 60.0          # an open tx older than this is aborted
+    tx_idle_timeout: float = 30.0     # ... or idle (no statement) for this long; 0 = off
     checkpoint_every: int = 5000      # journal records between checkpoints
     fsync: str = "always"             # "always" | "never"
     auth_fail_delay: float = 0.25
@@ -137,6 +138,9 @@ class ServerConfig:
     repl_conn: dict | None = None     # token / tls options for the replication connection
     repl_ring: int = 200_000          # commits a primary keeps available to replicas
     repl_poll: float = 5.0            # replica long-poll seconds
+    sync_replicas: int = 0            # commits wait for this many replicas to confirm
+    sync_timeout: float = 10.0        # ... at most this long
+    sync_strict: bool = False         # on timeout: error (commit stays) instead of degrading
 
 
 def _ring_rec(ops: list, tx: str | None) -> dict:
@@ -206,6 +210,7 @@ class _Stats:
         self.bytes_in = 0
         self.bytes_out = 0
         self.checkpoints = 0
+        self.sync_timeouts = 0
         self.tx_commits = 0
         self.tx_rollbacks = 0
         self.checkpoint_failures = 0
@@ -248,6 +253,9 @@ class Engine:
         self._cv = threading.Condition()               # guards tx ownership
         self._tx_owner: int | None = None
         self._tx_since = 0.0
+        self._tx_last = 0.0                            # last statement of the open tx
+        self._begin_q: collections.deque = collections.deque()   # FIFO of waiting BEGINs
+        self._ticket = itertools.count(1)
         self._undo: list = []
         self._tx_ops: list = []
         self._tx_id: str | None = None
@@ -278,6 +286,9 @@ class Engine:
         self._ring = repl.WalRing(self.cfg.repl_ring)
         self._snaps = repl.SnapshotStore((db_path + ".repl") if db_path else "")
         self._follower: repl.Follower | None = None
+        self._acks: dict[str, tuple[tuple[int, int], float]] = {}   # replica id -> (position, seen)
+        self._ack_cv = threading.Condition()
+        self._sync_local = threading.local()           # position of this thread's last commit
         self._replica = self.cfg.replica_of is not None
         if self._replica and not db_path:
             raise ValueError("--replica-of requires --db")
@@ -378,6 +389,35 @@ class Engine:
         seq = self._journal.records
         self._journal.append(ops, tx, rp)           # durable first ...
         self._ring.append(self._gen, seq, _ring_rec(ops, tx), _approx(ops))   # ... then visible
+        self._sync_local.pos = (self._gen, seq + 1)
+
+    def _await_replicas(self) -> None:
+        """Synchronous replication: hold the client's reply until enough replicas
+        have confirmed this thread's last commit (outside every server lock)."""
+        need = self.cfg.sync_replicas
+        pos = getattr(self._sync_local, "pos", None)
+        self._sync_local.pos = None
+        if not need or pos is None or self._replica:
+            return
+        live = max(3 * self.cfg.repl_poll, 5.0)
+        deadline = time.monotonic() + self.cfg.sync_timeout
+        with self._ack_cv:
+            while True:
+                now = time.monotonic()
+                have = sum(1 for p, seen in self._acks.values()
+                           if p >= pos and now - seen < live)
+                if have >= need:
+                    return
+                remaining = deadline - now
+                if remaining <= 0:
+                    break
+                self._ack_cv.wait(min(remaining, 0.2))
+        self.stats.bump("sync_timeouts")
+        msg = (f"commit is durable locally but {need} replica(s) did not confirm it "
+               f"within {self.cfg.sync_timeout}s")
+        if self.cfg.sync_strict:
+            raise Busy(msg + " — check the transaction with tx_status before retrying")
+        log.warning("%s; continuing without synchronous guarantee", msg)
 
     def _remember_tx(self, txid: str) -> None:
         self._txids[txid] = True
@@ -580,8 +620,9 @@ class Engine:
             raise BadRequest("this server is a replica; cascading replication is not supported")
         if method == "repl_fetch":
             try:
-                cid, timeline, pos, maxn, wait_ms = args
+                cid, timeline, pos, maxn, wait_ms, *rest = args
                 pos = (int(pos[0]), int(pos[1]))
+                rid = str(rest[0])[:64] if rest else None
             except (ValueError, TypeError, IndexError):
                 raise BadRequest("repl_fetch takes [cluster_id, timeline, [gen, seq], max, wait_ms]")
             if cid and cid != self.cluster_id:
@@ -589,6 +630,10 @@ class Engine:
             if int(timeline) != self.timeline:
                 raise BadRequest(f"replication refused: timeline mismatch (replica "
                                  f"{timeline}, primary {self.timeline}) — re-bootstrap the replica")
+            if rid:                                  # this request confirms everything before pos
+                with self._ack_cv:
+                    self._acks[rid] = (pos, time.monotonic())
+                    self._ack_cv.notify_all()
             try:
                 recs, nxt = self._ring.fetch(pos, max(1, min(int(maxn), 10_000)),
                                              max(0.0, min(int(wait_ms) / 1000.0, 30.0)))
@@ -687,8 +732,11 @@ class Engine:
     # ── transactions: one open transaction at a time, serializable ───────────
     def _expire_stale_tx_locked(self) -> None:
         """Caller holds ``_cv``. Abort an open tx that exceeded tx_timeout."""
+        now = time.monotonic()
+        idle = self.cfg.tx_idle_timeout
         if (self._tx_owner is not None
-                and time.monotonic() - self._tx_since > self.cfg.tx_timeout):
+                and (now - self._tx_since > self.cfg.tx_timeout
+                     or (idle and now - self._tx_last > idle))):
             owner = self._tx_owner
             with self._lock:
                 self._rollback_locked()
@@ -727,17 +775,23 @@ class Engine:
                     raise Busy(f"storage failure: {self._broken}")
                 if s.in_tx:
                     raise BadRequest("a transaction is already open")
-                while self._tx_owner is not None:
-                    self._expire_stale_tx_locked()
-                    if self._tx_owner is None:
-                        break
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        raise Busy("database is locked by another transaction")
-                    self._cv.wait(min(remaining, 0.5))
+                ticket = next(self._ticket)
+                self._begin_q.append(ticket)                  # first come, first served
+                try:
+                    while self._tx_owner is not None or self._begin_q[0] != ticket:
+                        self._expire_stale_tx_locked()
+                        if self._tx_owner is None and self._begin_q[0] == ticket:
+                            break
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise Busy("database is locked by another transaction")
+                        self._cv.wait(min(remaining, 0.5))
+                finally:
+                    self._begin_q.remove(ticket)
+                    self._cv.notify_all()
                 with self._lock:
                     self._tx_owner = s.id
-                    self._tx_since = time.monotonic()
+                    self._tx_since = self._tx_last = time.monotonic()
                     self._tx_id = txid
                     self._undo, self._tx_ops = [], []
                     self._overlay = TxOverlay()
@@ -773,6 +827,7 @@ class Engine:
             self._cv.notify_all()
         if method == "tx_commit":
             self._maybe_checkpoint()
+            self._await_replicas()
         return None
 
     def _tx_status(self, args: list) -> str:
@@ -815,6 +870,8 @@ class Engine:
                         finally:
                             self.srv = live
                     if self._tx_owner in (None, s.id):
+                        if self._tx_owner == s.id:
+                            self._tx_last = time.monotonic()
                         return self._call(method, args)
                 continue                               # raced with a new tx; retry
             with self._cv:                             # writers wait out a foreign tx
@@ -838,6 +895,7 @@ class Engine:
                     raise Busy(f"storage failure — the server is read-only: {self._broken}")
                 result, undo = self._mutate(method, args)
                 if s.in_tx and self._tx_owner == s.id:
+                    self._tx_last = time.monotonic()
                     self._undo.append(undo)
                     self._tx_ops.append([method, args])
                 elif self._journal:
@@ -852,6 +910,8 @@ class Engine:
                 break
         if not s.in_tx:
             self._maybe_checkpoint()
+            if method in MUTATIONS:
+                self._await_replicas()
         return result
 
     def _maybe_checkpoint(self) -> None:
@@ -879,14 +939,22 @@ class Engine:
         srv = self.srv
         try:
             if method == "create":
-                table, columns = args
+                table, columns, *rest = args
+                if len(rest) > 1 or (rest and not isinstance(rest[0], bool)):
+                    raise BadRequest("create takes [table, columns, if_not_exists?]")
+                if rest and rest[0] and table in srv._schema:
+                    return False, lambda: None               # IF NOT EXISTS: already there
                 self._rpc_create(table, columns)
                 if self._overlay is not None:
                     self._overlay.created.add(table)
                 return None, lambda: srv.drop(table)
             if method == "drop":
-                (table,) = args
+                table, *rest = args
+                if len(rest) > 1 or (rest and not isinstance(rest[0], bool)):
+                    raise BadRequest("drop takes [table, if_exists?]")
                 if table not in srv._schema:
+                    if rest and rest[0]:
+                        return False, lambda: None           # IF EXISTS: nothing to drop
                     raise BadRequest(f"no such table: {table}")
                 if self._overlay is not None and table not in self._overlay.created:
                     self._overlay.dropped[table] = (srv._schema[table], srv._rows[table])
@@ -1167,12 +1235,16 @@ class Engine:
                 "transactions": {"commits": st.tx_commits,
                                  "rollbacks": st.tx_rollbacks},
                 "checkpoints": st.checkpoints,
+                "sync_timeouts": st.sync_timeouts,
             }
         with self._lock:
             snap["tables"] = {t: {"rows": v["rows"], "deleted": v["deleted"]}
                               for t, v in self.srv.stats().items()}
             snap["storage"] = self.cfg.storage
             snap["generation"] = self._gen
+            snap["tx_waiters"] = len(self._begin_q)
+            snap["tx_open_seconds"] = (round(time.monotonic() - self._tx_since, 1)
+                                       if self._tx_owner is not None else 0)
             snap["replication"] = {"role": "replica" if self._replica else "primary",
                                    "timeline": self.timeline}
             snap["journal_records"] = self._journal.records if self._journal else 0
@@ -1437,8 +1509,15 @@ def main(argv: list[str] | None = None) -> None:
                     help="env var with an admin token for the primary (replication)")
     ap.add_argument("--repl-tls", action="store_true", help="use TLS towards the primary")
     ap.add_argument("--repl-cafile", default=None)
+    ap.add_argument("--sync-replicas", type=int, default=0,
+                    help="commits wait until this many replicas confirmed them (synchronous replication)")
+    ap.add_argument("--sync-timeout", type=float, default=10.0)
+    ap.add_argument("--sync-strict", action="store_true",
+                    help="on sync timeout answer Busy (commit stays) instead of degrading to async")
     ap.add_argument("--repl-ring", type=int, default=200_000,
                     help="commits kept in memory for replicas to catch up from")
+    ap.add_argument("--tx-idle-timeout", type=float, default=30.0,
+                    help="abort a transaction idle for this many seconds (0 = off)")
     ap.add_argument("--storage", choices=("memory", "disk"), default="memory",
                     help="disk: rows live in heap files under <db>.data/ (data set may exceed RAM)")
     ap.add_argument("--cache-rows", type=int, default=50_000, help="disk storage: rows cached per table")
@@ -1512,7 +1591,10 @@ def main(argv: list[str] | None = None) -> None:
                        checkpoint_every=args.checkpoint_every, fsync=args.fsync,
                        backup_dir=args.backup_dir, backup_keep=args.backup_keep,
                        storage=args.storage, cache_rows=args.cache_rows,
-                       replica_of=replica_of, repl_conn=repl_conn, repl_ring=args.repl_ring)
+                       tx_idle_timeout=args.tx_idle_timeout,
+                       replica_of=replica_of, repl_conn=repl_conn, repl_ring=args.repl_ring,
+                       sync_replicas=args.sync_replicas, sync_timeout=args.sync_timeout,
+                       sync_strict=args.sync_strict)
     ssl_ctx = _build_ssl_ctx(args)
     try:
         srv = NoKeyTCPServer(args.host, args.port, args.db, ssl_ctx=ssl_ctx,

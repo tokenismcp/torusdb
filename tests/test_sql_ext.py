@@ -125,3 +125,28 @@ def test_validator_parity():
                 "SELECT id FROM t OFFSET -1", "SELECT id FROM t WHERE id NOT 5"):
         with pytest.raises(ParseError):
             parse(bad)
+
+
+def test_if_not_exists_is_atomic_on_the_server_and_adopts_unknown_tables(tmp_path):
+    s = Running(db=str(tmp_path / "db"))
+    try:
+        with s.connect() as a, s.connect() as b:
+            a.execute("CREATE TABLE t (id INT PLAIN, v INT ENC)")
+            call = a._wire.call
+            cols = [["id", "int", "plain"], ["v", "int", "encrypted"]]
+            assert call("create", ["t", cols, True]) is False          # exists: no error, no change
+            assert call("create", ["u", cols, True]) is None          # created
+            with pytest.raises(Exception, match="already exists"):
+                call("create", ["u", cols])
+            assert call("drop", ["nope", True]) is False
+            with pytest.raises(Exception, match="no such table"):
+                call("drop", ["nope"])
+            # a client that never heard of `t` adopts the server's schema (read-only)
+            b.execute("CREATE TABLE IF NOT EXISTS t (id INT PLAIN, v INT ENC)")
+            assert b.client._schema["t"] == [("id", "int", "plain"), ("v", "int", "encrypted")]
+            with pytest.raises(Exception, match="learned from the server"):
+                b.execute("INSERT INTO t (id, v) VALUES (1, 2)")
+            b.execute("DROP TABLE IF EXISTS u")
+            assert "u" not in call("tables", [])
+    finally:
+        s.stop()
