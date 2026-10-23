@@ -37,7 +37,7 @@ exactly where it stopped (crash or clean). A replica that fell out of the ring (
 points at a different `cluster_id`/timeline) stops with a clear error instead of
 guessing; re-bootstrap it. Bootstrap streams a checksummed snapshot file in
 512 KiB chunks (`repl_snapshot_*`); producing it pauses the primary's writers
-for the time it takes to serialise the database.
+for the time it takes to write the snapshot.
 
 ## Guarantees and limits
 
@@ -45,6 +45,7 @@ for the time it takes to serialise the database.
   the replica had not fetched them yet. There is no synchronous mode yet.
 * A replica only ever sees commits that were durable in the primary's journal.
 * No automatic fail-over, no cascading replicas, no multi-primary.
-* The bootstrap snapshot is assembled in memory on the primary (like `backup`).
+* The bootstrap snapshot is streamed to disk on the primary (writers are paused while
+  it is produced); the replica parses the downloaded file in memory.
 * Replication traffic carries only blinded scalars and plaintext columns — but use
   TLS: it is the same data the server stores, and the admin token travels with it.

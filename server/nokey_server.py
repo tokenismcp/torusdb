@@ -396,8 +396,12 @@ class Engine:
             new_gen = self._gen + 1
             old_gen, old_count = self._gen, self._journal.records
             self._ring.gen_len[old_gen] = old_count
-            dur.write_snapshot(self._path, self.srv.checkpoint_body(new_gen), new_gen,
-                               self._extra())
+            if self._storage is None:                    # memory mode: stream the image
+                dur.write_snapshot_stream(self._path, self.srv.body_chunks(self._extra()),
+                                          new_gen)
+            else:
+                dur.write_snapshot(self._path, self.srv.checkpoint_body(new_gen), new_gen,
+                                   self._extra())
             try:
                 self._journal.reset(new_gen)
             except BaseException as exc:
@@ -425,8 +429,10 @@ class Engine:
             out = Path(self.cfg.backup_dir) / (
                 f"{base}.{time.strftime('%Y%m%dT%H%M%S')}.g{self._gen}"
                 f".{next(self._ids)}.bak")
-            dur.write_snapshot(str(out), self.srv.to_body(), self._gen,
-                               dict(self._extra(), pos=[self._gen, self._journal.records]))
+            dur.write_snapshot_stream(
+                str(out), self.srv.body_chunks(dict(self._extra(),
+                                                    pos=[self._gen, self._journal.records])),
+                self._gen)
             keep = max(1, self.cfg.backup_keep)
             olds = sorted(Path(self.cfg.backup_dir).glob(f"{base}.*.bak"),
                           key=lambda p: p.stat().st_mtime)
@@ -597,8 +603,8 @@ class Engine:
                     raise Busy(f"storage failure: {self._broken}")
                 sid, path = self._snaps.create()
                 pos = [self._gen, self._journal.records]
-                dur.write_snapshot(path, self.srv.to_body(), self._gen,
-                                   dict(self._extra(), pos=pos))
+                dur.write_snapshot_stream(
+                    path, self.srv.body_chunks(dict(self._extra(), pos=pos)), self._gen)
             return {"id": sid, "gen": pos[0], "seq": pos[1], "size": os.path.getsize(path)}
         if method == "repl_snapshot_read":
             try:

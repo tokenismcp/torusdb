@@ -65,6 +65,30 @@ def write_snapshot(path: str, body: dict, generation: int, extra: dict | None = 
     _fsync_dir(path)
 
 
+def write_snapshot_stream(path: str, chunks, generation: int) -> None:
+    """Like :func:`write_snapshot`, for an ``inner`` document produced piece by
+    piece in canonical form (see ``NoKeyServer.body_chunks``). The checksum is
+    computed while streaming and stored after the payload; the result is read by
+    :func:`read_snapshot` exactly like a regular snapshot."""
+    h = hashlib.sha256()
+    tmp = path + ".tmp"
+    fd = _create_exclusive(tmp)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write('{"format":3,"generation":%d,"snapshot":' % generation)
+            for piece in chunks:
+                h.update(piece.encode("utf-8"))
+                f.write(piece)
+            f.write(',"sha256":"%s"}' % h.hexdigest())
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+    _fsync_dir(path)
+
+
 def read_snapshot(path: str) -> tuple[dict, int, dict]:
     """-> (body, generation, extra). Accepts the legacy formats."""
     try:

@@ -203,6 +203,36 @@ class NoKeyServer:
                 "indexes": {t: store.indexed_columns for t, store in self._rows.items()
                             if store.indexed_columns}}
 
+    def body_chunks(self, extra: dict, rows_per_chunk: int = 2000):
+        """Yield the *canonical* JSON text of ``{"body": to_body(), "extra": extra}``
+        piece by piece (keys sorted, compact separators — byte-identical to
+        ``json.dumps(..., sort_keys=True, separators=(",", ":"))``) so a snapshot
+        of a huge database never has to exist in memory at once."""
+        import json
+        dumps = lambda o: json.dumps(o, sort_keys=True, separators=(",", ":"))   # noqa: E731
+        tables = sorted(self._schema)
+        yield '{"body":{"deleted":{'
+        yield ",".join(f"{dumps(t)}:{dumps(self._rows[t].dead_ids())}" for t in tables)
+        yield '},"indexes":{'
+        yield ",".join(f"{dumps(t)}:{dumps(self._rows[t].indexed_columns)}" for t in tables
+                       if self._rows[t].indexed_columns)
+        yield '},"rows":{'
+        for n, t in enumerate(tables):
+            store = self._rows[t]
+            yield ("," if n else "") + dumps(t) + ":["
+            buf: list[str] = []
+            for i in range(len(store)):
+                buf.append(dumps({k: _pv(v) for k, v in store.row(i).items()}))
+                if len(buf) >= rows_per_chunk:
+                    yield ("," if i >= rows_per_chunk else "") + ",".join(buf)
+                    buf = []
+            if buf:
+                yield ("," if len(store) > len(buf) else "") + ",".join(buf)
+            yield "]"
+        yield '},"schema":{'
+        yield ",".join(f"{dumps(t)}:{dumps([list(c) for c in self._schema[t]])}" for t in tables)
+        yield '}},"extra":' + dumps(extra) + "}"
+
     def checkpoint_body(self, gen: int) -> dict:
         """Snapshot body for generation ``gen``. For disk storage this flushes the
         heaps and writes slot tables, returning a small manifest; the caller must

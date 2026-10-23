@@ -52,8 +52,10 @@ definitions are durable; the index contents live in RAM and are rebuilt at start
 ## Limits (be aware)
 
 * One writer at a time (a global lock); readers wait for it.
-* Backups (`backup` RPC) are *logical* and are assembled in memory — for very
-  large databases take a filesystem copy of a stopped server instead.
+* Backups (`backup` RPC), memory-mode checkpoints and replica bootstrap snapshots are
+  *logical* and **streamed** to disk with a running checksum, so the server never holds
+  a second copy. *Reading* one back (restore, replica bootstrap) still parses the whole
+  file in memory.
 * Dead rows keep their data until a future vacuum; deleted values stay on disk
   (they are blinded scalars/plaintext columns the server could already see).
 * Heap data is not fsynced per commit (the journal is); it is fsynced at checkpoint.

@@ -376,3 +376,28 @@ def test_readers_see_last_committed_state_while_a_write_tx_is_open(dbpath, stora
         w.rollback()
         assert r.execute("SELECT COUNT(*) FROM t WHERE name = 'nope'").rows == [[0]]
     s.stop()
+
+
+def test_streamed_snapshot_is_byte_identical_to_the_classic_one(tmp_path):
+    import json, hashlib
+    from torusdb_core.nokey_engine import NoKeyClient, NoKeyServer
+    srv = NoKeyServer()
+    c = NoKeyClient(srv)
+    c.execute("CREATE TABLE b (k INT PLAIN)")
+    c.execute("CREATE TABLE a (id INT PLAIN, s STR PLAIN, v INT ENC, r RATIONAL ENC)")
+    for i in range(7):
+        c.execute(f"INSERT INTO a (id, s, v, r) VALUES ({i}, 'x{i}', {i * 1000}, FRAC({i}, 3))")
+    c.execute("DELETE FROM a WHERE id = 2")
+    srv._rows["a"].create_index("id")
+    extra = {"txids": ["t1"], "pos": [3, 4]}
+    for per_chunk in (1, 2, 1000):
+        classic = json.dumps({"body": srv.to_body(), "extra": extra}, sort_keys=True,
+                             separators=(",", ":"))
+        assert "".join(srv.body_chunks(extra, per_chunk)) == classic
+    p = str(tmp_path / "s")
+    dur.write_snapshot_stream(p, srv.body_chunks(extra, 2), 5)
+    body, gen, ex = dur.read_snapshot(p)                 # verifies the checksum
+    assert gen == 5 and ex == extra and body == json.loads(json.dumps(srv.to_body()))
+    empty = NoKeyServer()
+    dur.write_snapshot_stream(p, empty.body_chunks({}), 0)
+    assert dur.read_snapshot(p)[0]["rows"] == {}
