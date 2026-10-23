@@ -26,6 +26,7 @@ from torussql_parser.ast import (
     AvgExpr, CountStar, InList, MaxExpr, MinExpr, ScaledSumExpr,
 )
 from torussql_parser.errors import ValidationError as _OpenValidationError
+from torussql_parser.predicate import LIKE_OPS, NULL_OPS
 from torussql_parser.validate import MAX_SCALAR, check_literal, check_predicate_literal
 
 
@@ -151,6 +152,7 @@ class Plan:
     where: PWhere | None = None
     order_by: POrderBy | None = None
     limit: int | None = None
+    offset: int | None = None
     out_aliases: list | None = None   # AS names, aligned with projections
     distinct: bool = False
     group_by: list[str] | None = None
@@ -202,6 +204,8 @@ def plan_query(q: Query, catalog: Catalog) -> Plan:
         return _plan_create(q, catalog)
     if isinstance(q, DropTable):
         if q.name not in catalog.tables:
+            if q.if_exists:
+                return Plan(kind="noop", raw=q, table=q.name)
             raise PlanError(f"no such table: {q.name}")
         return Plan(kind="drop", raw=q, table=q.name)
     if isinstance(q, (CreateIndex, DropIndex)):
@@ -231,6 +235,8 @@ def _plan_create(q: CreateTable, cat: Catalog) -> Plan:
     if q.name.startswith("__"):
         raise PlanError(f"table names starting with '__' are reserved ({q.name!r})")
     if q.name in cat.tables:
+        if q.if_not_exists:
+            return Plan(kind="noop", raw=q, table=q.name)
         raise PlanError(f"table {q.name!r} already exists")
     if not q.columns:
         raise PlanError("a table must declare at least one column")
@@ -262,8 +268,16 @@ def _plan_where(q_where, scope: "_Scope", qualify: bool) -> "PWhere | None":
                     "WHERE on encrypted columns is not supported (encrypted "
                     f"predicate circuit needed); use a plain column "
                     f"(column {col.name!r} is {col.policy})")
-            _typed(check_predicate_literal, col,
-                   atom.values if isinstance(atom, InList) else [atom.value])
+            if isinstance(atom, InList):
+                _typed(check_predicate_literal, col, atom.values)
+            elif atom.op in NULL_OPS:
+                pass
+            elif atom.op in LIKE_OPS:
+                if col.type != "str" or not isinstance(atom.value, str):
+                    raise PlanError(f"LIKE needs a STR column and a string pattern "
+                                    f"(column {col.name!r} is {col.type.upper()})")
+            else:
+                _typed(check_predicate_literal, col, [atom.value])
             name = f"{inst}.{col.name}" if qualify else col.name
             if isinstance(atom, InList):
                 atoms.append(PInList(column=name, values=list(atom.values)))
@@ -461,9 +475,9 @@ def _plan_select(q: Select, cat: Catalog) -> Plan:
     if agg_like and q.order_by is not None:
         raise PlanError("ORDER BY has no effect on an aggregate result — use GROUP BY "
                         "or select plain rows")
-    if (not q.group_by and q.limit is not None
+    if (not q.group_by and (q.limit is not None or q.offset is not None)
             and any(isinstance(p, (PScalarMul, PCtMul)) for p in projs)):
-        raise PlanError("LIMIT does not apply to per-row encrypted expressions "
+        raise PlanError("LIMIT/OFFSET do not apply to per-row encrypted expressions "
                         "(k*col, a*b), which are returned as one list")
 
     group_by: list[str] = []
@@ -503,7 +517,7 @@ def _plan_select(q: Select, cat: Catalog) -> Plan:
         raise PlanError("HAVING requires GROUP BY")
     having = (q.having.op, q.having.value) if q.having else None
     return Plan(kind="select", raw=q, table=q.table, projections=projs,
-                star=q.star, where=where, order_by=order_by, limit=q.limit,
+                star=q.star, where=where, order_by=order_by, limit=q.limit, offset=q.offset,
                 out_aliases=list(q.aliases) if q.aliases else None,
                 distinct=q.distinct,
                 group_by=group_by or None,

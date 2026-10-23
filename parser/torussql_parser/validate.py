@@ -22,6 +22,7 @@ from .ast import (
     DropTable, CreateIndex, DropIndex, InList, Insert, Join, MaxExpr, MinExpr, Query, ScalarMulExpr,
     ScaledSumExpr, Select, SumExpr, Update,
 )
+from .predicate import LIKE_OPS, NULL_OPS
 from .errors import ValidationError
 
 
@@ -102,6 +103,8 @@ class Schema:
         """Apply a DDL statement (CREATE/DROP) to the schema, after
         validating it. DML is validated but does not change the schema."""
         self.validate(q)
+        if isinstance(q, CreateTable) and q.name in self.tables:
+            return                                      # IF NOT EXISTS on an existing table
         if isinstance(q, CreateTable):
             self.tables[q.name] = Table(
                 name=q.name,
@@ -114,7 +117,8 @@ class Schema:
         if isinstance(q, CreateTable):
             self._validate_create(q)
         elif isinstance(q, DropTable):
-            self._require_table(q.name)
+            if not (q.if_exists and q.name not in self.tables):
+                self._require_table(q.name)
         elif isinstance(q, (CreateIndex, DropIndex)):
             self._validate_index(q)
         elif isinstance(q, Insert):
@@ -146,7 +150,7 @@ class Schema:
         if q.name.startswith("__"):
             raise ValidationError(
                 f"table names starting with '__' are reserved ({q.name!r})")
-        if q.name in self.tables:
+        if q.name in self.tables and not q.if_not_exists:
             raise ValidationError(f"table {q.name!r} already exists")
         seen: set[str] = set()
         for (n, t, p) in q.columns:
@@ -193,10 +197,10 @@ class Schema:
             raise ValidationError(
                 "ORDER BY has no effect on an aggregate result — use GROUP BY or "
                 "select plain rows")
-        if (not q.star and not q.group_by and q.limit is not None and any(
+        if (not q.star and not q.group_by and (q.limit is not None or q.offset is not None) and any(
                 isinstance(p, (ScalarMulExpr, CtMulExpr)) for p in q.projections)):
             raise ValidationError(
-                "LIMIT does not apply to per-row encrypted expressions (k*col, a*b), "
+                "LIMIT/OFFSET do not apply to per-row encrypted expressions (k*col, a*b), "
                 "which are returned as one list")
 
         self._validate_where(scope, q.where)
@@ -277,8 +281,17 @@ class Schema:
                         "WHERE on encrypted columns is not supported; use a "
                         f"PLAIN column for predicates (column {col.name!r} is "
                         f"{col.policy})")
-                check_predicate_literal(
-                    col, atom.values if isinstance(atom, InList) else [atom.value])
+                if isinstance(atom, InList):
+                    check_predicate_literal(col, atom.values)
+                elif atom.op in NULL_OPS:
+                    pass                                   # IS [NOT] NULL has no literal
+                elif atom.op in LIKE_OPS:
+                    if col.type != "str" or not isinstance(atom.value, str):
+                        raise ValidationError(
+                            f"LIKE needs a STR column and a string pattern "
+                            f"(column {col.name!r} is {col.type.upper()})")
+                else:
+                    check_predicate_literal(col, [atom.value])
 
     def _validate_update(self, q: Update) -> None:
         table = self._require_table(q.table)

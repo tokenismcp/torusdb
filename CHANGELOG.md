@@ -11,6 +11,13 @@ Versioning: [Versioning Policy](docs/versioning.md).
 Hardening release: SQL joins completed, server and drivers made operable, a
 cryptographic self-audit, and the open repository made self-contained.
 
+### Added — SQL conveniences (late 0.5.0)
+
+- `BETWEEN`, `NOT IN`, `IS [NOT] NULL`, `[NOT] LIKE`, `OFFSET`, `CREATE TABLE IF NOT EXISTS`,
+  `DROP TABLE IF EXISTS`. One shared evaluator (`torussql_parser.predicate`) is used
+  by validator, engine and wire layer. The TypeScript/Rust drivers' own predicate
+  builders do not expose them yet.
+
 ### Added — replication, snapshot reads, pooling (late 0.5.0)
 
 - **Replication** (`docs/replication.md`): asynchronous WAL shipping, read-only

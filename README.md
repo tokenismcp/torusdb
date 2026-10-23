@@ -41,7 +41,7 @@ UPDATE emp SET salary = FRAC(9500,1) WHERE id = 2;  DELETE FROM emp WHERE dept =
 ```
 
 `INSERT/UPDATE/DELETE`, `SUM AVG MIN MAX COUNT`, `k*col`, `a*b`, `DOT`,
-`WHERE` (AND/OR/IN) on `PLAIN` columns, `GROUP BY/HAVING`, `ORDER BY/LIMIT/DISTINCT`,
+`WHERE` (AND/OR/IN/NOT IN/BETWEEN/IS NULL/LIKE) on `PLAIN` columns, `GROUP BY/HAVING`, `ORDER BY/LIMIT/DISTINCT`,
 aliases, `INNER`/`LEFT` joins (any number, self-joins), transactions. Full
 reference and the list of what is *not* supported:
 [`spec/TorusSQL-Spec-v0.5.md`](spec/TorusSQL-Spec-v0.5.md).
@@ -101,6 +101,15 @@ The owner's mask vault can be sealed under a key that **no one ever holds**: it 
 generated dealer-free by `n` custodians and used by any `k` of them through one
 verifiable message each — the key is never reassembled (`python -m torussql.custody`,
 [`docs/custody.md`](docs/custody.md)). Custodian hosts need neither the server nor the engine core.
+
+## Postgres-style operation
+
+* **Disk storage** (`--storage disk`): data larger than RAM, crash-safe, auto-compacting — [`docs/storage.md`](docs/storage.md)
+* **Indexes** on plain columns: `CREATE INDEX ON t (col)`
+* **Replication**: read-only hot standbys, promotion — [`docs/replication.md`](docs/replication.md)
+* **Snapshot reads**: readers never block on another session's transaction
+* **Pooling / threads**: thread-safe connections, `torussql.pool.ConnectionPool`
+* **Shell**: `torussql` (`psql`-like)
 
 ## Operating it
 

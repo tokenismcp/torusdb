@@ -166,9 +166,9 @@ jobs:
           python bench/net_bench.py --rows 2000
           python bench/tpch.py --rows 500
 
-  publish-parser:
-    name: publish torussql-parser (PyPI, trusted publishing)
-    needs: [parser, python]
+  publish-python:
+    name: publish Python packages (PyPI, trusted publishing)
+    needs: [parser, custody, python, wheels]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     environment: pypi
@@ -177,13 +177,16 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
-      - run: pip install build && python -m build parser
+      - run: |
+          pip install build
+          # dependency order: parser -> core -> driver -> server
+          for d in parser core drivers/python server; do python -m build --outdir dist "$d"; done
       - uses: pypa/gh-action-pypi-publish@release/v1
-        with: { packages-dir: parser/dist }
+        with: { packages-dir: dist }
 
   publish-npm:
     name: publish @torusdb/driver
-    needs: [typescript]
+    needs: [typescript, publish-python]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     environment: npm

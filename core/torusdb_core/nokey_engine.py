@@ -31,6 +31,7 @@ from .protocol import Owner, Server, decode, encode, gen_triple
 
 from .errors import ExecError, IntegrityError, PlanError
 from .maskstore import DictMaskStore, MaskStore
+from torussql_parser.predicate import compare as _compare
 from .store import MemoryStorage, StoreView, TableStore, TxOverlay
 from .parser import parse
 from .planner import (
@@ -43,16 +44,12 @@ N = nokey.N
 
 # ── plaintext predicate evaluation (server-side; plain columns only) ─────────
 def _cmp(a, op: str, b) -> bool:
-    if a is None or b is None:            # SQL: a NULL operand makes the atom false
-        return False
-    if op == "=":
-        return a == b
-    if op in ("!=", "<>"):
-        return a != b
     try:
-        return {"<": a < b, ">": a > b, "<=": a <= b, ">=": a >= b}[op]
+        return _compare(a, op, b)
     except TypeError as exc:
         raise ExecError(f"WHERE: cannot compare {a!r} {op} {b!r} ({exc})")
+    except ValueError as exc:
+        raise ExecError(f"WHERE: {exc}")
 
 
 def _atom(row: dict, atom) -> bool:
@@ -67,7 +64,7 @@ def _atom_null_safe(row: dict, atom) -> bool:
     the comparison false, as in SQL."""
     v = row[atom.column]
     if v is None:
-        return False
+        return not isinstance(atom, PInList) and atom.op == "is_null"
     if isinstance(atom, PInList):
         return v in atom.values
     return _cmp(v, atom.op, atom.value)
@@ -350,6 +347,8 @@ class NoKeyClient:
     # — entry point —
     def execute(self, sql: str) -> Any:
         plan = plan_query(parse(sql), _CatalogView(self._schema))
+        if plan.kind == "noop":                  # IF [NOT] EXISTS that has nothing to do
+            return 0
         if plan.kind == "create":
             return self._create(plan)
         if plan.kind == "drop":
@@ -932,6 +931,8 @@ class NoKeyClient:
                              reverse=plan.order_by.descending)
             except TypeError as exc:
                 raise ExecError(f"ORDER BY: cannot compare values ({exc})")
+        if plan.offset:
+            rs.rows = rs.rows[plan.offset:]
         if plan.limit is not None:
             rs.rows = rs.rows[:plan.limit]
         if plan.out_aliases:

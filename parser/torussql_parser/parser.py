@@ -152,6 +152,10 @@ def _parse_create(p: _P):
         p.eat()
         return _parse_index(p, CreateIndex)
     p.eat(kind="id", value="TABLE")
+    if_not_exists = False
+    if p.peek(kind="id", value="IF"):
+        p.eat(); p.eat(kind="id", value="NOT"); p.eat(kind="id", value="EXISTS")
+        if_not_exists = True
     name = p.eat(kind="id").value
     p.eat(kind="sym", value="(")
     cols: list[tuple[str, str, str]] = []
@@ -170,7 +174,7 @@ def _parse_create(p: _P):
     p.eat(kind="sym", value=")")
     if not p.eof():
         raise ParseError("trailing tokens after CREATE TABLE")
-    return CreateTable(name=name, columns=cols)
+    return CreateTable(name=name, columns=cols, if_not_exists=if_not_exists)
 
 
 def _parse_drop(p: _P):
@@ -178,10 +182,14 @@ def _parse_drop(p: _P):
         p.eat()
         return _parse_index(p, DropIndex)
     p.eat(kind="id", value="TABLE")
+    if_exists = False
+    if p.peek(kind="id", value="IF"):
+        p.eat(); p.eat(kind="id", value="EXISTS")
+        if_exists = True
     name = p.eat(kind="id").value
     if not p.eof():
         raise ParseError("trailing tokens after DROP TABLE")
-    return DropTable(name=name)
+    return DropTable(name=name, if_exists=if_exists)
 
 
 def _parse_insert(p: _P) -> Insert:
@@ -249,7 +257,8 @@ def _parse_delete(p: _P) -> Delete:
 
 _RESERVED = frozenset({
     "JOIN", "INNER", "LEFT", "OUTER", "ON", "WHERE", "GROUP", "ORDER",
-    "HAVING", "LIMIT", "AS", "FROM", "SELECT", "AND", "OR", "IN", "BY",
+    "HAVING", "LIMIT", "OFFSET", "AS", "FROM", "SELECT", "AND", "OR", "IN", "BY",
+    "LIKE", "IS", "BETWEEN", "NOT",
 })
 
 
@@ -396,6 +405,13 @@ def _parse_select(p: _P) -> Select:
             raise ParseError("LIMIT must be non-negative")
         sel.limit = n
 
+    if p.peek(kind="id", value="OFFSET"):
+        p.eat()
+        n = p.eat(kind="num").value
+        if n < 0:
+            raise ParseError("OFFSET must be non-negative")
+        sel.offset = n
+
     if not p.eof():
         raise ParseError("trailing tokens in SELECT")
     return sel
@@ -408,7 +424,7 @@ def _parse_where(p: _P) -> Where:
     while True:
         group: list = []
         while True:
-            group.append(_parse_atom(p))
+            group.extend(_parse_atom(p))
             if p.peek(kind="id", value="AND"):
                 p.eat(); continue
             break
@@ -419,31 +435,65 @@ def _parse_where(p: _P) -> Where:
     return Where(or_terms=or_terms)
 
 
-def _parse_atom(p: _P):
+def _literal(p: _P, what: str):
+    v = p.eat()
+    if v.kind not in ("num", "str"):
+        raise ParseError(f"{what} must be a literal")
+    return v.value
+
+
+def _parse_in_list(p: _P) -> list:
+    p.eat(kind="sym", value="(")
+    values: list = []
+    while True:
+        v = p.eat()
+        if v.kind not in ("num", "str"):
+            raise ParseError("IN list values must be literals")
+        values.append(v.value)
+        if p.peek(kind="sym", value=","):
+            p.eat(); continue
+        break
+    p.eat(kind="sym", value=")")
+    if not values:
+        raise ParseError("IN list must be non-empty")
+    return values
+
+
+def _parse_atom(p: _P) -> list:
+    """One predicate atom, returned as the list of primitive atoms it stands for
+    (BETWEEN and NOT IN desugar into AND-ed comparisons)."""
     col = _parse_col_ref(p)
     if p.peek(kind="id", value="IN"):
         p.eat()
-        p.eat(kind="sym", value="(")
-        values: list = []
-        while True:
-            v = p.eat()
-            if v.kind not in ("num", "str"):
-                raise ParseError("IN list values must be literals")
-            values.append(v.value)
-            if p.peek(kind="sym", value=","):
-                p.eat(); continue
-            break
-        p.eat(kind="sym", value=")")
-        if not values:
-            raise ParseError("IN list must be non-empty")
-        return InList(column=col, values=values)
+        return [InList(column=col, values=_parse_in_list(p))]
+    if p.peek(kind="id", value="BETWEEN"):
+        p.eat()
+        lo = _literal(p, "BETWEEN bound")
+        p.eat(kind="id", value="AND")
+        hi = _literal(p, "BETWEEN bound")
+        return [Condition(column=col, op=">=", value=lo),
+                Condition(column=col, op="<=", value=hi)]
+    if p.peek(kind="id", value="IS"):
+        p.eat()
+        neg = False
+        if p.peek(kind="id", value="NOT"):
+            p.eat(); neg = True
+        p.eat(kind="id", value="NULL")
+        return [Condition(column=col, op="not_null" if neg else "is_null", value=None)]
+    if p.peek(kind="id", value="NOT"):
+        p.eat()
+        if p.peek(kind="id", value="IN"):
+            p.eat()
+            return [Condition(column=col, op="!=", value=v) for v in _parse_in_list(p)]
+        p.eat(kind="id", value="LIKE")
+        return [Condition(column=col, op="not_like", value=_literal(p, "LIKE pattern"))]
+    if p.peek(kind="id", value="LIKE"):
+        p.eat()
+        return [Condition(column=col, op="like", value=_literal(p, "LIKE pattern"))]
     op_tok = p.eat(kind="sym")
     if op_tok.value not in WHERE_OPS:
         raise ParseError(f"unsupported WHERE operator {op_tok.value!r}")
-    v = p.eat()
-    if v.kind not in ("num", "str"):
-        raise ParseError("WHERE value must be a literal")
-    return Condition(column=col, op=op_tok.value, value=v.value)
+    return [Condition(column=col, op=op_tok.value, value=_literal(p, "WHERE value"))]
 
 
 def _parse_proj(p: _P) -> Proj:

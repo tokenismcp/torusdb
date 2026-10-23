@@ -34,8 +34,10 @@ LIMIT AS FROM SELECT AND OR IN BY`.
 ## 3. Statements
 
 ```
-CREATE TABLE t ( col type policy {, col type policy} )
-DROP TABLE t
+CREATE TABLE [IF NOT EXISTS] t ( col type policy {, col type policy} )
+DROP TABLE [IF EXISTS] t
+CREATE INDEX ON t ( col )          -- PLAIN columns only; speeds = < <= > >= IN
+DROP INDEX ON t ( col )
 INSERT INTO t ( col {, col} ) VALUES ( lit {, lit} )      -- every column must be listed
 UPDATE t SET col = lit {, col = lit} [WHERE pred]
 DELETE FROM t [WHERE pred]
@@ -113,19 +115,25 @@ must be a group key; `SELECT *` cannot be combined with `GROUP BY`. `HAVING` is
 
 `ORDER BY` takes one `PLAIN` column of any instance. It need not be selected,
 except with `DISTINCT` or `GROUP BY` (then it must be selected / a group key).
-`NULL` sorts **last** ascending and **first** descending. `LIMIT` applies after
-ordering. `DISTINCT` removes duplicate output rows (order-stable).
+`NULL` sorts **last** ascending and **first** descending. `LIMIT n [OFFSET m]`
+apply after ordering (`OFFSET` skips `m` rows first). `DISTINCT` removes duplicate output rows (order-stable).
 
 ## 5. Predicates
 
 ```
 pred ::= and { OR and }        and ::= atom { AND atom }
 atom ::= colref op literal  |  colref IN ( literal {, literal} )
+      |  colref NOT IN ( literal {, literal} )
+      |  colref BETWEEN literal AND literal        -- = col >= lo AND col <= hi
+      |  colref IS [NOT] NULL
+      |  colref [NOT] LIKE 'pattern'               -- STR columns; % any run, _ one char
 op   ::= = != <> < > <= >=
 ```
 
 Disjunctive normal form (no parentheses; `AND` binds tighter). Columns must be
-`PLAIN`; a `NULL` operand makes an atom false. In a join, atoms may reference any
+`PLAIN`; a `NULL` operand makes every atom false except `IS NULL` (so `NOT IN`,
+`NOT LIKE` and `!=` never match a NULL cell). `LIKE` is case-sensitive and has no
+`ESCAPE` clause. In a join, atoms may reference any
 instance; atoms on the `FROM` table are evaluated at the server's plaintext index,
 others on the joined rows.
 
@@ -159,6 +167,7 @@ in predicates (`IS NULL`).
 | 0.2 | `COUNT(*)`, `AVG`, `MIN/MAX`, `AND/OR/IN`, comparison ops, `ORDER BY`, `LIMIT`, `AS` |
 | 0.3 | `UPDATE`, `DELETE`, `DISTINCT`, `GROUP BY`, `HAVING COUNT(*)` |
 | 0.4 | `[INNER] JOIN … ON a = b`, qualified names |
+| 0.5+ | `CREATE/DROP INDEX`, `IF [NOT] EXISTS`, `OFFSET`, `BETWEEN`, `NOT IN`, `IS [NOT] NULL`, `[NOT] LIKE` |
 | **0.5** | table aliases, **self-joins**, **multiple joins**, **`LEFT [OUTER] JOIN`**, `GROUP BY`/`HAVING` over joins, `WHERE` on any joined table, `DOT`/`a*b` across tables, `ORDER BY` an unselected column, qualified names on single-table queries, strict exactness errors (`OutOfBudget`) |
 
 All v0.1–v0.4 statements keep their meaning, with two deliberate tightenings

@@ -88,7 +88,7 @@ def test_where_rejects_non_literal_and_bad_op():
         parse("SELECT * FROM t WHERE dept = other")      # not a literal
     # a bare identifier where an operator is expected fails to tokenize as sym
     with pytest.raises(ParseError):
-        parse("SELECT * FROM t WHERE dept LIKE 5")
+        parse("SELECT * FROM t WHERE dept REGEXP 5")
 
 
 def test_count_star():

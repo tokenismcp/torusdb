@@ -15,11 +15,13 @@ from typing import Any, Union
 class CreateTable:
     name: str
     columns: list[tuple[str, str, str]]   # (name, type, policy), normalized
+    if_not_exists: bool = False
 
 
 @dataclass
 class DropTable:
     name: str
+    if_exists: bool = False
 
 
 @dataclass
@@ -183,6 +185,7 @@ class Select:
     where: Where | None = None
     order_by: OrderBy | None = None
     limit: int | None = None
+    offset: int | None = None
     # Output-column aliases (from `AS`), aligned 1:1 with `projections`;
     # an entry is None when that projection has no alias. Empty for `*`.
     aliases: list = field(default_factory=list)

@@ -84,24 +84,11 @@ def where_to_wire(pwhere) -> dict | None:
 
 def _cmp(a, op: str, b) -> bool:
     """SQL comparison: a NULL operand makes the atom false (never an error)."""
-    if a is None or b is None:
-        return False
-    if op == "=":
-        return a == b
-    if op in ("!=", "<>"):
-        return a != b
+    from torussql_parser.predicate import compare
     try:
-        if op == "<":
-            return a < b
-        if op == ">":
-            return a > b
-        if op == "<=":
-            return a <= b
-        if op == ">=":
-            return a >= b
+        return compare(a, op, b)
     except TypeError:
         raise ValueError(f"cannot compare {type(a).__name__} with {type(b).__name__}") from None
-    raise ValueError(f"unsupported operator {op!r}")
 
 
 def match_wire(row: dict, pred: dict | None) -> bool:
