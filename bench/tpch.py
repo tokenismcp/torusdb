@@ -28,7 +28,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import conftest  # noqa: F401,E402  (root bootstrap)
 
-from ecfhe_query.nokey_engine import NoKeyClient, NoKeyServer
+from torusdb_core.nokey_engine import NoKeyClient, NoKeyServer
 
 
 # ── Schema (TPC-H inspired, encrypted monetary columns) ─────────────────────

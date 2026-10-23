@@ -6,7 +6,7 @@ import pytest
 from torussql_parser.errors import ValidationError
 from torussql_parser.parser import parse
 from torussql_parser.validate import Schema
-from ecfhe_query.nokey_engine import NoKeyClient, NoKeyServer
+from torusdb_core.nokey_engine import NoKeyClient, NoKeyServer
 
 DDL = "CREATE TABLE t (i INT PLAIN, s STR PLAIN, e INT ENC, r RATIONAL ENC, q RATIONAL PLAIN)"
 

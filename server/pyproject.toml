@@ -19,9 +19,8 @@ classifiers = [
     "Topic :: Database :: Database Engines/Servers",
     "Topic :: Security :: Cryptography",
 ]
-# torussql supplies the wire codec/framing; ec-fhe-query supplies the keyless
-# storage engine (separately licensed engine package).
-dependencies = ["torussql==0.5.0", "ec-fhe-query>=0.2.0,<1.0.0"]
+# torussql supplies the wire codec/framing; torusdb-core the keyless engine.
+dependencies = ["torussql==0.5.0", "torusdb-core==0.5.0"]
 
 [project.scripts]
 torusdb-server = "nokey_server:main"

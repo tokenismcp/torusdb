@@ -7,12 +7,11 @@ sees a salary.
 ## 1. Install
 
 ```bash
-pip install torusdb-server torussql      # release wheels or your index; engine wheels come with your licence
+pip install torusdb-server torussql      # Python >= 3.11, pure Python, no other dependencies
 ```
 
-The engine packages (`ec-fhe-engine`, `ec-fhe-query`) are licensed separately; the
-driver and server need them at runtime. The TypeScript (`@torusdb/driver`) and
-Rust (`torusdb`) drivers and `torussql-parser` do not.
+Everything is Apache-2.0 and self-contained. The TypeScript (`@torusdb/driver`) and
+Rust (`torusdb`) drivers speak the same wire protocol and need only a running server.
 
 ## 2. Start a server
 
@@ -84,4 +83,4 @@ return wrong aggregates undetected.
 
 * `ops-guide.md` — auth, TLS, backups, vault custody, monitoring.
 * `threat-model.md` — exactly what the server can and cannot learn.
-* `torusctl/torusctl.py --connect 127.0.0.1:8533` — an interactive shell.
+* `torussql -h 127.0.0.1 -p 8533` — an interactive shell (`torussql --help`).

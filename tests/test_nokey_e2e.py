@@ -100,7 +100,7 @@ def test_server_stores_only_blinded_scalars(server):
         _seed(conn)
     # reach into the live server's storage: the salary cells are full-width
     # one-time-padded scalars, never the small plaintext encodings.
-    from ecfhe.nokey import encode
+    from torusdb_core.protocol import encode
     srv = server.srv.engine.srv
     plain = {encode(8000), encode(9000), encode(7000)}
     stored = {srv.blinded_cell("emp", "salary", i) for i in range(3)}

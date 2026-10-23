@@ -37,9 +37,9 @@ The encoding ring Z/nZ with n = 2^254 + 10 (the BN254 scalar field order)
 supports exact rational reconstruction for all values |p/q| < B where B is
 a system-specific bound satisfying B^2 ≪ n/4 (Howgrave-Graham bound).
 
-**Implementation:** `ec_fhe_engine/ecfhe/nokey.py`, functions `encode`/`decode`.
+**Implementation:** `core/torusdb_core/protocol.py`, functions `encode`/`decode`.
 
-**Verification:** The test `test_rational_encode_decode` (ec_fhe_engine/tests)
+**Verification:** The test `test_rational_encode_decode` (`core/tests/test_nokey.py`)
 round-trips a set of rationals including edge cases (denominator > 1,
 negative values, large magnitude) and verifies exact reconstruction.
 
@@ -72,7 +72,7 @@ For a SUM query over rows {i₁, …, iₖ}:
 **Non-interactive:** No round trip beyond the single query RPC.
 
 **Implementation:** `NoKeyServer.blinded_sum`, `NoKeyClient._pi_lin_sum`
-in `ec_fhe_query/ecfhe_query/nokey_engine.py`.
+in `core/torusdb_core/nokey_engine.py`.
 
 **Verification test:** `test_nokey_sum_correct` — verifies SUM of 3 values.
 
@@ -146,7 +146,7 @@ both operands via `_read_verified_scalar`. The server's product term e·g is
 also verified via the check `eg = e·g (mod n)`.
 
 **Implementation:** `NoKeyClient._verify_mac`, `_read_verified_scalar` in
-`ec_fhe_query/ecfhe_query/nokey_engine.py`.
+`core/torusdb_core/nokey_engine.py`.
 
 **Activation:** `NoKeyClient(server, authenticated=True)` or
 `connect(..., authenticated=True)`.
@@ -188,8 +188,7 @@ The public Anchor contains only commitments. Recovery:
 An anti-rollback ledger (`chain.py`) chains Anchor digests — a superseded
 pre-refresh Anchor is rejected.
 
-**Implementation:** `ec_fhe_engine/ecfhe/lss.py` (LSS core),
-`ec_fhe_query/ecfhe_query/keymgmt.py` (vault sealing + LSS custody).
+**Implementation:** the LSS custody described here is part of the *legacy closed engine* and is NOT in this repository; it is out of scope of this packet. The open, in-repo replacement is `torussql.custody` (threshold, see `docs/custody.md`).
 
 **Verification tests:**
 - `test_lss_*.py` — 8 tests: correctness, threshold security (fewer than t
@@ -210,15 +209,15 @@ Shamir over a Laurent ring. The reviewers should verify:
 
 | Theorem / Construction | Source File | Key Function |
 |---|---|---|
-| Encode/Decode (§III) | `ec_fhe_engine/ecfhe/nokey.py` | `encode`, `decode` |
-| Π_lin blind (§VI, C14) | `ec_fhe_query/ecfhe_query/nokey_engine.py` | `NoKeyClient._insert` (blind phase) |
+| Encode/Decode (§III) | `core/torusdb_core/protocol.py` | `encode`, `decode` |
+| Π_lin blind (§VI, C14) | `core/torusdb_core/nokey_engine.py` | `NoKeyClient._insert` (blind phase) |
 | Π_lin sum (§VI, C16) | same | `NoKeyClient._pi_lin_sum` |
 | Π_mult product (§VII, C18) | same | `NoKeyClient._pi_mult_products` |
 | SPDZ MAC (§IX) | same | `NoKeyClient._verify_mac` |
-| LSS share (§LSS) | `ec_fhe_engine/ecfhe/lss.py` | `LSSScheme.share` |
+| LSS share (§LSS) | `ec_fhe_engine/ecfhe/lss.py` | `LSSScheme.share` | (legacy engine, not in this repo)
 | LSS reconstruct | same | `LSSScheme.reconstruct` |
 | Proactive refresh | same | `LSSScheme.refresh` |
-| Vault seal | `ec_fhe_query/ecfhe_query/keymgmt.py` | `VaultCustody.export_shares` |
+| Vault seal | `ec_fhe_query/ecfhe_query/keymgmt.py` | `VaultCustody.export_shares` | (legacy engine, not in this repo)
 | Verifiable custody | same | `VerifiableCustody` |
 | Anti-rollback ledger | same module | `chain.py` |
 
@@ -239,7 +238,7 @@ python3 -c "import json; print(open('vectors.json').read())"
 
 To verify the no-key sum from scratch:
 ```python
-from ecfhe.nokey import encode, decode, N
+from torusdb_core.protocol import encode, decode, N
 s1, s2 = encode(100), encode(200)
 r1, r2 = 42, 99            # masks (normally random)
 v1, v2 = (s1 + r1) % N, (s2 + r2) % N   # what server stores
@@ -312,7 +311,7 @@ We request external review of the following claims, in priority order:
 
 ## 11. Internal audit (pre-review) — findings
 
-An internal line-by-line audit of `ecfhe/nokey.py`, `nokey_engine.py`, the
+An internal line-by-line audit of `protocol.py`, `nokey_engine.py`, the
 server and the vault was performed before requesting external review. It is
 **not** a substitute for independent review. Status: **FIXED** (with a
 regression test), **OPEN** (known, by design or pending), **DOC** (limitation
@@ -338,7 +337,7 @@ now stated).
 | F-16 | Custodian arithmetic is not constant-time (pure Python). Scalar randomisation (k + r·q) is the only mitigation. | **OPEN** | `Group.mul_blinded` |
 | F-17 | Rogue-key / mixed-epoch / forged-partial / swapped-file attacks on the custody protocols. | **FIXED/COVERED** — Schnorr PoK binds dealers, DLEQ binds partials to (key, epoch, context), signed broadcasts + sender checks bind files | `tests/test_custody.py` |
 
-### Properties exercised by `ec_fhe_query/tests/test_crypto_audit.py`
+### Properties exercised by `core/tests/test_crypto_audit.py`
 
 * Blinded cells are uniform (χ² over 6 000 samples, five plaintext classes,
   incl. 0, 1, −7, 10^12, 2^100) and two plaintexts are indistinguishable
@@ -375,7 +374,7 @@ now stated).
 ### Reproducing
 
 ```bash
-pytest ec_fhe_engine ec_fhe_query torussql/tests/test_vault_audit.py -q
+pytest core/tests tests/test_vault_audit.py -q
 ```
 
 ---

@@ -26,8 +26,8 @@ This file states what is *not* done as plainly as what is.
    runner; first green run + required checks on `main`.
 3. ⬜ **Authenticated (MAC) mode and vault log in the TypeScript and Rust drivers.**
 4. ⬜ **Replication / hot standby** for the server (today: restore from backup).
-5. ⬜ Publish packages (PyPI parser; npm; crates.io) — needs registry tokens and a
-   decision on distributing the proprietary engine wheels.
+5. ⬜ Publish packages (PyPI parser; npm; crates.io) — needs registry tokens (the
+   engine is now in-repo, so the wheels are self-contained).
 6. ⬜ Connection pooling and a thread-safe connection in the Python driver.
 
 ## Later

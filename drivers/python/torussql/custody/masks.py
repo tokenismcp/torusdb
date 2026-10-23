@@ -31,8 +31,8 @@ import secrets
 import time
 from collections import Counter
 
-from ecfhe_query.errors import ExecError
-from ecfhe_query.maskstore import MaskStore
+from torusdb_core.errors import ExecError
+from torusdb_core.maskstore import MaskStore
 
 from . import laurent
 from .group import CustodyError

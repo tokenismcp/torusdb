@@ -1,5 +1,5 @@
 -- TorusSQL example: encrypted payroll
--- Run with:  python torussql/torusctl/torusctl.py < torussql/examples/payroll.torusql
+-- Run with:  torussql -f examples/payroll.torusql
 --
 -- Every value in `rate`/`hours`/`salary` stays encrypted on the server.
 -- The aggregates and products below are all computed over ciphertext.

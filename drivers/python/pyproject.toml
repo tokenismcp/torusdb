@@ -22,17 +22,15 @@ classifiers = [
     "Topic :: Security :: Cryptography",
 ]
 
-# Runtime: the driver contains the client side of the no-key protocol, which
-# is provided by the TorusDB engine package `ec-fhe-query` (it pulls in
-# `ec-fhe-engine` and `py_ecc`). The engine is distributed separately under
-# its own license; everything else here is Apache-2.0 and stdlib-only.
-dependencies = ["ec-fhe-query>=0.2.0,<1.0.0"]
+# Runtime: the client side of the no-key protocol lives in torusdb-core (Apache-2.0).
+dependencies = ["torusdb-core==0.5.0"]
 
 [project.optional-dependencies]
 custody = ["py_ecc>=6.0.0,<9.0.0"]
 dev = ["pytest>=8"]
 
 [project.scripts]
+torussql = "torussql.cli:main"
 torussql-custody = "torussql.custody.__main__:main"
 
 [project.urls]

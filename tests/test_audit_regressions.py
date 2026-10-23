@@ -7,7 +7,7 @@ import threading
 import pytest
 
 import torussql
-from ecfhe_query.nokey_engine import NoKeyServer
+from torusdb_core.nokey_engine import NoKeyServer
 from torussql.nokey import ProgrammingError
 
 

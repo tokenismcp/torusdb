@@ -749,7 +749,7 @@ def test_raw_predicate_on_encrypted_column_is_rejected(plain):
 
 
 def test_legacy_unchecksummed_snapshot_still_loads(tmp_path):
-    from ecfhe_query.nokey_engine import NoKeyServer
+    from torusdb_core.nokey_engine import NoKeyServer
     db = str(tmp_path / "old.db")
     old = NoKeyServer()
     old.create("t", [("a", "int", "plain")])

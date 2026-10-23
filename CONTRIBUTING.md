@@ -6,10 +6,8 @@ Thanks for helping. A few ground rules keep the project safe to depend on.
 
 ```bash
 git clone <repo> && cd torussql
-export TORUSDB_ENGINE_DIR=/path/to/engine        # folder containing ec_fhe_engine/ and ec_fhe_query/
-pip install pytest && pip install -e parser
-pytest parser/tests                              # engine-free subset
-pytest                                           # everything (needs the engine)
+pip install pytest "py_ecc>=6,<9"
+pytest                                           # everything; pure Python, no proprietary parts
 (cd drivers/typescript && npm ci && npm test)
 (cd drivers/rust && cargo test && cargo clippy --all-targets -- -D warnings)
 ```
@@ -21,7 +19,7 @@ pytest                                           # everything (needs the engine)
    must accept/reject identically (`tests/test_join_v05.py` shows the pattern).
 2. **The server must never hold a key or a mask**, nor receive one: nothing may be
    added to an RPC argument that derives from a mask, an encoded plaintext of an
-   encrypted cell, or the MAC key. `ec_fhe_query/tests/test_crypto_audit.py` records
+   encrypted cell, or the MAC key. `core/tests/test_crypto_audit.py` records
    every value a server receives and enforces this — keep it passing.
 3. **No silent wrong answers.** Prefer a loud error (`OutOfBudget`, `IntegrityError`,
    `PlanError`) to a plausible-looking incorrect result.

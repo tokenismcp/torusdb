@@ -6,7 +6,7 @@ import os
 
 import pytest
 
-from ecfhe_query.nokey_engine import NoKeyClient, NoKeyServer
+from torusdb_core.nokey_engine import NoKeyClient, NoKeyServer
 from torussql.vault import VaultError, VaultLocked, VaultLog
 
 

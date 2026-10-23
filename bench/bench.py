@@ -22,13 +22,13 @@ import sys
 import time
 from pathlib import Path
 
-_REPO = Path(__file__).resolve().parents[2]
-for rel in ("ec_fhe_query", "ec_fhe_engine", "torussql/parser"):
+_REPO = Path(__file__).resolve().parents[1]
+for rel in ("core", "parser", "drivers/python"):
     p = _REPO / rel
     if p.is_dir() and str(p) not in sys.path:
         sys.path.insert(0, str(p))
 
-from ecfhe_query.nokey_engine import NoKeyClient, NoKeyServer   # noqa: E402
+from torusdb_core.nokey_engine import NoKeyClient, NoKeyServer   # noqa: E402
 
 
 def _timeit(fn, repeat: int) -> float:

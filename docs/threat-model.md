@@ -8,7 +8,7 @@
 
 ```
 ┌──────────────── Owner / Client (trusted boundary) ───────────────────┐
-│  torusctl · Python/TS/Rust driver · mask vault · encode / unblind     │
+│  torussql shell · Python/TS/Rust driver · mask vault · encode / unblind     │
 │  LSS custody: vault-key K split (t-of-n) among custodians             │
 └───────────────────────────────┬──────────────────────────────────────┘
               blinded scalars only │  Π_lin · Π_mult (one round, Beaver)
@@ -253,7 +253,7 @@ The following are explicitly **not** in scope for this version:
 
 **Current**: internal review and internal audit only (J1729 Labs) — findings
 F-1…F-12 are listed with status in `crypto-review-packet.md` §11 and are covered
-by `ec_fhe_query/tests/test_crypto_audit.py`. **No independent external review
+by `core/tests/test_crypto_audit.py`. **No independent external review
 has been completed.** Do not describe the system as externally audited.
 **Planned**: KISA submission + academic peer review.
 
@@ -262,5 +262,5 @@ The formal proofs (Thm 30/31 for confidentiality; §IX for integrity) are in:
 - Shim & Lee, *"Laurent Series Secret Sharing"*, J1729 Labs (LSSS paper)
 
 External reviewers should start from these documents and verify against the
-implementations in `ec_fhe_engine/ecfhe/nokey.py` and
-`ec_fhe_query/ecfhe_query/keymgmt.py`.
+implementations in `core/torusdb_core/protocol.py` and
+`drivers/python/torussql/custody/`.

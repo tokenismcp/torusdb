@@ -11,6 +11,17 @@ Versioning: [Versioning Policy](docs/versioning.md).
 Hardening release: SQL joins completed, server and drivers made operable, a
 cryptographic self-audit, and the open repository made self-contained.
 
+### Changed — fully open source (late 0.5.0)
+
+- **`torusdb-core`** (`core/`, Apache-2.0): the keyless engine (planner, blinding
+  client, keyless store, no-key protocol primitives) now lives in this repository.
+  The driver and server no longer depend on any proprietary package;
+  `pip install torusdb-server torussql` works on a clean machine (verified from
+  built wheels in a fresh virtualenv).
+- New **`torussql` shell** (psql-style: `-c`, `-f`, `\dt`, `\d`, `\timing`, token/TLS/vault
+  flags) replaces the old `torusctl` demo REPL.
+- CI, Dockerfile and docs no longer reference a private engine repository.
+
 ### Added — threshold masks and full audit (late 0.5.0)
 
 - **Threshold mask custody** (`docs/masks.md`): per-cell masks shared k-of-n

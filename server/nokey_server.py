@@ -49,28 +49,20 @@ from pathlib import Path
 
 
 def _bootstrap_paths() -> None:
-    """Make the engine and the torussql package importable when running from a
-    source checkout. Installed packages (``ec-fhe-query``, ``torussql``) win;
-    otherwise use $TORUSDB_ENGINE_DIR, then folders above this file."""
-    import os
+    """Make ``torusdb_core`` and ``torussql`` importable when running from a
+    source checkout. Installed packages win (paths are appended)."""
     here = Path(__file__).resolve().parent
-    roots = [Path(os.environ["TORUSDB_ENGINE_DIR"])] \
-        if os.environ.get("TORUSDB_ENGINE_DIR") else []
-    roots += list(here.parents)[:6]
-    cands = [here, here.parent / "drivers" / "python"]
-    for root in roots:
-        cands += [root / "ec_fhe_query", root / "ec_fhe_engine"]
-    for p in cands:
+    for p in (here, here.parent / "drivers" / "python", here.parent / "core"):
         if p.is_dir() and str(p) not in sys.path:
-            sys.path.append(str(p))          # append: installed packages win
+            sys.path.append(str(p))
 
 
 _bootstrap_paths()
 
 from torussql import nokey_wire as w                         # noqa: E402
 from torussql.framing import read_frame, write_frame         # noqa: E402
-from ecfhe.nokey import N                                    # noqa: E402
-from ecfhe_query.nokey_engine import NoKeyServer             # noqa: E402
+from torusdb_core.protocol import N                                    # noqa: E402
+from torusdb_core.nokey_engine import NoKeyServer             # noqa: E402
 import durability as dur                                     # noqa: E402
 
 SERVER_VERSION = "0.5.0"

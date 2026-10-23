@@ -1,13 +1,9 @@
 # syntax=docker/dockerfile:1.7
 # TorusDB keyless server — container image
 #
-# The engine packages (ec-fhe-engine, ec-fhe-query) are separately licensed and
-# are NOT part of this repository, so they come in as a named build context:
+# Everything in this image is Apache-2.0 and built from this repository.
 #
-#   docker build --build-context engine=/path/containing/ec_fhe_engine-and-ec_fhe_query \
-#                -f server/Dockerfile -t torusdb-server:0.5.0 .
-#
-# (In the monorepo checkout:  --build-context engine=..  )
+#   docker build -f server/Dockerfile -t torusdb-server:0.5.0 .
 #
 # Run (a non-loopback bind REQUIRES authentication; this image binds 0.0.0.0):
 #   docker run -p 8533:8533 -v /host/data:/data -v /host/secrets:/secrets:ro \
@@ -21,20 +17,18 @@
 
 FROM python:3.12-slim AS build
 WORKDIR /src
-COPY --from=engine ec_fhe_engine  ./ec_fhe_engine
-COPY --from=engine ec_fhe_query   ./ec_fhe_query
+COPY core           ./core
 COPY parser         ./parser
 COPY drivers/python ./drivers/python
 COPY server         ./server
 RUN python -m venv /opt/venv \
  && /opt/venv/bin/pip install --no-cache-dir \
-        ./ec_fhe_engine ./ec_fhe_query ./parser ./drivers/python ./server
+        ./parser ./core ./drivers/python ./server
 
 FROM python:3.12-slim
 LABEL org.opencontainers.image.title="torusdb-server" \
       org.opencontainers.image.description="Keyless TorusDB server" \
-      org.opencontainers.image.licenses="Apache-2.0 AND LicenseRef-TorusDB-Engine-Proprietary" \
-      org.opencontainers.image.description.license-note="Bundles the separately licensed TorusDB engine; do not redistribute the image publicly"
+      org.opencontainers.image.licenses="Apache-2.0"
 COPY --from=build /opt/venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH" PYTHONUNBUFFERED=1
 RUN useradd -m -u 1001 torusdb && mkdir /data && chown torusdb /data

@@ -13,15 +13,11 @@ concurrency:
 permissions:
   contents: read
 
-# The proprietary engine (ec_fhe_engine + ec_fhe_query) is not in this repo.
-# Jobs marked "engine" check it out from a private repository using:
-#   vars.ENGINE_REPO   e.g. j1729labs/torusdb-engine
-#   secrets.ENGINE_TOKEN  a read-only deploy token for that repository
-# Fork PRs do not receive secrets, so those run the engine-free jobs only.
+# Everything needed to build and test lives in this repository (Apache-2.0).
 
 jobs:
   parser:
-    name: parser (engine-free) · py${{ matrix.python }}
+    name: parser (zero deps) · py${{ matrix.python }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -35,7 +31,7 @@ jobs:
       - run: pytest parser/tests -q
 
   custody:
-    name: threshold custody (engine-free) · py${{ matrix.python }}
+    name: threshold custody (zero deps) · py${{ matrix.python }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -46,54 +42,38 @@ jobs:
       - uses: actions/setup-python@v5
         with: { python-version: "${{ matrix.python }}" }
       - run: pip install pytest "py_ecc>=6,<9"
-      - name: custodian host install has no engine
+      - name: custodian host install needs no engine core
         run: |
           pip install --no-deps ./drivers/python
-          python -c "import sys, torussql.custody; assert 'ecfhe_query' not in sys.modules"
+          python -c "import sys, torussql.custody; assert 'torusdb_core' not in sys.modules"
       - run: pytest tests/test_custody.py -q -p no:cacheprovider
 
   python:
-    name: python suites (engine) · py${{ matrix.python }}
+    name: python suites · py${{ matrix.python }}
     runs-on: ubuntu-latest
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     strategy:
       fail-fast: false
       matrix:
         python: ["3.11", "3.12"]
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/checkout@v4
-        with:
-          repository: ${{ vars.ENGINE_REPO }}
-          token: ${{ secrets.ENGINE_TOKEN }}
-          path: _engine
       - uses: actions/setup-python@v5
         with: { python-version: "${{ matrix.python }}" }
       - run: pip install pytest "py_ecc>=6,<9"
       - name: tests
-        env:
-          TORUSDB_ENGINE_DIR: ${{ github.workspace }}/_engine
         run: pytest -q -p no:cacheprovider
-      - name: engine suites (need the parser + driver importable)
-        env:
-          TORUSDB_ENGINE_DIR: ${{ github.workspace }}/_engine
-          PYTHONPATH: ${{ github.workspace }}/parser:${{ github.workspace }}/drivers/python
-        run: pytest _engine/ec_fhe_engine _engine/ec_fhe_query -q -p no:cacheprovider
 
   wheels:
     name: build + smoke-test installed wheels
     runs-on: ubuntu-latest
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/checkout@v4
-        with: { repository: "${{ vars.ENGINE_REPO }}", token: "${{ secrets.ENGINE_TOKEN }}", path: _engine }
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
       - run: |
           pip install build
           mkdir wh
-          for d in _engine/ec_fhe_engine _engine/ec_fhe_query parser drivers/python server; do
+          for d in parser core drivers/python server; do
             python -m build --wheel --outdir wh "$d"
           done
           python -m venv /tmp/v && /tmp/v/bin/pip install --find-links wh torusdb-server
@@ -110,24 +90,14 @@ jobs:
           assert c.execute("SELECT SUM(v) FROM t").rows == [[9]], "wrong result"
           print("smoke ok", torussql.__version__)
           PY
-      # Only the open-source wheels are uploaded. The proprietary engine wheels
-      # (ec_fhe_engine, ec_fhe_query) are build inputs and must never become a
-      # downloadable artifact of this public repository.
-      - run: |
-          mkdir pub
-          cp wh/torussql-*.whl wh/torussql_parser-*.whl wh/torusdb_server-*.whl pub/
-          ls pub; ! ls pub | grep -qi "ec_fhe"
       - uses: actions/upload-artifact@v4
-        with: { name: wheels, path: pub/*.whl }
+        with: { name: wheels, path: wh/*.whl }
 
   typescript:
     name: typescript driver
     runs-on: ubuntu-latest
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/checkout@v4
-        with: { repository: "${{ vars.ENGINE_REPO }}", token: "${{ secrets.ENGINE_TOKEN }}", path: _engine }
       - uses: actions/setup-node@v4
         with: { node-version: "20" }
       - uses: actions/setup-python@v5
@@ -135,7 +105,6 @@ jobs:
       - run: pip install "py_ecc>=6,<9"
       - working-directory: drivers/typescript
         env:
-          TORUSDB_ENGINE_DIR: ${{ github.workspace }}/_engine
           TORUSDB_PYTHON: python
           TORUSDB_REQUIRE_INTEGRATION: "1"
         run: |
@@ -147,11 +116,8 @@ jobs:
   rust:
     name: rust driver
     runs-on: ubuntu-latest
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/checkout@v4
-        with: { repository: "${{ vars.ENGINE_REPO }}", token: "${{ secrets.ENGINE_TOKEN }}", path: _engine }
       - uses: dtolnay/rust-toolchain@stable
         with: { components: clippy }
       - uses: actions/setup-python@v5
@@ -159,7 +125,6 @@ jobs:
       - run: pip install "py_ecc>=6,<9"
       - working-directory: drivers/rust
         env:
-          TORUSDB_ENGINE_DIR: ${{ github.workspace }}/_engine
           TORUSDB_PYTHON: python
           TORUSDB_REQUIRE_INTEGRATION: "1"
         run: |
@@ -172,13 +137,10 @@ jobs:
   docker:
     name: docker image
     runs-on: ubuntu-latest
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/checkout@v4
-        with: { repository: "${{ vars.ENGINE_REPO }}", token: "${{ secrets.ENGINE_TOKEN }}", path: _engine }
       - uses: docker/setup-buildx-action@v3
-      - run: docker buildx build --load --build-context engine=_engine -f server/Dockerfile -t torusdb-server:ci .
+      - run: docker buildx build --load -f server/Dockerfile -t torusdb-server:ci .
       - name: refuses unauthenticated non-loopback bind
         run: |
           out=$(docker run --rm torusdb-server:ci 2>&1 || true)
@@ -195,16 +157,12 @@ jobs:
   bench:
     name: benchmark smoke
     runs-on: ubuntu-latest
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/checkout@v4
-        with: { repository: "${{ vars.ENGINE_REPO }}", token: "${{ secrets.ENGINE_TOKEN }}", path: _engine }
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
       - run: pip install "py_ecc>=6,<9"
-      - env: { TORUSDB_ENGINE_DIR: "${{ github.workspace }}/_engine" }
-        run: |
+      - run: |
           python bench/net_bench.py --rows 2000
           python bench/tpch.py --rows 500
 

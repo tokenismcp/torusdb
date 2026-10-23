@@ -12,8 +12,8 @@ from fractions import Fraction
 import pytest
 
 import torussql
-from ecfhe_query.errors import ExecError, IntegrityError
-from ecfhe_query.nokey_engine import NoKeyClient, NoKeyServer
+from torusdb_core.errors import ExecError, IntegrityError
+from torusdb_core.nokey_engine import NoKeyClient, NoKeyServer
 from torussql.custody import laurent, run_local_ceremony
 from torussql.custody.masks import (MaskClusterError, MaskUnavailable, MaskWriteError,
                                     ThresholdMaskStore, reshare_masks)
@@ -118,7 +118,7 @@ def test_masks_are_recoverable_only_from_a_quorum(tmp_path):
     cid, ver = srv._rows["t"][0]["__cid__"], srv._rows["t"][0]["__mv__v"]
     shares = [(cu.masks._gens[0].x, cu.masks._gens[0].tables["t"][(cid, "v", ver)][0])
               for cu in customs]
-    from ecfhe.nokey import encode
+    from torusdb_core.protocol import encode
     blinded = srv._rows["t"][0]["v"]
     r = (blinded - encode(4242)) % Q
     assert laurent.reconstruct(shares[:3], Q) == r          # any quorum → the mask
@@ -137,7 +137,7 @@ def test_custodians_never_receive_plaintext_or_blinded_cells():
         c.execute(f"INSERT INTO t (a, v, w) VALUES ({i}, {10 ** 9 + i}, {3 * 10 ** 9 + 7 * i})")
     c.execute("SELECT SUM(v), DOT(w, w) FROM t")
     c.execute("SELECT v FROM t")
-    from ecfhe.nokey import encode
+    from torusdb_core.protocol import encode
     seen = set()
 
     def walk(x):
@@ -650,5 +650,5 @@ def test_robust_reconstruct_majority_rules():
 
 
 def test_bn254_order_matches_the_engine_field():
-    from ecfhe.nokey import N
+    from torusdb_core.protocol import N
     assert Q == N

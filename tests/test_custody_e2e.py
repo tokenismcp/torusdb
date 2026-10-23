@@ -30,10 +30,7 @@ TOKEN = "owner-token-0123456789abc"
 
 
 def _env():
-    paths = [str(ROOT / "drivers" / "python")]
-    eng = os.environ.get("TORUSDB_ENGINE_DIR")
-    for r in ([Path(eng)] if eng else []) + list(ROOT.parents)[:3]:
-        paths += [str(r / "ec_fhe_query"), str(r / "ec_fhe_engine")]
+    paths = [str(ROOT / "drivers" / "python"), str(ROOT / "core"), str(ROOT / "parser")]
     e = dict(os.environ)
     e["PYTHONPATH"] = os.pathsep.join(paths + [e.get("PYTHONPATH", "")])
     return e
@@ -347,7 +344,7 @@ def test_existing_passphrase_vaults_still_work(db, tmp_path):
 
 
 def test_seal_format_is_compatible_with_the_engine_keymgmt():
-    from ecfhe_query import keymgmt
+    keymgmt = pytest.importorskip("ecfhe_query.keymgmt")   # proprietary engine, optional
     from torussql import seal
     k = secrets.randbits(250)
     assert seal.unseal(k, keymgmt.seal(k, b"hello")) == b"hello"

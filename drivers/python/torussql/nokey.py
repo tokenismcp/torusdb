@@ -33,36 +33,31 @@ from pathlib import Path
 
 
 
-def _find_engine() -> None:
-    """Make the TorusDB engine importable. Prefers an installed ``ec-fhe-query``
-    package; otherwise looks in $TORUSDB_ENGINE_DIR and then in the folders
-    above this file (monorepo layout: engine next to ``torussql/``)."""
+def _find_core() -> None:
+    """In a source checkout, make ``torusdb_core`` (``core/`` next to
+    ``drivers/``) importable. An installed ``torusdb-core`` always wins."""
     try:
-        import ecfhe_query  # noqa: F401
+        import torusdb_core  # noqa: F401
         return
     except ImportError:
         pass
-    import os
-    roots = [Path(os.environ["TORUSDB_ENGINE_DIR"])] \
-        if os.environ.get("TORUSDB_ENGINE_DIR") else []
-    roots += list(Path(__file__).resolve().parents)[:6]
-    for root in roots:
-        for rel in ("ec_fhe_query", "ec_fhe_engine"):
-            p = root / rel
-            if p.is_dir() and str(p) not in sys.path:
-                sys.path.insert(0, str(p))
+    for root in list(Path(__file__).resolve().parents)[:5]:
+        p = root / "core"
+        if (p / "torusdb_core").is_dir() and str(p) not in sys.path:
+            sys.path.append(str(p))
+            return
 
 
-_find_engine()
+_find_core()
 
 from . import nokey_wire as w                                # noqa: E402
 from .framing import read_frame, write_frame                 # noqa: E402
 try:
-    from ecfhe_query.nokey_engine import NoKeyClient         # noqa: E402
+    from torusdb_core.nokey_engine import NoKeyClient         # noqa: E402
 except ImportError as _exc:                                  # pragma: no cover
     raise ImportError(
-        "the TorusDB engine (package 'ec-fhe-query') is required but was not "
-        "found; install it or set TORUSDB_ENGINE_DIR") from _exc
+        "the 'torusdb-core' package is required but was not found "
+        "(pip install torusdb-core)") from _exc
 from .vault import VaultLog                                  # noqa: E402
 
 # ── DB-API 2.0 exception hierarchy (PEP 249 §3.1) ───────────────────────────
@@ -250,7 +245,7 @@ class _Conn:
 # ── remote server proxy ───────────────────────────────────────────────────────
 
 class RemoteNoKeyServer:
-    """Proxy with the SAME interface as ecfhe_query.nokey_engine.NoKeyServer,
+    """Proxy with the SAME interface as torusdb_core.nokey_engine.NoKeyServer,
     forwarding each call to a remote keyless server. Holds no keys, no masks,
     no plaintext — only a socket."""
 

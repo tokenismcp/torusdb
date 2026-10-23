@@ -18,6 +18,7 @@ def test_open_packages_share_one_version():
     versions = {
         "driver pyproject": _toml_version("drivers/python/pyproject.toml"),
         "driver __version__": torussql.__version__,
+        "core pyproject": _toml_version("core/pyproject.toml"),
         "parser pyproject": _toml_version("parser/pyproject.toml"),
         "server pyproject": _toml_version("server/pyproject.toml"),
         "server banner": nokey_server.SERVER_VERSION,
@@ -38,3 +39,15 @@ def test_changelog_and_spec_describe_current_release():
 def test_server_pins_matching_driver():
     ver = _toml_version("server/pyproject.toml")
     assert f'"torussql=={ver}"' in (ROOT / "server/pyproject.toml").read_text()
+
+
+def test_open_source_tree_has_no_proprietary_dependency():
+    """The whole open tree must run without ec-fhe-engine / ec-fhe-query."""
+    bad = re.compile(r"^\s*(from|import)\s+(ecfhe|ecfhe_query)\b", re.M)
+    skip = {"test_versions.py", "test_custody_e2e.py"}   # guarded optional imports
+    for p in ROOT.rglob("*.py"):
+        if (set(p.parts) & {"node_modules", "target", "build", ".git", ".venv"}) or p.name in skip:
+            continue
+        assert not bad.search(p.read_text()), f"{p} imports the proprietary engine"
+    for toml in ("drivers/python", "server", "core", "parser"):
+        assert "ec-fhe" not in (ROOT / toml / "pyproject.toml").read_text()

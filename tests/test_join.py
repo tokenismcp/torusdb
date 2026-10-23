@@ -12,16 +12,15 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-_REPO = Path(__file__).resolve().parents[3]
-for _p in [_REPO / "ec_fhe_query", _REPO / "ec_fhe_engine",
-           _REPO / "torussql/parser"]:
+_REPO = Path(__file__).resolve().parents[1]
+for _p in [_REPO / "core", _REPO / "parser"]:
     if _p.is_dir() and str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
 
 import pytest
 from torussql_parser.ast import Join, Select
 from torussql_parser.parser import parse
-from ecfhe_query.nokey_engine import NoKeyClient, NoKeyServer
+from torusdb_core.nokey_engine import NoKeyClient, NoKeyServer
 
 
 # ── fixtures ─────────────────────────────────────────────────────────────────

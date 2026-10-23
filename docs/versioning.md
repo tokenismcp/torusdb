@@ -58,11 +58,10 @@ The Python packages follow [Semantic Versioning 2.0](https://semver.org/).
 | `torusdb-server` | 0.5.0 | Wire surface + operational flags |
 | `torussql-parser` | 0.5.0 | Dialect surface only |
 | `@torusdb/driver` (npm), `torusdb` (crate) | 0.5.0 | Wire surface |
-| `ec-fhe-query` | 0.3.0 | Internal (closed) |
-| `ec-fhe-engine` | ≥0.2.0 | Internal (closed) |
+| `torusdb-core` | 0.5.0 | Internal engine API (not a public interface) |
 
-**All open packages (parser, drivers, server) share one version number and are released together (enforced by `tests/test_versions.py`). The driver and parser packages are the public API.** The engine packages
-are implementation details — do not depend on their interfaces directly.
+**All open packages (parser, drivers, server) share one version number and are released together (enforced by `tests/test_versions.py`). The driver and parser packages are the public API.** `torusdb-core`
+is an implementation detail — do not depend on their interfaces directly.
 
 ---
 
@@ -82,7 +81,7 @@ After 1.0:
 ## What is NOT versioned / guaranteed
 
 - Engine internals (mask encoding, blinded-scalar representation, persistence format)
-- `torusctl` meta-command syntax (`\custody`, `\spec`, etc.) — may change in any release
+- `torussql` shell meta-commands (`\dt`, `\d`, `\timing`) — may change in any release
 - Internal RPC methods not documented in `torussql-wire-v*.md`
 - The conformance suite itself (tests may be added; existing tests never weakened)
 

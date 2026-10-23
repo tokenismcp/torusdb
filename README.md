@@ -57,35 +57,48 @@ reference and the list of what is *not* supported:
 | `drivers/python/torussql/custody/` | **Threshold key custody** (z-MPC-style Laurent sharing): dealerless DKG, k-of-n verifiable key use, refresh/reshare, custodian daemon, CLI — see [`docs/custody.md`](docs/custody.md) |
 | `server/` | `torusdb-server` — keyless server: auth/roles, WAL durability, backups, metrics, Docker |
 | `proto/` | Wire protocol v2 spec |
-| `torusctl/` | Interactive shell |
+| `drivers/python/torussql/cli.py` | `torussql` — interactive shell (`psql` for TorusDB) |
+| `core/` | `torusdb-core` — keyless engine: planner, blinding client, keyless store (Apache-2.0) |
 | `bench/` | Micro-, network and TPC-H-style benchmarks |
 | `fuzz/`, `tests/` | Fuzz/robustness and end-to-end suites |
 | `docs/` | Quickstart, ops guide, threat model, crypto review packet, versioning |
 
-The homomorphic engine (`ec-fhe-engine`, `ec-fhe-query`) is a separately licensed
-dependency of the Python driver and server — see [`NOTICE`](NOTICE).
+Everything here is Apache-2.0 and self-contained: no proprietary package is needed
+to build, run or test any of it.
 
 ## Try it
 
 ```bash
-# wheels from the release page / your package index; the engine wheels come with your TorusDB licence
-pip install torusdb-server torussql
+pip install torusdb-server torussql                   # Python >= 3.11, pure Python
 torusdb-server --db ./demo.db &                       # loopback; see docs/ops-guide.md for production
-python - <<'PY'
+torussql --vault ./demo.vault                         # interactive shell, like psql
+```
+
+```
+torussql> CREATE TABLE t (id INT PLAIN, v INT ENC);
+torussql> INSERT INTO t (id, v) VALUES (1, 10);
+torussql> INSERT INTO t (id, v) VALUES (2, 32);
+torussql> SELECT SUM(v) FROM t;                       -- computed by the server on blinded data
+```
+
+or from code:
+
+```python
 import torussql
 c = torussql.connect("127.0.0.1", 8533, vault_path="./demo.vault")
 c.execute("CREATE TABLE t (id INT PLAIN, v INT ENC)")
 c.cursor().executemany("INSERT INTO t (id, v) VALUES (%s, %s)", [(1, 10), (2, 32)])
-print(c.execute("SELECT SUM(v) FROM t").rows)         # [[42]] — computed on blinded data
-PY
+print(c.execute("SELECT SUM(v) FROM t").rows)         # [[42]]
 ```
+
+Docker: `docker build -f server/Dockerfile -t torusdb-server .` (see the Dockerfile header).
 
 ## Threshold key custody
 
 The owner's mask vault can be sealed under a key that **no one ever holds**: it is
 generated dealer-free by `n` custodians and used by any `k` of them through one
 verifiable message each — the key is never reassembled (`python -m torussql.custody`,
-[`docs/custody.md`](docs/custody.md)). Custodian hosts do not need the engine.
+[`docs/custody.md`](docs/custody.md)). Custodian hosts need neither the server nor the engine core.
 
 ## Operating it
 
@@ -97,8 +110,7 @@ list of limitations (single node, no replication, in-memory dataset).
 ## Development
 
 ```bash
-pytest parser/tests                         # engine-free
-TORUSDB_ENGINE_DIR=/path/to/engine pytest   # everything (engine = ec_fhe_engine + ec_fhe_query dirs)
+pytest                                      # everything (pure Python; py_ecc for the custody tests)
 (cd drivers/typescript && npm ci && npm test)
 (cd drivers/rust && cargo test)
 ```

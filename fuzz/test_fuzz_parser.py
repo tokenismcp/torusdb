@@ -21,9 +21,8 @@ from pathlib import Path
 
 import pytest
 
-_REPO = Path(__file__).resolve().parents[3]
-for _rel in ("torussql/parser", "torussql/proto", "torussql/server",
-             "ec_fhe_query", "ec_fhe_engine"):
+_REPO = Path(__file__).resolve().parents[1]
+for _rel in ("core", "parser", "proto", "server"):
     _p = _REPO / _rel
     if _p.is_dir() and str(_p) not in sys.path:
         sys.path.insert(0, str(_p))

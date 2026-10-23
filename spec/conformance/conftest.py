@@ -13,14 +13,14 @@ from pathlib import Path
 
 import pytest
 
-_REPO = Path(__file__).resolve().parents[3]
-for _pkg in ("ec_fhe_query", "ec_fhe_engine", "torussql/parser"):
+_REPO = Path(__file__).resolve().parents[2]
+for _pkg in ("core", "parser"):
     _p = _REPO / _pkg
     if _p.is_dir() and str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
 
-from ecfhe_query.errors import ParseError, PlanError       # noqa: E402
-from ecfhe_query.nokey_engine import NoKeyClient, NoKeyServer  # noqa: E402
+from torusdb_core.errors import ParseError, PlanError       # noqa: E402
+from torusdb_core.nokey_engine import NoKeyClient, NoKeyServer  # noqa: E402
 
 
 class EngineSeam:

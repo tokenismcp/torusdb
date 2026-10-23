@@ -23,7 +23,7 @@ with conn.transaction():                    # atomic, rolls back vault + server
     cur.execute("UPDATE emp SET salary = FRAC(9500,1) WHERE id = 2")
 ```
 
-* **Requires the TorusDB engine package** (`ec-fhe-query`), distributed separately.
+* Pure Python (>= 3.11); depends only on `torusdb-core` (Apache-2.0). Ships the `torussql` shell.
 * TLS verifies the server certificate by default; `tls_insecure=True` is a
   development-only escape hatch.
 * The mask vault is the only copy of your data's keys-to-readability — back it

@@ -19,15 +19,11 @@ everything below:
 ## 1. Installing
 
 ```bash
-pip install torusdb-server          # pulls torussql + the engine package
+pip install torusdb-server          # pulls torussql + torusdb-core
 # or, container:
-docker build --build-context engine=/path/to/engine-parent \
-             -f server/Dockerfile -t torusdb-server:0.5.0 .
+docker build -f server/Dockerfile -t torusdb-server:0.5.0 .
 ```
 
-The engine packages (`ec-fhe-engine`, `ec-fhe-query`) are licensed separately
-and are not in the public repository — the image and wheels need them at
-build/install time.
 
 ## 2. Starting the server
 
@@ -170,8 +166,8 @@ conn = torussql.connect(..., vault_path="/secure/disk/owner.vault",
   encryption and file permissions.
 * **Back it up** like a private key: copy `owner.vault` after significant
   changes and keep copies in at least two places. For organisational custody
-  use the LSS export (`ecfhe_query.keymgmt.export_custody`): the vault is sealed
-  and the key split t-of-n among custodians.
+  seal the vault under a threshold key (`vault_custody=`, `docs/custody.md`) or
+  keep the masks in a threshold mask cluster (`mask_cluster=`, `docs/masks.md`).
 * **Orphans.** A crash after the server accepted an INSERT but before the mask
   reached the vault leaves a row this vault cannot decrypt. `conn.find_orphans()`
   lists them and `conn.repair_orphans()` tombstones them. Run it after any
