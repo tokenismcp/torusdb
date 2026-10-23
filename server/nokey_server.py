@@ -29,11 +29,13 @@ from __future__ import annotations
 
 import argparse
 import collections
+import base64
 import hashlib
 import hmac
 import itertools
 import json
 import logging
+import os
 import signal
 import socket
 import socketserver
@@ -62,8 +64,10 @@ _bootstrap_paths()
 from torussql import nokey_wire as w                         # noqa: E402
 from torussql.framing import read_frame, write_frame         # noqa: E402
 from torusdb_core.protocol import N                                    # noqa: E402
-from torusdb_core.nokey_engine import NoKeyServer             # noqa: E402
+from torusdb_core.nokey_engine import CommittedView, NoKeyServer   # noqa: E402
+from torusdb_core.store import DiskStorage, StoreCorrupt, TxOverlay  # noqa: E402
 import durability as dur                                     # noqa: E402
+import replication as repl                                   # noqa: E402
 
 SERVER_VERSION = "0.5.0"
 PROTOCOL_VERSION = 2
@@ -78,12 +82,15 @@ READ_RPCS = frozenset({
 })
 WRITE_RPCS = frozenset({
     "create", "insert", "insert_many", "update_cell", "delete_rows",
+    "create_index", "drop_index",
     "tx_begin", "tx_commit", "tx_rollback", "tx_status",
 })
-ADMIN_RPCS = frozenset({"drop", "stats", "checkpoint", "backup"})
+ADMIN_RPCS = frozenset({"drop", "stats", "checkpoint", "backup", "promote", "repl_status",
+                        "repl_fetch", "repl_snapshot_begin", "repl_snapshot_read",
+                        "repl_snapshot_done"})
 PUBLIC_RPCS = frozenset({"hello", "ping", "auth"})
 MUTATIONS = frozenset({"create", "insert", "insert_many", "drop",
-                       "update_cell", "delete_rows"})
+                       "update_cell", "delete_rows", "create_index", "drop_index"})
 ROLE_RPCS = {
     "ro": READ_RPCS,
     "rw": READ_RPCS | WRITE_RPCS,
@@ -123,6 +130,36 @@ class ServerConfig:
     auth_deadline: float = 10.0       # seconds an unauthenticated peer may stay connected
     pre_auth_frame: int = 8192        # largest frame accepted before authentication
     tx_ring: int = 100_000            # committed transaction ids remembered
+    storage: str = "memory"           # "memory" | "disk" (heap files in <db>.data/)
+    cache_rows: int = 50_000          # disk storage: decoded rows cached per table
+    replica_of: tuple | None = None   # (host, port): follow that primary, read-only
+    repl_conn: dict | None = None     # token / tls options for the replication connection
+    repl_ring: int = 200_000          # commits a primary keeps available to replicas
+    repl_poll: float = 5.0            # replica long-poll seconds
+
+
+def _ring_rec(ops: list, tx: str | None) -> dict:
+    return {"ops": ops, "tx": tx} if tx else {"ops": ops}
+
+
+def _approx(ops: list) -> int:
+    """Cheap size estimate of a commit (for the WAL ring byte budget)."""
+    return 64 + sum(len(m) + 24 + sum(len(str(a)) for a in args) for m, args in ops)
+
+
+def _wire_groups(pred: dict) -> list[list[tuple]]:
+    """Wire predicate -> ``(col, op, value)`` groups for index lookups."""
+    out = []
+    for group in pred["or"]:
+        g = []
+        for a in group:
+            if "in" in a:
+                g.append((a["c"], "in", [w.uwv(x) for x in a["in"]]))
+            else:
+                g.append((a["c"], {"=": "=", "==": "=", "<": "<", "<=": "<=", ">": ">",
+                                   ">=": ">="}.get(a["op"], ""), w.uwv(a["v"])))
+        out.append(g)
+    return out
 
 
 def hash_token(token: str) -> str:
@@ -213,6 +250,7 @@ class Engine:
         self._undo: list = []
         self._tx_ops: list = []
         self._tx_id: str | None = None
+        self._overlay: TxOverlay | None = None          # what the open tx changed
         self._txids: collections.OrderedDict[str, bool] = collections.OrderedDict()
         self._timed_out: set[int] = set()              # sessions whose tx was aborted
         self._ids = itertools.count(1)
@@ -225,40 +263,120 @@ class Engine:
         if self.cfg.tokens is not None:
             self._tokens = {(t if t.startswith("sha256:") else hash_token(t)): r
                             for t, r in self.cfg.tokens.items()}
-        self.srv = NoKeyServer()
+        if self.cfg.storage not in ("memory", "disk"):
+            raise ValueError("storage must be 'memory' or 'disk'")
+        if self.cfg.storage == "disk" and not db_path:
+            raise ValueError("disk storage needs --db")
+        self._storage = (DiskStorage(db_path + ".data", self.cfg.cache_rows)
+                         if self.cfg.storage == "disk" else None)
+        self.srv = NoKeyServer(self._storage)
         self._gen = 0
+        self.cluster_id = repl.new_cluster_id()
+        self.timeline = 1
+        self.repl_pos: tuple[int, int] = (0, 0)       # replica: next WAL position wanted
+        self._ring = repl.WalRing(self.cfg.repl_ring)
+        self._snaps = repl.SnapshotStore((db_path + ".repl") if db_path else "")
+        self._follower: repl.Follower | None = None
+        self._replica = self.cfg.replica_of is not None
+        if self._replica and not db_path:
+            raise ValueError("--replica-of requires --db")
         self._journal: dur.Journal | None = None
         self._dblock: dur.DbLock | None = None
         if db_path:
             self._open_db(db_path)
+        if self._replica:
+            self.start_replication()
 
     # ── durability ───────────────────────────────────────────────────────────
+    def _extra(self) -> dict:
+        return {"txids": list(self._txids), "cluster_id": self.cluster_id,
+                "timeline": self.timeline, "repl_pos": list(self.repl_pos),
+                "gen_len": self._ring.known_gen_len()}
+
     def _open_db(self, path: str) -> None:
         self._dblock = dur.DbLock(path)
         self._dblock.acquire()
+        fresh = not Path(path).exists()
         try:
             jpath = path + ".journal"
+            if fresh and self._replica:
+                self._bootstrap_from_primary(path)
+                fresh = False
+            gen_len = None
             if Path(path).exists():
                 body, self._gen, extra = dur.read_snapshot(path)
-                self.srv = NoKeyServer.from_body(body)
+                try:
+                    self.srv = NoKeyServer.from_body(body, self._storage)
+                except (ValueError, StoreCorrupt) as exc:
+                    raise dur.CorruptDatabase(f"{path}: {exc}") from exc
                 for t in extra.get("txids", []):
                     self._remember_tx(t)
+                self.cluster_id = extra.get("cluster_id", self.cluster_id)
+                self.timeline = int(extra.get("timeline", 1))
+                self.repl_pos = tuple(extra.get("repl_pos", (0, 0)))
+                gen_len = extra.get("gen_len")
             self._journal = dur.Journal(jpath, self._gen, self.cfg.fsync)
             replayed = 0
+            self._ring.reset(self._gen, 0, gen_len)
             for rec in self._journal.open():        # raises CorruptDatabase on damage
                 for method, args in rec["ops"]:
                     self._mutate(method, args)
                 if rec.get("tx"):
                     self._remember_tx(rec["tx"])
+                if rec.get("rp"):
+                    self.repl_pos = tuple(rec["rp"])
+                self._ring.append(self._gen, replayed, _ring_rec(rec["ops"], rec.get("tx")),
+                                  _approx(rec["ops"]))
                 replayed += 1
             if replayed:
                 log.info("recovered %d journal commit(s) on top of snapshot "
                          "generation %d", replayed, self._gen)
+            if fresh:
+                self.checkpoint()                   # persist the cluster identity at once
         except BaseException:
             if self._journal:
                 self._journal.close()
             self._dblock.release()
             raise
+
+    def _bootstrap_from_primary(self, path: str) -> None:
+        """First start of a replica: download a consistent snapshot of the primary."""
+        from torussql.nokey import _Conn
+        host, port = self.cfg.replica_of
+        log.info("bootstrapping replica from %s:%s", host, port)
+        conn = _Conn(host, port, timeout=120.0, **(self.cfg.repl_conn or {}))
+        tmp = path + ".bootstrap"
+        try:
+            info = conn.call("repl_snapshot_begin", [])
+            with open(tmp, "wb") as f:
+                off = 0
+                while True:
+                    part = conn.call("repl_snapshot_read", [info["id"], off, repl.SNAP_CHUNK])
+                    data = base64.b64decode(part["data"])
+                    f.write(data)
+                    off += len(data)
+                    if part["eof"]:
+                        break
+                f.flush(); os.fsync(f.fileno())
+            conn.call("repl_snapshot_done", [info["id"]])
+            body, gen, extra = dur.read_snapshot(tmp)       # verifies the checksum
+            pos = extra.get("pos")
+            if not pos:
+                raise dur.CorruptDatabase("primary snapshot carries no WAL position")
+            extra = dict(extra, repl_pos=pos, timeline=extra.get("timeline", 1))
+            dur.write_snapshot(path, body, gen, extra)
+            log.info("replica bootstrapped at generation %s, WAL position %s", gen, pos)
+        finally:
+            conn.close()
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+    def _journal_append(self, ops: list, tx: str | None = None, rp: list | None = None) -> None:
+        seq = self._journal.records
+        self._journal.append(ops, tx, rp)           # durable first ...
+        self._ring.append(self._gen, seq, _ring_rec(ops, tx), _approx(ops))   # ... then visible
 
     def _remember_tx(self, txid: str) -> None:
         self._txids[txid] = True
@@ -276,8 +394,10 @@ class Engine:
             if self._tx_owner is not None:
                 raise Busy("cannot checkpoint while a transaction is open")
             new_gen = self._gen + 1
-            dur.write_snapshot(self._path, self.srv.to_body(), new_gen,
-                               {"txids": list(self._txids)})
+            old_gen, old_count = self._gen, self._journal.records
+            self._ring.gen_len[old_gen] = old_count
+            dur.write_snapshot(self._path, self.srv.checkpoint_body(new_gen), new_gen,
+                               self._extra())
             try:
                 self._journal.reset(new_gen)
             except BaseException as exc:
@@ -288,6 +408,8 @@ class Engine:
                 log.critical("%s — server is now read-only; restart to recover", self._broken)
                 raise
             self._gen = new_gen
+            self._ring.new_generation(old_gen, old_count, new_gen)
+            self.srv.checkpoint_done()
             self.stats.bump("checkpoints")
             return new_gen
 
@@ -304,7 +426,7 @@ class Engine:
                 f"{base}.{time.strftime('%Y%m%dT%H%M%S')}.g{self._gen}"
                 f".{next(self._ids)}.bak")
             dur.write_snapshot(str(out), self.srv.to_body(), self._gen,
-                               {"txids": list(self._txids)})
+                               dict(self._extra(), pos=[self._gen, self._journal.records]))
             keep = max(1, self.cfg.backup_keep)
             olds = sorted(Path(self.cfg.backup_dir).glob(f"{base}.*.bak"),
                           key=lambda p: p.stat().st_mtime)
@@ -313,6 +435,9 @@ class Engine:
             return str(out)
 
     def close(self) -> None:
+        if self._follower is not None:
+            self._follower.stop()
+            self._follower.join(timeout=5)
         with self._lock:
             self._closing = True                       # no RPC may mutate from now on
             if self._path and self._journal and self._tx_owner is None and not self._broken:
@@ -323,6 +448,7 @@ class Engine:
             if self._journal:
                 self._journal.close()
                 self._journal = None
+            self.srv.close()
             if self._dblock:
                 self._dblock.release()
                 self._dblock = None
@@ -420,6 +546,11 @@ class Engine:
             raise Forbidden(f"role {s.role!r} may not call {method!r}")
         if method == "stats":
             return self.stats_snapshot()
+        if method.startswith("repl_") or method == "promote":
+            return self._repl_rpc(method, args)
+        if self._replica and (method in MUTATIONS or method == "tx_begin"):
+            raise Forbidden("this server is a read-only replica (use 'promote' to make "
+                            "it a primary)")
         if method == "checkpoint":
             return self.checkpoint()
         if method == "backup":
@@ -429,6 +560,122 @@ class Engine:
         if method == "tx_status":
             return self._tx_status(args)
         return self._run(s, method, args)
+
+    # ── replication ──────────────────────────────────────────────────────────
+    def _repl_rpc(self, method: str, args: list):
+        if not self._path:
+            raise BadRequest("replication needs a persistent database (--db)")
+        if method == "repl_status":
+            return self.repl_status()
+        if method == "promote":
+            return self.promote()
+        if self._replica:
+            raise BadRequest("this server is a replica; cascading replication is not supported")
+        if method == "repl_fetch":
+            try:
+                cid, timeline, pos, maxn, wait_ms = args
+                pos = (int(pos[0]), int(pos[1]))
+            except (ValueError, TypeError, IndexError):
+                raise BadRequest("repl_fetch takes [cluster_id, timeline, [gen, seq], max, wait_ms]")
+            if cid and cid != self.cluster_id:
+                raise BadRequest("replication refused: different cluster_id")
+            if int(timeline) != self.timeline:
+                raise BadRequest(f"replication refused: timeline mismatch (replica "
+                                 f"{timeline}, primary {self.timeline}) — re-bootstrap the replica")
+            try:
+                recs, nxt = self._ring.fetch(pos, max(1, min(int(maxn), 10_000)),
+                                             max(0.0, min(int(wait_ms) / 1000.0, 30.0)))
+            except repl.TooFarBehind as exc:
+                raise BadRequest(f"replica too far behind / diverged: {exc}")
+            return {"records": recs, "next": list(nxt), "end": list(self._ring.end),
+                    "cluster_id": self.cluster_id, "timeline": self.timeline}
+        if method == "repl_snapshot_begin":
+            with self._lock:
+                if self._tx_owner is not None:
+                    raise Busy("cannot snapshot while a transaction is open")
+                if self._broken:
+                    raise Busy(f"storage failure: {self._broken}")
+                sid, path = self._snaps.create()
+                pos = [self._gen, self._journal.records]
+                dur.write_snapshot(path, self.srv.to_body(), self._gen,
+                                   dict(self._extra(), pos=pos))
+            return {"id": sid, "gen": pos[0], "seq": pos[1], "size": os.path.getsize(path)}
+        if method == "repl_snapshot_read":
+            try:
+                sid, off, length = args
+                return self._snaps.read(str(sid), int(off), int(length))
+            except (KeyError, ValueError, TypeError) as exc:
+                raise BadRequest(f"bad snapshot read: {exc}")
+        if method == "repl_snapshot_done":
+            self._snaps.done(str(args[0]) if args else "")
+            return None
+        raise BadRequest("unknown replication call")
+
+    def apply_replicated(self, records: list, next_pos: tuple) -> None:
+        """Replica: apply the primary's commits atomically and journal them."""
+        with self._lock:
+            if not self._replica:
+                return
+            for rec in records:
+                undos = []
+                try:
+                    for method, args in rec["ops"]:
+                        _res, undo = self._mutate(method, args)
+                        undos.append(undo)
+                    self._journal_append(rec["ops"], rec.get("tx"), [rec["g"], rec["q"] + 1])
+                except BaseException:
+                    for undo in reversed(undos):
+                        undo()
+                    raise
+                if rec.get("tx"):
+                    self._remember_tx(rec["tx"])
+            self.repl_pos = tuple(next_pos)
+        self._maybe_checkpoint()
+
+    def repl_status(self) -> dict:
+        with self._lock:
+            out = {"role": "replica" if self._replica else "primary",
+                   "cluster_id": self.cluster_id, "timeline": self.timeline,
+                   "generation": self._gen,
+                   "journal_records": self._journal.records if self._journal else 0}
+            if self._replica:
+                f = self._follower
+                out.update({"replica_of": f"{self.cfg.replica_of[0]}:{self.cfg.replica_of[1]}",
+                            "position": list(self.repl_pos),
+                            "primary_end": list(f.primary_end) if f and f.primary_end else None,
+                            "applied": f.applied if f else 0,
+                            "last_contact": f.last_contact if f else 0,
+                            "last_error": (f.fatal or f.last_error) if f else None})
+            else:
+                out.update({"wal_end": list(self._ring.end)})
+            return out
+
+    def start_replication(self) -> None:
+        if not self._replica or self._follower is not None:
+            return
+        host, port = self.cfg.replica_of
+        self._follower = repl.Follower(self, host, port, self.cfg.repl_conn or {},
+                                       poll=self.cfg.repl_poll)
+        self._follower.start()
+
+    def promote(self) -> dict:
+        """Turn a replica into a writable primary (new timeline). Operators must
+        make sure the old primary is stopped / fenced first."""
+        if not self._replica:
+            raise BadRequest("this server is already a primary")
+        f = self._follower
+        if f is not None:
+            f.stop()
+            f.join(timeout=self.cfg.repl_poll + 35)
+        with self._lock:
+            self._replica = False
+            self._follower = None
+            self.timeline += 1
+            self._ring.reset(self._gen, self._journal.records, self._ring.known_gen_len())
+            self.repl_pos = (0, 0)
+        self.checkpoint()                           # persist the new timeline
+        log.warning("promoted to primary (timeline %d)", self.timeline)
+        return {"role": "primary", "timeline": self.timeline}
 
     # ── transactions: one open transaction at a time, serializable ───────────
     def _expire_stale_tx_locked(self) -> None:
@@ -486,6 +733,7 @@ class Engine:
                     self._tx_since = time.monotonic()
                     self._tx_id = txid
                     self._undo, self._tx_ops = [], []
+                    self._overlay = TxOverlay()
                 s.in_tx, s.tx_id = True, txid
                 return None
             if self._tx_owner != s.id:
@@ -494,7 +742,7 @@ class Engine:
                 if method == "tx_commit":
                     if self._journal and (self._tx_ops or self._tx_id):
                         try:
-                            self._journal.append(self._tx_ops, self._tx_id)
+                            self._journal_append(self._tx_ops, self._tx_id)
                         except Exception as exc:        # noqa: BLE001
                             self._rollback_locked()
                             s.in_tx, s.tx_id = False, None
@@ -513,6 +761,7 @@ class Engine:
                     self.stats.bump("tx_rollbacks")
                 self._tx_owner = None
                 self._tx_id = None
+                self._overlay = None
             s.in_tx, s.tx_id = False, None
             self._cv.notify_all()
         if method == "tx_commit":
@@ -537,12 +786,31 @@ class Engine:
         self._undo, self._tx_ops = [], []
         self._tx_owner = None
         self._tx_id = None
+        self._overlay = None
 
     # ── executing one RPC ────────────────────────────────────────────────────
     def _run(self, s: Session, method: str, args: list):
         deadline = time.monotonic() + self.cfg.tx_wait
         while True:
-            with self._cv:                             # wait out foreign tx
+            if method not in MUTATIONS:
+                # Readers never wait for a foreign write transaction: they see the
+                # last committed state (snapshot read), not the uncommitted one.
+                with self._cv:
+                    self._check_timed_out(s)
+                    self._expire_stale_tx_locked()      # a stale writer must not linger
+                with self._lock:
+                    if s.id in self._timed_out:
+                        self._check_timed_out(s)
+                    if self._tx_owner not in (None, s.id) and self._overlay is not None:
+                        live, self.srv = self.srv, CommittedView(self.srv, self._overlay)
+                        try:
+                            return self._call(method, args)
+                        finally:
+                            self.srv = live
+                    if self._tx_owner in (None, s.id):
+                        return self._call(method, args)
+                continue                               # raced with a new tx; retry
+            with self._cv:                             # writers wait out a foreign tx
                 self._check_timed_out(s)
                 while self._tx_owner not in (None, s.id):
                     self._expire_stale_tx_locked()
@@ -557,8 +825,6 @@ class Engine:
                     continue                           # lost a race; wait again
                 if s.id in self._timed_out:
                     self._check_timed_out(s)           # raced with an expiry
-                if method not in MUTATIONS:
-                    return self._call(method, args)
                 if self._closing:
                     raise Busy("server is shutting down")
                 if self._broken:
@@ -569,7 +835,7 @@ class Engine:
                     self._tx_ops.append([method, args])
                 elif self._journal:
                     try:
-                        self._journal.append([[method, args]])
+                        self._journal_append([[method, args]])
                     except Exception as exc:           # noqa: BLE001
                         undo()
                         if not self._journal.usable:
@@ -608,60 +874,74 @@ class Engine:
             if method == "create":
                 table, columns = args
                 self._rpc_create(table, columns)
+                if self._overlay is not None:
+                    self._overlay.created.add(table)
                 return None, lambda: srv.drop(table)
             if method == "drop":
                 (table,) = args
-                saved = (srv._schema.get(table), srv._rows.get(table),
-                         srv._deleted.get(table))
-                self._rpc_drop(table)
-
-                def undo_drop(saved=saved, table=table):
-                    if saved[0] is not None:
-                        srv._schema[table], srv._rows[table], srv._deleted[table] = saved
-                return None, undo_drop
+                if table not in srv._schema:
+                    self._rpc_drop(table)                  # no-op drop of a missing table
+                    return None, lambda: None
+                if self._overlay is not None and table not in self._overlay.created:
+                    self._overlay.dropped[table] = (srv._schema[table], srv._rows[table])
+                saved = srv.drop(table)
+                return None, lambda saved=saved, table=table: srv.undrop(table, saved)
             if method == "insert":
                 table, row_wire = args
-                before = len(srv._rows.get(table, ()))
+                n0, mark = self._store(table).mark()
+                if self._overlay is not None:
+                    self._overlay.note_append(table, srv._rows[table])
                 rid = self._rpc_insert(table, row_wire)
-                return rid, lambda: srv._rows[table].__delitem__(slice(before, None))
+                return rid, lambda: srv._rows[table].rewind(n0, mark)
             if method == "insert_many":
                 table, rows_wire = args
-                before = len(srv._rows.get(table, ()))
+                n0, mark = self._store(table).mark()
+                if self._overlay is not None:
+                    self._overlay.note_append(table, srv._rows[table])
                 try:
                     rids = [self._rpc_insert(table, r) for r in rows_wire]
                 except Exception:
                     if table in srv._rows:
-                        del srv._rows[table][before:]
+                        srv._rows[table].rewind(n0, mark)
                     raise
-                return rids, lambda: srv._rows[table].__delitem__(slice(before, None))
+                return rids, lambda: srv._rows[table].rewind(n0, mark)
             if method == "update_cell":
                 table, idx, col, wire_value = args
-                row = self._row(table, idx)
-                old = row.get(col, _MISSING)
+                self._row(table, idx)
+                if self._overlay is not None:
+                    self._overlay.note_update(table, srv._rows[table], idx)
                 self._rpc_update_cell(table, idx, col, wire_value)
-
-                def undo_cell(row=row, col=col, old=old):
-                    if old is _MISSING:
-                        row.pop(col, None)
-                    else:
-                        row[col] = old
-                return None, undo_cell
+                return None, self._last_undo
+            if method in ("create_index", "drop_index"):
+                table, col = args
+                store = self._store(table)
+                had = col in store.indexed_columns
+                self._rpc_index(method, table, col)
+                if method == "create_index":
+                    return None, (lambda: None) if had else (lambda: store.drop_index(col))
+                return None, (lambda: store.create_index(col)) if had else (lambda: None)
             if method == "delete_rows":
                 table, idxs = args
-                dead = srv._deleted.get(table, set())
-                newly = [i for i in set(idxs) if i not in dead]
+                store = self._store(table)
+                newly = [i for i in sorted(set(idxs)) if not store.is_dead(i)]
+                if self._overlay is not None:
+                    self._overlay.note_kill(table, newly)
                 n = self._rpc_delete_rows(table, idxs)
-                return n, lambda: srv._deleted[table].difference_update(newly)
+                return n, lambda: store.revive(newly)
         except ValueError as exc:                       # wrong arity
             if "unpack" in str(exc) or "values to" in str(exc):
                 raise BadRequest(f"bad arguments for {method}")
             raise
         raise BadRequest("unknown mutation")            # pragma: no cover
 
-    def _row(self, table, idx) -> dict:
-        rows = self.srv._rows.get(table)
-        if rows is None:
+    def _store(self, table):
+        store = self.srv._rows.get(table)
+        if store is None:
             raise BadRequest(f"no such table: {table}")
+        return store
+
+    def _row(self, table, idx) -> dict:
+        rows = self._store(table)
         if not isinstance(idx, int) or isinstance(idx, bool) or not 0 <= idx < len(rows):
             raise BadRequest("row id out of range")
         return rows[idx]
@@ -671,6 +951,12 @@ class Engine:
         if table not in self.srv._schema:
             raise BadRequest(f"no such table: {table}")
         return self.srv._schema[table]
+
+    def _rpc_create_index(self, table, col):
+        return None                                   # executed in _mutate
+
+    def _rpc_drop_index(self, table, col):
+        return None
 
     def _rpc_create(self, table, columns):
         if not isinstance(table, str) or not table:
@@ -693,8 +979,21 @@ class Engine:
                 raise BadRequest(f"STR columns must be PLAIN (column {n!r})")
         self.srv.create(table, [tuple(c) for c in columns]); return None
 
+    def _rpc_index(self, method, table, col):
+        if not isinstance(col, str):
+            raise BadRequest("column must be a string")
+        self._cols(table)
+        if method == "create_index":
+            try:
+                self.srv.create_index(table, col)
+            except Exception as exc:                  # PlanError -> client error
+                raise BadRequest(str(exc)) from None
+        else:
+            self.srv.drop_index(table, col)
+        return None
+
     def _rpc_drop(self, table):
-        self.srv.drop(table); return None
+        return None                                   # the drop itself runs in _mutate
 
     def _rpc_tables(self):
         return sorted(self.srv._schema)
@@ -703,11 +1002,9 @@ class Engine:
         return [list(c) for c in self.srv.schema(table)]
 
     def _rpc_table_info(self, table):
-        rows = self.srv._rows.get(table)
-        if rows is None:
-            raise BadRequest(f"no such table: {table}")
-        return {"rows": len(rows),
-                "deleted": sorted(self.srv._deleted.get(table, ()))}
+        store = self._store(table)
+        return {"rows": len(store), "deleted": store.dead_ids(),
+                "indexes": store.indexed_columns}
 
     @staticmethod
     def _is_hidden(k: str) -> bool:
@@ -741,13 +1038,12 @@ class Engine:
         if (col not in known and not self._is_hidden(col)
                 and not (col.startswith("__mac__") and col[7:] in known)):
             raise BadRequest(f"no such column: {col}")
-        self.srv.update_cell(table, idx, col, w.uwv(wire_value)); return None
+        self._last_undo = self.srv._rows[table].set_cell(idx, col, w.uwv(wire_value))
+        return None
 
     def _check_ids(self, table, idxs) -> list:
         """Validated row-id list: bounded length, real ints, in range."""
-        rows = self.srv._rows.get(table)
-        if rows is None:
-            raise BadRequest(f"no such table: {table}")
+        rows = self._store(table)
         if not isinstance(idxs, list) or len(idxs) > self.cfg.max_items:
             raise BadRequest(f"id list must be a list of at most {self.cfg.max_items} ids")
         n = len(rows)
@@ -781,10 +1077,12 @@ class Engine:
 
     def _rpc_matching_rowids(self, table, pred):
         self._check_predicate(table, pred)
-        rows = self.srv._rows[table]
-        dead = self.srv._deleted.get(table, set())
-        return [i for i, r in enumerate(rows)
-                if i not in dead and w.match_wire(r, pred)]
+        store = self.srv._rows[table]
+        cand = None
+        if pred is not None and store.indexed_columns:
+            cand = store.candidates(_wire_groups(pred))
+        ids = cand if cand is not None else store.live_ids()
+        return [i for i in ids if not store.is_dead(i) and w.match_wire(store.row(i), pred)]
 
     def _col(self, table, col) -> str:
         known = {c[0] for c in self._cols(table)}
@@ -858,10 +1156,12 @@ class Engine:
                 "checkpoints": st.checkpoints,
             }
         with self._lock:
-            snap["tables"] = {t: {"rows": len(r),
-                                  "deleted": len(self.srv._deleted.get(t, ()))}
-                              for t, r in self.srv._rows.items()}
+            snap["tables"] = {t: {"rows": v["rows"], "deleted": v["deleted"]}
+                              for t, v in self.srv.stats().items()}
+            snap["storage"] = self.cfg.storage
             snap["generation"] = self._gen
+            snap["replication"] = {"role": "replica" if self._replica else "primary",
+                                   "timeline": self.timeline}
             snap["journal_records"] = self._journal.records if self._journal else 0
             snap["journal_bytes"] = self._journal.bytes if self._journal else 0
         return snap
@@ -1118,6 +1418,17 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--db", default=None, help="database path (enables durability)")
     ap.add_argument("--fsync", choices=("always", "never"), default="always")
     ap.add_argument("--checkpoint-every", type=int, default=5000)
+    ap.add_argument("--replica-of", metavar="HOST:PORT",
+                    help="run as a read-only replica of this primary (needs --db)")
+    ap.add_argument("--repl-token-env", metavar="VAR",
+                    help="env var with an admin token for the primary (replication)")
+    ap.add_argument("--repl-tls", action="store_true", help="use TLS towards the primary")
+    ap.add_argument("--repl-cafile", default=None)
+    ap.add_argument("--repl-ring", type=int, default=200_000,
+                    help="commits kept in memory for replicas to catch up from")
+    ap.add_argument("--storage", choices=("memory", "disk"), default="memory",
+                    help="disk: rows live in heap files under <db>.data/ (data set may exceed RAM)")
+    ap.add_argument("--cache-rows", type=int, default=50_000, help="disk storage: rows cached per table")
     ap.add_argument("--backup-dir", default=None)
     ap.add_argument("--backup-keep", type=int, default=7,
                     help="how many backups to retain (≥1)")
@@ -1168,11 +1479,27 @@ def main(argv: list[str] | None = None) -> None:
 
     if args.backup_keep < 1:
         raise SystemExit("--backup-keep must be at least 1")
+    if args.storage == "disk" and not args.db:
+        raise SystemExit("--storage disk requires --db")
+    replica_of, repl_conn = None, None
+    if args.replica_of:
+        if not args.db:
+            raise SystemExit("--replica-of requires --db")
+        rh, _, rp = args.replica_of.rpartition(":")
+        if not rh or not rp.isdigit():
+            raise SystemExit("--replica-of expects HOST:PORT")
+        replica_of = (rh, int(rp))
+        tok = os.environ.get(args.repl_token_env) if args.repl_token_env else None
+        if args.repl_token_env and not tok:
+            raise SystemExit(f"${args.repl_token_env} is not set")
+        repl_conn = {"token": tok, "tls": args.repl_tls, "cafile": args.repl_cafile}
     cfg = ServerConfig(tokens=tokens, max_connections=args.max_connections,
                        idle_timeout=args.idle_timeout,
                        max_frame=args.max_frame_mb * 1024 * 1024,
                        checkpoint_every=args.checkpoint_every, fsync=args.fsync,
-                       backup_dir=args.backup_dir, backup_keep=args.backup_keep)
+                       backup_dir=args.backup_dir, backup_keep=args.backup_keep,
+                       storage=args.storage, cache_rows=args.cache_rows,
+                       replica_of=replica_of, repl_conn=repl_conn, repl_ring=args.repl_ring)
     ssl_ctx = _build_ssl_ctx(args)
     try:
         srv = NoKeyTCPServer(args.host, args.port, args.db, ssl_ctx=ssl_ctx,

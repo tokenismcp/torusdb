@@ -107,10 +107,12 @@ class Journal:
         self.bytes = self._log._size
         return out
 
-    def append(self, ops: list, tx: str | None = None) -> None:
+    def append(self, ops: list, tx: str | None = None, rp: list | None = None) -> None:
         rec = {"g": self.generation, "ops": ops}
         if tx:
             rec["tx"] = tx
+        if rp:
+            rec["rp"] = rp                      # replica: position in the primary's WAL
         self._log.append(rec)                   # all-or-nothing; raises on failure
         self.records += 1
         self.bytes = self._log._size

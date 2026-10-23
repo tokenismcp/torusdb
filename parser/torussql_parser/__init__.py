@@ -14,8 +14,8 @@ can reject illegal queries before they reach the closed TorusDB engine.
 from __future__ import annotations
 
 from .ast import (
-    AvgExpr, ColRef, Condition, CountStar, CreateTable, CtMulExpr, Delete,
-    DotExpr, DropTable, Having, InList, Insert, MaxExpr, MinExpr, OrderBy,
+    AvgExpr, ColRef, Condition, CountStar, CreateIndex, CreateTable, CtMulExpr, Delete,
+    DotExpr, DropIndex, DropTable, Having, InList, Insert, MaxExpr, MinExpr, OrderBy,
     Query, ScalarMulExpr, ScaledSumExpr, Select, SumExpr, Update, Where,
     POLICIES, TYPES, WHERE_OPS,
 )
@@ -30,7 +30,7 @@ __all__ = [
     "parse",
     "Schema", "Table", "Column", "validate_script",
     "ParseError", "ValidationError", "TorusSQLError",
-    "CreateTable", "DropTable", "Insert", "Update", "Delete", "Select",
+    "CreateTable", "DropTable", "CreateIndex", "DropIndex", "Insert", "Update", "Delete", "Select",
     "Having", "Query",
     "ColRef", "SumExpr", "DotExpr", "ScalarMulExpr", "ScaledSumExpr",
     "CtMulExpr", "CountStar", "AvgExpr", "MinExpr", "MaxExpr",

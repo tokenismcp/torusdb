@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 
 from .ast import (
     AvgExpr, ColRef, CountStar, CreateTable, CtMulExpr, Delete, DotExpr,
-    DropTable, InList, Insert, Join, MaxExpr, MinExpr, Query, ScalarMulExpr,
+    DropTable, CreateIndex, DropIndex, InList, Insert, Join, MaxExpr, MinExpr, Query, ScalarMulExpr,
     ScaledSumExpr, Select, SumExpr, Update,
 )
 from .errors import ValidationError
@@ -115,6 +115,8 @@ class Schema:
             self._validate_create(q)
         elif isinstance(q, DropTable):
             self._require_table(q.name)
+        elif isinstance(q, (CreateIndex, DropIndex)):
+            self._validate_index(q)
         elif isinstance(q, Insert):
             self._validate_insert(q)
         elif isinstance(q, Update):
@@ -131,6 +133,14 @@ class Schema:
         if name not in self.tables:
             raise ValidationError(f"no such table: {name}")
         return self.tables[name]
+
+    def _validate_index(self, q) -> None:
+        table = self._require_table(q.table)
+        cols = {c.name: c for c in table.columns}
+        if q.column not in cols:
+            raise ValidationError(f"no such column: {q.column!r} in table {q.table!r}")
+        if cols[q.column].policy != "plain":
+            raise ValidationError(f"cannot index {q.column!r}: only PLAIN columns can be indexed")
 
     def _validate_create(self, q: CreateTable) -> None:
         if q.name.startswith("__"):

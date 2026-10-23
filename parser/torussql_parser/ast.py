@@ -23,6 +23,18 @@ class DropTable:
 
 
 @dataclass
+class CreateIndex:
+    table: str
+    column: str
+
+
+@dataclass
+class DropIndex:
+    table: str
+    column: str
+
+
+@dataclass
 class Insert:
     table: str
     columns: list[str]
@@ -186,7 +198,7 @@ class Select:
         return self.table_alias or self.table
 
 
-Query = Union[CreateTable, DropTable, Insert, Update, Delete, Select]
+Query = Union[CreateTable, DropTable, CreateIndex, DropIndex, Insert, Update, Delete, Select]
 
 
 # ── Normalized vocabularies (the dialect's closed sets) ──────────────────────

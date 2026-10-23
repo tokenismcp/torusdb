@@ -14,7 +14,7 @@ client-side; the conformance suite checks the two agree.
 from __future__ import annotations
 
 from torussql_parser.ast import (                       # noqa: F401  (re-export)
-    ColRef, CreateTable, CtMulExpr, Delete, DotExpr, DropTable, Insert, Join,
+    ColRef, CreateIndex, CreateTable, CtMulExpr, Delete, DotExpr, DropIndex, DropTable, Insert, Join,
     Query, ScalarMulExpr, Select, SumExpr, Update, Where,
 )
 from torussql_parser.errors import ParseError as _OpenParseError

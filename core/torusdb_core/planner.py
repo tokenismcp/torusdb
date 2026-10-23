@@ -19,7 +19,7 @@ from typing import Union
 from .catalog import Catalog
 from .errors import PlanError
 from .parser import (
-    ColRef, CreateTable, CtMulExpr, Delete, DotExpr, DropTable, Insert, Join,
+    ColRef, CreateIndex, CreateTable, CtMulExpr, Delete, DotExpr, DropIndex, DropTable, Insert, Join,
     Query, ScalarMulExpr, Select, SumExpr, Update,
 )
 from torussql_parser.ast import (
@@ -204,6 +204,16 @@ def plan_query(q: Query, catalog: Catalog) -> Plan:
         if q.name not in catalog.tables:
             raise PlanError(f"no such table: {q.name}")
         return Plan(kind="drop", raw=q, table=q.name)
+    if isinstance(q, (CreateIndex, DropIndex)):
+        spec = catalog.tables.get(q.table)
+        if spec is None:
+            raise PlanError(f"no such table: {q.table}")
+        if not spec.has(q.column):
+            raise PlanError(f"no such column: {q.column!r} in table {q.table!r}")
+        if spec.column(q.column).policy != "plain":
+            raise PlanError(f"cannot index {q.column!r}: only PLAIN columns can be indexed")
+        return Plan(kind="create_index" if isinstance(q, CreateIndex) else "drop_index",
+                    raw=q, table=q.table)
     if isinstance(q, Insert):
         return _plan_insert(q, catalog)
     if isinstance(q, Update):

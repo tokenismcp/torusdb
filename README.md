@@ -58,6 +58,8 @@ reference and the list of what is *not* supported:
 | `server/` | `torusdb-server` — keyless server: auth/roles, WAL durability, backups, metrics, Docker |
 | `proto/` | Wire protocol v2 spec |
 | `drivers/python/torussql/cli.py` | `torussql` — interactive shell (`psql` for TorusDB) |
+| `docs/replication.md` | Hot standbys, promotion |
+| `docs/storage.md` | Disk storage engine (`--storage disk`) and `CREATE INDEX` |
 | `core/` | `torusdb-core` — keyless engine: planner, blinding client, keyless store (Apache-2.0) |
 | `bench/` | Micro-, network and TPC-H-style benchmarks |
 | `fuzz/`, `tests/` | Fuzz/robustness and end-to-end suites |

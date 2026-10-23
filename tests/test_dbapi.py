@@ -55,7 +55,7 @@ def _seed(conn):
 
 def test_module_attributes():
     assert torussql.apilevel == "2.0"
-    assert torussql.threadsafety == 1
+    assert torussql.threadsafety == 2
     assert torussql.paramstyle == "format"
 
 

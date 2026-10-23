@@ -19,6 +19,9 @@ Grammar (case-insensitive keywords); see ../../spec/TorusSQL-Spec-v0.1.md:
                     | <col> * <col>
 
     DROP TABLE <name>
+
+    CREATE INDEX ON <name> ( <plain_col> )      -- accelerates = < <= > >= IN
+    DROP INDEX ON <name> ( <col> )
 """
 from __future__ import annotations
 
@@ -28,7 +31,7 @@ from typing import Any, Sequence
 
 from .ast import (
     AvgExpr, ColRef, Condition, CountStar, CreateTable, CtMulExpr, Delete,
-    DotExpr, DropTable, Having, InList, Insert, Join, MaxExpr, MinExpr, OrderBy,
+    DotExpr, DropTable, CreateIndex, DropIndex, Having, InList, Insert, Join, MaxExpr, MinExpr, OrderBy,
     POLICY_KEYWORDS, Proj, Query, ScalarMulExpr, ScaledSumExpr, Select, SumExpr,
     TYPE_KEYWORDS, Update, Where, WHERE_OPS,
 )
@@ -133,7 +136,21 @@ def parse(sql: str) -> Query:
     raise ParseError(f"unknown statement: {head}")
 
 
-def _parse_create(p: _P) -> CreateTable:
+def _parse_index(p: _P, cls):
+    p.eat(kind="id", value="ON")
+    table = p.eat(kind="id").value
+    p.eat(kind="sym", value="(")
+    col = p.eat(kind="id").value
+    p.eat(kind="sym", value=")")
+    if not p.eof():
+        raise ParseError("trailing tokens after INDEX definition")
+    return cls(table=table, column=col)
+
+
+def _parse_create(p: _P):
+    if p.peek(kind="id", value="INDEX"):
+        p.eat()
+        return _parse_index(p, CreateIndex)
     p.eat(kind="id", value="TABLE")
     name = p.eat(kind="id").value
     p.eat(kind="sym", value="(")
@@ -156,7 +173,10 @@ def _parse_create(p: _P) -> CreateTable:
     return CreateTable(name=name, columns=cols)
 
 
-def _parse_drop(p: _P) -> DropTable:
+def _parse_drop(p: _P):
+    if p.peek(kind="id", value="INDEX"):
+        p.eat()
+        return _parse_index(p, DropIndex)
     p.eat(kind="id", value="TABLE")
     name = p.eat(kind="id").value
     if not p.eof():

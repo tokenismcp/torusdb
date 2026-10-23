@@ -328,34 +328,30 @@ def test_dropped_connection_mid_transaction_rolls_back(plain):
         assert b._wire.call("table_info", ["emp"])["deleted"] == []
 
 
-def test_other_connections_wait_then_see_commit(plain):
+def test_readers_do_not_wait_for_a_foreign_transaction_and_see_the_commit_after(plain):
     a, b = plain.connect(), plain.connect()
     a.execute("CREATE TABLE t (x INT PLAIN)")
     a.begin()
     a.execute("INSERT INTO t (x) VALUES (1)")
-    seen = {}
-
-    def reader():
-        seen["info"] = b._wire.call("table_info", ["t"])   # blocks until commit
-    th = threading.Thread(target=reader)
-    th.start()
-    time.sleep(0.3)
-    assert th.is_alive()                           # b is waiting on a's tx
+    t0 = time.monotonic()
+    assert b._wire.call("table_info", ["t"])["rows"] == 0      # last committed state, no wait
+    assert time.monotonic() - t0 < 1.0
     a.commit()
-    th.join(timeout=5)
-    assert seen["info"]["rows"] == 1
+    assert b._wire.call("table_info", ["t"])["rows"] == 1
     a.close(); b.close()
 
 
-def test_waiting_for_transaction_times_out_with_busy():
+def test_writers_wait_for_a_foreign_transaction_then_get_busy():
     s = Running(tx_wait=0.4)
     try:
         a, b = s.connect(), s.connect()
         a.execute("CREATE TABLE t (x INT PLAIN)")
+        b.sync_schema()
         a.begin()
         with pytest.raises(ServerBusyError):
-            b._wire.call("table_info", ["t"])
+            b.execute("INSERT INTO t (x) VALUES (1)")
         a.rollback()
+        b.execute("INSERT INTO t (x) VALUES (1)")                # free again
         a.close(); b.close()
     finally:
         s.stop()

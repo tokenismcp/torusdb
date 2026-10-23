@@ -11,6 +11,24 @@ Versioning: [Versioning Policy](docs/versioning.md).
 Hardening release: SQL joins completed, server and drivers made operable, a
 cryptographic self-audit, and the open repository made self-contained.
 
+### Added — replication, snapshot reads, pooling (late 0.5.0)
+
+- **Replication** (`docs/replication.md`): asynchronous WAL shipping, read-only
+  hot standbys (`--replica-of`), snapshot bootstrap, `repl_status`, manual
+  `promote` with timelines and cluster ids.
+- **Snapshot reads:** readers no longer wait for (or see) another session's open
+  write transaction; they read the last committed state.
+- **Thread-safe `Connection`** (DB-API threadsafety 2) and `torussql.pool.ConnectionPool`.
+
+### Added — disk storage engine and indexes (late 0.5.0)
+
+- `--storage disk`: rows in checksummed append-only heap files with an LRU row
+  cache; data sets larger than RAM; crash-safe with the existing journal;
+  automatic compaction. Details: `docs/storage.md`.
+- `CREATE INDEX ON t (col)` / `DROP INDEX ON t (col)` on PLAIN columns (parser,
+  validator, planner, server RPCs `create_index` / `drop_index`, `table_info.indexes`).
+- `tests/test_storage.py`, `bench/storage_bench.py`.
+
 ### Changed — fully open source (late 0.5.0)
 
 - **`torusdb-core`** (`core/`, Apache-2.0): the keyless engine (planner, blinding

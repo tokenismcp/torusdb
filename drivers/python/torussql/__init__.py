@@ -50,7 +50,7 @@ def __dir__():
 # ── PEP 249 §3 module-level attributes ───────────────────────────────────────
 
 apilevel     = "2.0"     # supports DB-API 2.0
-threadsafety = 1         # threads may share the module but NOT connections
+threadsafety = 2         # threads may share the module and connections (statements are serialized)
 paramstyle   = "format"  # %s positional substitution
 
 __version__ = "0.5.0"

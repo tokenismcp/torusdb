@@ -31,6 +31,7 @@ from .protocol import Owner, Server, decode, encode, gen_triple
 
 from .errors import ExecError, IntegrityError, PlanError
 from .maskstore import DictMaskStore, MaskStore
+from .store import MemoryStorage, StoreView, TableStore, TxOverlay
 from .parser import parse
 from .planner import (
     PAvg, PColRef, PCondition, PCountStar, PCtMul, PDot, PInList, PMax, PMin,
@@ -79,27 +80,39 @@ def _match(row: dict, where) -> bool:
 # ── The untrusted server: blinded scalars + plaintext columns, NO keys ───────
 class NoKeyServer:
     """Holds schema, plaintext columns, and blinded scalars for encrypted
-    columns. No secret key, no public key, no masks, no decode — ever."""
+    columns. No secret key, no public key, no masks, no decode — ever.
 
-    def __init__(self) -> None:
+    Rows live in per-table stores (:mod:`torusdb_core.store`): in memory by
+    default, or in heap files on disk (``storage=DiskStorage(dir)``)."""
+
+    def __init__(self, storage=None) -> None:
+        self._storage = storage or MemoryStorage()
         self._schema: dict[str, list[tuple[str, str, str]]] = {}
-        self._rows: dict[str, list[dict]] = {}
-        # tombstones: rowids stay stable (mask-vault keys never shift) — DELETE
-        # logically removes rows by marking them, never reindexing.
-        self._deleted: dict[str, set[int]] = {}
+        # table -> TableStore. Row ids are stable: DELETE marks a slot dead and
+        # never reindexes (mask-vault keys must not shift).
+        self._rows: dict[str, TableStore] = {}
 
     # — catalog / storage (server sees plaintext cols + blinded scalars) —
     def create(self, table: str, columns: list[tuple[str, str, str]]) -> None:
         if table in self._schema:
             raise PlanError(f"table {table!r} already exists")
         self._schema[table] = columns
-        self._rows[table] = []
-        self._deleted[table] = set()
+        self._rows[table] = self._storage.new_table(table)
 
-    def drop(self, table: str) -> None:
-        self._schema.pop(table, None)
-        self._rows.pop(table, None)
-        self._deleted.pop(table, None)
+    def drop(self, table: str):
+        """Remove a table. Returns what :meth:`undrop` needs to bring it back."""
+        saved = (self._schema.pop(table, None), self._rows.pop(table, None))
+        meta = None
+        if saved[1] is not None and getattr(self._storage, "paged", False):
+            meta = self._storage.forget(table, saved[1])
+        return saved + (meta,)
+
+    def undrop(self, table: str, saved) -> None:
+        schema, store, meta = saved
+        if schema is not None:
+            self._schema[table], self._rows[table] = schema, store
+            if getattr(self._storage, "paged", False):
+                self._storage.restore(table, store, meta)
 
     def tables(self) -> list[str]:
         return sorted(self._schema)
@@ -110,57 +123,70 @@ class NoKeyServer:
         return self._schema[table]
 
     def insert(self, table: str, row: dict) -> int:
-        self._rows[table].append(row)
-        return len(self._rows[table]) - 1            # rowid
+        return self._rows[table].append(row)             # rowid
 
     def insert_many(self, table: str, rows: list[dict]) -> list[int]:
-        start = len(self._rows[table])
-        self._rows[table].extend(rows)
-        return list(range(start, start + len(rows)))
+        return self._rows[table].append_many(rows)
 
     def update_cell(self, table: str, idx: int, col: str, value) -> None:
-        self._rows[table][idx][col] = value
+        self._rows[table].set_cell(idx, col, value)
 
     def delete_rows(self, table: str, idxs: list[int]) -> int:
-        live = [i for i in idxs if i not in self._deleted[table]]
-        self._deleted[table].update(live)
-        return len(live)
+        return len(self._rows[table].kill(idxs))
+
+    def create_index(self, table: str, col: str) -> None:
+        cols = {c[0]: c for c in self.schema(table)}
+        if col not in cols:
+            raise PlanError(f"no such column: {col}")
+        if cols[col][2] != "plain":
+            raise PlanError(f"cannot index {col!r}: only PLAIN columns can be indexed")
+        self._rows[table].create_index(col)
+
+    def drop_index(self, table: str, col: str) -> None:
+        self.schema(table)
+        self._rows[table].drop_index(col)
+
+    def indexes(self, table: str) -> list[str]:
+        self.schema(table)
+        return self._rows[table].indexed_columns
 
     # — selection over the PLAINTEXT predicate (encrypted cols never tested) —
     def matching_rowids(self, table: str, where) -> list[int]:
-        rows = self._rows[table]
-        dead = self._deleted.get(table, set())
-        live = (i for i in range(len(rows)) if i not in dead)
+        store = self._rows[table]
         if where is None:
-            return list(live)
-        return [i for i in live if _match(rows[i], where)]
+            return list(store.live_ids())
+        groups = [[(a.column, "in", list(a.values)) if isinstance(a, PInList)
+                   else (a.column, _NORM_OP.get(a.op, ""), a.value) for a in g]
+                  for g in where.or_terms]
+        cand = store.candidates(groups)
+        ids = cand if cand is not None else store.live_ids()
+        return [i for i in ids if not store.is_dead(i) and _match(store.row(i), where)]
 
     def plain_cells(self, table: str, col: str, idxs: list[int]) -> list[Any]:
-        rows = self._rows[table]
+        store = self._rows[table]
         if col == "__cid__" or col.startswith("__mv__"):
             # owner bookkeeping columns may be absent on rows written by another
             # mask store; report None instead of failing the whole read
-            return [rows[i].get(col) for i in idxs]
-        return [rows[i][col] for i in idxs]
+            return [store.cell(i, col, None) for i in idxs]
+        return store.cells(col, idxs)
 
     def blinded_cell(self, table: str, col: str, idx: int) -> int:
-        return self._rows[table][idx][col]
+        return self._rows[table].row(idx)[col]
 
     def blinded_cells(self, table: str, col: str, idxs: list[int]) -> list[int]:
-        rows = self._rows[table]
-        return [rows[i][col] for i in idxs]
+        return self._rows[table].cells(col, idxs)
 
     # — Π_lin (Construction 16, step 2): affine form on blinded scalars —
     def blinded_sum(self, table: str, col: str, idxs: list[int]) -> int:
-        return sum(self._rows[table][i][col] for i in idxs) % N
+        return sum(self._rows[table].cells(col, idxs)) % N
 
     def blinded_scaled_sum(self, table: str, col: str, idxs: list[int],
                            k: int) -> int:
-        return k * sum(self._rows[table][i][col] for i in idxs) % N
+        return k * sum(self._rows[table].cells(col, idxs)) % N
 
     def blinded_per_row_scaled(self, table: str, col: str, idxs: list[int],
                                k: int) -> list[int]:
-        return [k * self._rows[table][i][col] % N for i in idxs]
+        return [k * v % N for v in self._rows[table].cells(col, idxs)]
 
     # — Π_mult (Construction 18, step 2): combine opened operands —
     @staticmethod
@@ -169,23 +195,69 @@ class NoKeyServer:
 
     # — durable storage of the (keyless) blinded database ——————————————
     def to_body(self) -> dict:
-        """JSON-safe image of the whole database (no keys, no masks)."""
+        """JSON-safe LOGICAL image of the whole database (no keys, no masks).
+        Works for every storage back end; used for backups and migration."""
         return {"schema": {t: [list(c) for c in cols]
                            for t, cols in self._schema.items()},
-                "rows": {t: [{k: _pv(v) for k, v in row.items()} for row in rows]
-                         for t, rows in self._rows.items()},
-                "deleted": {t: sorted(s) for t, s in self._deleted.items()}}
+                "rows": {t: [{k: _pv(v) for k, v in store.row(i).items()}
+                             for i in range(len(store))]
+                         for t, store in self._rows.items()},
+                "deleted": {t: store.dead_ids() for t, store in self._rows.items()},
+                "indexes": {t: store.indexed_columns for t, store in self._rows.items()
+                            if store.indexed_columns}}
+
+    def checkpoint_body(self, gen: int) -> dict:
+        """Snapshot body for generation ``gen``. For disk storage this flushes the
+        heaps and writes slot tables, returning a small manifest; the caller must
+        call :meth:`checkpoint_done` once the manifest is durably in place."""
+        if not getattr(self._storage, "paged", False):
+            return self.to_body()
+        tables = {}
+        for t in list(self._rows):
+            self._rows[t], tables[t] = self._storage.checkpoint_table(t, self._rows[t], gen)
+        self._manifest_tables = tables
+        return {"paged": 1, "next_fid": self._storage.next_fid,
+                "schema": {t: [list(c) for c in cols] for t, cols in self._schema.items()},
+                "tables": tables}
+
+    def checkpoint_done(self) -> None:
+        if getattr(self._storage, "paged", False):
+            self._storage.collect(self._manifest_tables)
+
+    def stats(self) -> dict:
+        return {t: {"rows": len(s), "deleted": s.dead_count(), "indexes": s.indexed_columns}
+                for t, s in self._rows.items()}
+
+    def close(self) -> None:
+        for s in self._rows.values():
+            s.close()
+        self._storage.close()
 
     @classmethod
-    def from_body(cls, snap: dict) -> "NoKeyServer":
-        srv = cls()
-        srv._schema = {t: [tuple(c) for c in cols]
-                       for t, cols in snap["schema"].items()}
-        srv._rows = {t: [{k: _upv(v) for k, v in row.items()} for row in rows]
-                     for t, rows in snap["rows"].items()}
-        srv._deleted = {t: set(v) for t, v in snap.get("deleted", {}).items()}
-        for t in srv._schema:
-            srv._deleted.setdefault(t, set())
+    def from_body(cls, snap: dict, storage=None) -> "NoKeyServer":
+        paged_snap = bool(snap.get("paged"))
+        if paged_snap and not (storage is not None and getattr(storage, "paged", False)):
+            raise ValueError("this snapshot is a disk-storage manifest; open it with "
+                             "DiskStorage (or restore a logical backup)")
+        srv = cls(storage)
+        srv._schema = {t: [tuple(c) for c in cols] for t, cols in snap["schema"].items()}
+        if paged_snap:
+            storage.next_fid = max(storage.next_fid, snap.get("next_fid", 1))
+            for t, entry in snap["tables"].items():
+                store = storage.open_table(t, entry)
+                for col in entry.get("indexes", []):
+                    store.create_index(col)
+                srv._rows[t] = store
+            srv._manifest_tables = dict(snap["tables"])
+            storage.collect(srv._manifest_tables)          # drop crash leftovers
+            return srv
+        for t in srv._schema:                               # logical image: import
+            store = srv._rows[t] = storage.new_table(t) if storage else MemoryStorage().new_table(t)
+            for row in snap["rows"].get(t, []):
+                store.append({k: _upv(v) for k, v in row.items()})
+            store.kill(snap.get("deleted", {}).get(t, []))
+            for col in snap.get("indexes", {}).get(t, []):
+                store.create_index(col)
         return srv
 
     def save(self, path: str) -> None:
@@ -198,6 +270,31 @@ class NoKeyServer:
         import json
         with open(path, "r", encoding="utf-8") as f:
             return cls.from_body(json.load(f))
+
+
+class CommittedView(NoKeyServer):
+    """Read-only :class:`NoKeyServer` showing the last committed state while a
+    write transaction (described by ``ov``) is open."""
+
+    def __init__(self, srv: NoKeyServer, ov: TxOverlay) -> None:
+        self._storage = srv._storage
+        self._schema, self._rows = {}, {}
+        for t, cols in srv._schema.items():
+            if t in ov.created and t not in ov.dropped:
+                continue
+            if t in ov.dropped:                    # dropped then re-created in the tx
+                cols, store = ov.dropped[t]
+            else:
+                store = srv._rows[t]
+            self._schema[t] = cols
+            self._rows[t] = StoreView(t, store, ov)
+        for t, (cols, store) in ov.dropped.items():
+            if t not in self._schema and cols is not None:
+                self._schema[t] = cols
+                self._rows[t] = StoreView(t, store, ov)
+
+
+_NORM_OP = {"=": "=", "==": "=", "<": "<", "<=": "<=", ">": ">", ">=": ">="}
 
 
 # ── The owner/client: masks + encode/decode, drives the protocol ─────────────
@@ -258,6 +355,12 @@ class NoKeyClient:
         if plan.kind == "drop":
             self.server.drop(plan.table)
             self._forget_table(plan.table)
+            return 0
+        if plan.kind == "create_index":
+            self.server.create_index(plan.table, plan.raw.column)
+            return 0
+        if plan.kind == "drop_index":
+            self.server.drop_index(plan.table, plan.raw.column)
             return 0
         if plan.kind == "insert":
             return self._insert(plan)

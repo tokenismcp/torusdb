@@ -258,6 +258,12 @@ class RemoteNoKeyServer:
     def drop(self, table):
         self._c.call("drop", [table])
 
+    def create_index(self, table, col):
+        self._c.call("create_index", [table, col])
+
+    def drop_index(self, table, col):
+        self._c.call("drop_index", [table, col])
+
     def schema(self, table):
         return [tuple(c) for c in self._c.call("schema", [table])]
 
@@ -517,6 +523,18 @@ class Cursor:
             self.rowcount = result if isinstance(result, int) else -1
 
 
+def _synchronized(fn):
+    """Serialize a Connection method (the connection is shared between threads
+    — DB-API threadsafety 2 — but one statement runs at a time)."""
+    import functools
+
+    @functools.wraps(fn)
+    def wrapper(self, *a, **kw):
+        with self._mutex:
+            return fn(self, *a, **kw)
+    return wrapper
+
+
 # ── DB-API 2.0 Connection ────────────────────────────────────────────────────
 
 class Connection:
@@ -565,6 +583,7 @@ class Connection:
         self._host, self._port = host, port
         self._wire = _Conn(host, port, **self._wire_args)
         self._trust_server_schema = trust_server_schema
+        self._mutex = threading.RLock()
         self._closed = False
         self._in_tx = False
         self._txid: str | None = None
@@ -628,16 +647,19 @@ class Connection:
         self._check_open()
         return Cursor(self)
 
+    @_synchronized
     def commit(self) -> None:
         self._check_open()
         if self._in_tx:
             self._end_tx(commit=True)
 
+    @_synchronized
     def rollback(self) -> None:
         self._check_open()
         if self._in_tx:
             self._end_tx(commit=False)
 
+    @_synchronized
     def close(self) -> None:
         if self._closed:
             return
@@ -654,6 +676,7 @@ class Connection:
         if self._closed:
             raise InterfaceError("connection is closed")
 
+    @_synchronized
     def sync_schema(self) -> list[str]:
         """Learn tables that exist on the server but not in this client yet
         (e.g. a second reader, or a fresh vault). Only the schema is fetched —
@@ -683,6 +706,7 @@ class Connection:
     def in_transaction(self) -> bool:
         return self._in_tx
 
+    @_synchronized
     def begin(self) -> None:
         self._check_open()
         if self._in_tx:
@@ -702,6 +726,7 @@ class Connection:
             self._in_tx, self._txid, self._tx_failed = False, None, None
             self._vault.tx_rollback(self.client)
 
+    @_synchronized
     def _end_tx(self, *, commit: bool) -> None:
         txid = self._txid
         if commit and self._tx_failed:
@@ -788,6 +813,7 @@ class Connection:
         except Exception:                                            # noqa: BLE001
             return ""                      # the engine will raise the proper error
 
+    @_synchronized
     def _run(self, sql: str):
         self._check_open()
         if self._in_tx and self._tx_failed:
@@ -835,6 +861,7 @@ class Connection:
             # only be rolled back from here
             self._tx_failed = f"{type(exc).__name__}: {str(exc)[:120]}"
 
+    @_synchronized
     def _run_insert_many(self, sqls: list[str]) -> int:
         self._check_open()
         if self._in_tx and self._tx_failed:
@@ -896,6 +923,7 @@ class Connection:
             raise ProgrammingError("finish the transaction first")
         self._vault.rebase(self.client)
 
+    @_synchronized
     def reseal_vault(self, *, custody=None, vault_passphrase: str | None = None) -> None:
         """Move the vault to a different protection: ``custody=`` (threshold key)
         or ``vault_passphrase=`` (or neither, for an unsealed file). Use it to
@@ -906,6 +934,7 @@ class Connection:
             raise ProgrammingError("finish the transaction first")
         self._vault.reseal(self.client, custody=custody, passphrase=vault_passphrase)
 
+    @_synchronized
     def find_orphans(self) -> dict[str, list[int]]:
         """Rows whose masks cannot be recovered (a crash between the server
         accepting a write and the masks being durable — or a different vault).
@@ -947,6 +976,7 @@ class Connection:
         return n
 
     # — threshold mask cluster maintenance (mask_cluster= connections) —
+    @_synchronized
     def mask_gc(self, **kw) -> dict:
         """Delete masks no committed row refers to (needs ``mask_admin``)."""
         self._check_open()
@@ -969,17 +999,25 @@ class _TxContext:
         self._conn = conn
 
     def __enter__(self) -> Connection:
-        self._conn.begin()
+        self._conn._mutex.acquire()           # other threads wait out the transaction
+        try:
+            self._conn.begin()
+        except BaseException:
+            self._conn._mutex.release()
+            raise
         return self._conn
 
     def __exit__(self, exc_type, exc, tb) -> None:
-        if exc_type is None:
-            self._conn.commit()
-        else:
-            try:
-                self._conn.rollback()
-            except Error:
-                pass
+        try:
+            if exc_type is None:
+                self._conn.commit()
+            else:
+                try:
+                    self._conn.rollback()
+                except Error:
+                    pass
+        finally:
+            self._conn._mutex.release()
 
 
 # ── module-level constructor ──────────────────────────────────────────────────
