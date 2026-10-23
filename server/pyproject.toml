@@ -22,6 +22,9 @@ classifiers = [
 # torussql supplies the wire codec/framing; torusdb-core the keyless engine.
 dependencies = ["torussql==0.5.0", "torusdb-core==0.5.0"]
 
+[project.optional-dependencies]
+fhe = ["torusdb-core[fhe]==0.5.0"]
+
 [project.scripts]
 torusdb-server = "nokey_server:main"
 

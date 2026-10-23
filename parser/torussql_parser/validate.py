@@ -160,6 +160,8 @@ class Schema:
             if n in seen:
                 raise ValidationError(f"duplicate column {n!r}")
             seen.add(n)
+            if p == "fhe" and t != "int":
+                raise ValidationError(f"FHE columns must be INT (column {n!r})")
             # string columns can't be encrypted in v0.1 (spec §2.2)
             if p != "plain" and t == "str":
                 raise ValidationError(
@@ -312,20 +314,23 @@ class Schema:
             return                              # COUNT(*) is always valid
 
         if isinstance(proj, ColRef):
-            scope.resolve(proj.name, "projection")
+            _i, col = scope.resolve(proj.name, "projection")
+            _no_fhe_in_join(scope, col)
 
         elif isinstance(proj, SumExpr):
             _i, col = scope.resolve(proj.column, "SUM")
             if col.policy == "plain":
                 raise ValidationError(
-                    f"SUM requires an ENC/PAIRED column, got PLAIN "
+                    f"SUM requires an ENC/PAIRED/FHE column, got PLAIN "
                     f"(column {col.name!r})")
+            _no_fhe_in_join(scope, col)
 
         elif isinstance(proj, AvgExpr):
             _i, col = scope.resolve(proj.column, "AVG")
             if col.type == "str":
                 raise ValidationError(
                     f"AVG requires a numeric column (column {col.name!r} is str)")
+            _no_fhe_in_join(scope, col)
 
         elif isinstance(proj, (MinExpr, MaxExpr)):
             fn = "MIN" if isinstance(proj, MinExpr) else "MAX"
@@ -348,6 +353,9 @@ class Schema:
                 raise ValidationError(
                     f"k * col requires an ENC/PAIRED column, got PLAIN "
                     f"(column {col.name!r})")
+            if col.policy == "fhe":
+                raise ValidationError(
+                    f"k * col is not supported on FHE columns (column {col.name!r})")
 
         elif isinstance(proj, CtMulExpr):
             _i, a = scope.resolve(proj.left, "col * col")
@@ -360,10 +368,17 @@ class Schema:
         elif isinstance(proj, DotExpr):
             _i, a = scope.resolve(proj.left, "DOT")
             _j, b = scope.resolve(proj.right, "DOT")
+            if a.policy == "fhe" and b.policy == "fhe":
+                _no_fhe_in_join(scope, a)
+                return
+            if a.policy == "fhe" or b.policy == "fhe":
+                raise ValidationError(
+                    "DOT cannot mix FHE and PAIRED columns — use two FHE columns "
+                    "or two PAIRED columns")
             if a.policy != "paired" or b.policy != "paired":
                 bad = a.name if a.policy != "paired" else b.name
                 raise ValidationError(
-                    f"DOT requires PAIRED columns (column {bad!r})")
+                    f"DOT requires PAIRED or FHE columns (column {bad!r})")
             # v0.1: DOT is INT-only — rational inner products collapse the
             # denominator under aggregation (spec §4.5).
             if a.type != "int" or b.type != "int":
@@ -375,6 +390,12 @@ class Schema:
 
         else:
             raise ValidationError(f"unsupported projection: {proj}")
+
+
+def _no_fhe_in_join(scope, col) -> None:
+    if col.policy == "fhe" and len(scope.instances) > 1:
+        raise ValidationError(
+            f"FHE column {col.name!r} cannot be used in a join query yet")
 
 
 class _Scope:

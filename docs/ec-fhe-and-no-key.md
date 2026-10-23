@@ -7,22 +7,21 @@ them (`Π_lin`) and combines owner-opened Beaver openings (`Π_mult`), and holds
 key, no bootstrap key and no mask**. Everything that decrypts happens in the data
 owner's process.
 
-## Why there is no server-side EC-FHE evaluation mode
+## Server-side evaluation: `FHE` columns
 
-We looked at adding a per-column "evaluate on EC-FHE ciphertexts at the server"
-back end. In the EC-FHE reference engine the two evaluation paths are:
+An earlier version of this page said a server-side evaluation mode would add nothing without
+server-held keys. That was wrong for the *pairing* path. The reference engine's default
+evaluator (`bootstrap_assisted`) does need a bootstrap key at the evaluator, and its
+`ct_native` path assumes a co-located secret-key holder — both rejected here. But the
+pairing step itself (`★_ct`, BGN-style) uses **only public ciphertext data**, so the server
+can add and multiply ciphertexts and the owner decrypts the aggregate. That is implemented
+as the `FHE` column policy — see [`fhe-columns.md`](fhe-columns.md) — with a layout that fixes a
+weakness we found in shared-randomness paired ciphertexts (a public-key value oracle).
 
-| path | what the evaluator needs | consequence |
-|---|---|---|
-| `bootstrap_assisted` (default) | the bootstrap key; every operation partially decrypts, computes on the rational, re-encrypts | exactly the *decrypt-then-re-encrypt at the server* structure this project forbids |
-| `ct_native` (pairing ★_ct) | "a secret-key holder co-located with the evaluator"; the ★_ct adapter is not yet implemented | a secret key at the server |
-
-Homomorphic *addition* alone stays in G1 without a key — but sums are already served
-by `Π_lin`, with unconditional (information-theoretic) hiding and no elliptic-curve
-work at the server. So under the rule "the server never holds key material" an
-EC-FHE evaluation back end would add no capability, and with the rule relaxed it would
-re-introduce the very trust assumption the no-key protocol removes. For that reason
-it is **not built**; this is a design decision, not an omission.
+Which mode to use: `ENC`/`PAIRED` for information-theoretic confidentiality, MAC integrity and
+speed, at the price of a mask vault and owner-side multiplication; `FHE` when you need the
+server to compute products/inner products without owner state, accepting computational
+security, no integrity yet, and slow pairings.
 
 ## What an "EC-FHE DBMS" means here
 
@@ -32,12 +31,3 @@ it is **not built**; this is a design decision, not an omission.
   (`I(M; V_S) = 0`), with the leakage listed in `threat-model.md` (plaintext columns,
   schema, row counts, access patterns);
 * integrity against a lying server is opt-in (`authenticated=True`, SPDZ-style MACs).
-
-## If you want server-side evaluation anyway
-
-It must be a separate, clearly labelled mode with its own threat model: the server
-(or a TEE / separate evaluator service) would hold evaluation key material, and a
-compromise of it would break confidentiality of those columns. It would need a column
-policy distinct from `ENC`/`PAIRED`, a planner extension, new RPCs and an explicit
-opt-in at table creation. Nothing in the open tree prevents that, but it should be
-a deliberate product decision rather than a default.

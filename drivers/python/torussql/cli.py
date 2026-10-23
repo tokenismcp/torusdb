@@ -164,6 +164,12 @@ def _parser() -> argparse.ArgumentParser:
     ap.add_argument("--trust-server-schema", action="store_true",
                     help="allow writes to tables whose schema was learned from the server")
     ap.add_argument("--authenticated", action="store_true", help="enable integrity MACs")
+    ap.add_argument("--fhe-key", metavar="PATH", help="FHE key file (for FHE columns)")
+    ap.add_argument("--fhe-pass-env", metavar="VAR", help="env var with the FHE key passphrase")
+    ap.add_argument("--fhe-keygen", metavar="PATH",
+                    help="create a new FHE key file at PATH and exit (see --fhe-range)")
+    ap.add_argument("--fhe-range", type=int, default=1_000_000,
+                    help="largest |value| / result the key can decrypt (default 1000000)")
     ap.add_argument("-c", "--command", action="append", metavar="SQL")
     ap.add_argument("-f", "--file", metavar="PATH")
     ap.add_argument("--timing", action="store_true")
@@ -174,6 +180,29 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv=None) -> int:
     a = _parser().parse_args(argv)
+    fhe_pass = os.environ.get(a.fhe_pass_env) if a.fhe_pass_env else None
+    if a.fhe_pass_env and not fhe_pass:
+        print(f"error: ${a.fhe_pass_env} is not set", file=sys.stderr)
+        return 2
+    if a.fhe_keygen:
+        from torusdb_core import fhe
+        if os.path.exists(a.fhe_keygen):
+            print(f"error: {a.fhe_keygen} already exists", file=sys.stderr)
+            return 2
+        if not fhe_pass:
+            print("warning: no --fhe-pass-env; the key file will NOT be encrypted", file=sys.stderr)
+        fhe.save_key(fhe.FheKey(value_range=a.fhe_range), a.fhe_keygen, fhe_pass)
+        print(f"FHE key written to {a.fhe_keygen} (range ±{a.fhe_range}) — back it up: "
+              f"without it FHE columns cannot be read")
+        return 0
+    fhe_key = None
+    if a.fhe_key:
+        from torusdb_core import fhe
+        try:
+            fhe_key = fhe.load_key(a.fhe_key, fhe_pass)
+        except (OSError, ValueError) as exc:
+            print(f"error: cannot load the FHE key: {exc}", file=sys.stderr)
+            return 2
     token = os.environ.get(a.token_env) if a.token_env else None
     if a.token_env and not token:
         print(f"error: ${a.token_env} is not set", file=sys.stderr)
@@ -189,7 +218,7 @@ def main(argv=None) -> int:
                              tls_insecure=a.tls_insecure, token=token,
                              vault_path=a.vault, vault_passphrase=passphrase,
                              authenticated=a.authenticated,
-                             trust_server_schema=a.trust_server_schema)
+                             trust_server_schema=a.trust_server_schema, fhe_key=fhe_key)
     except Exception as exc:                                    # noqa: BLE001
         print(f"torussql: could not connect to {a.host}:{a.port}: {exc}", file=sys.stderr)
         return 1

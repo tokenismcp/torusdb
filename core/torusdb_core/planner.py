@@ -55,6 +55,7 @@ class PSum:
 class PDot:
     left: str
     right: str
+    fhe: bool = False        # both columns are FHE: evaluated by the server on ciphertexts
 
 
 @dataclass
@@ -234,6 +235,9 @@ def _plan_create(q: CreateTable, cat: Catalog) -> Plan:
     reject exactly what the dialect rejects."""
     if q.name.startswith("__"):
         raise PlanError(f"table names starting with '__' are reserved ({q.name!r})")
+    for (n_, t_, p_) in q.columns:
+        if p_ == "fhe" and t_ != "int":
+            raise PlanError(f"FHE columns must be INT (column {n_!r})")
     if q.name in cat.tables:
         if q.if_not_exists:
             return Plan(kind="noop", raw=q, table=q.name)
@@ -286,6 +290,11 @@ def _plan_where(q_where, scope: "_Scope", qualify: bool) -> "PWhere | None":
                                         value=atom.value))
         or_terms.append(atoms)
     return PWhere(or_terms=or_terms)
+
+
+def _no_fhe_in_join(is_join: bool, col) -> None:
+    if is_join and col.policy == "fhe":
+        raise PlanError(f"FHE column {col.name!r} cannot be used in a join query yet")
 
 
 def _single_scope(cat: Catalog, table: str) -> "_Scope":
@@ -382,20 +391,29 @@ def _plan_select(q: Select, cat: Catalog) -> Plan:
     if q.star:
         for inst, tname in instances.items():
             for c in cat.get(tname).columns:
+                _no_fhe_in_join(is_join, c)
                 projs.append(PColRef(name=qn(inst, c.name), policy=c.policy))
     else:
         for proj in q.projections:
             if isinstance(proj, ColRef):
                 qname, col = _rcol(proj.name)
+                _no_fhe_in_join(is_join, col)
                 projs.append(PColRef(name=qname, policy=col.policy))
             elif isinstance(proj, SumExpr):
                 qname, col = _rcol(proj.column)
                 if col.policy == "plain":
-                    raise PlanError(f"SUM requires encrypted/paired column, got plain (column {col.name!r})")
+                    raise PlanError(f"SUM requires encrypted/paired/fhe column, got plain (column {col.name!r})")
+                _no_fhe_in_join(is_join, col)
                 projs.append(PSum(column=qname, policy=col.policy))
             elif isinstance(proj, DotExpr):
                 qname_a, a = _rcol(proj.left)
                 qname_b, b = _rcol(proj.right)
+                if a.policy == "fhe" and b.policy == "fhe":
+                    _no_fhe_in_join(is_join, a)
+                    projs.append(PDot(left=qname_a, right=qname_b, fhe=True))
+                    continue
+                if a.policy == "fhe" or b.policy == "fhe":
+                    raise PlanError("DOT cannot mix FHE and PAIRED columns")
                 if a.policy != "paired":
                     raise PlanError(f"DOT requires `paired` policy on column {a.name!r} (need both G1 & G2 sides)")
                 if b.policy != "paired":
@@ -430,6 +448,8 @@ def _plan_select(q: Select, cat: Catalog) -> Plan:
                 qname, col = _rcol(proj.column)
                 if col.policy == "plain":
                     raise PlanError(f"k*col requires encrypted/paired, got plain (column {col.name!r})")
+                if col.policy == "fhe":
+                    raise PlanError(f"k*col is not supported on FHE columns (column {col.name!r})")
                 projs.append(PScalarMul(scalar=proj.scalar, column=qname,
                                         policy=col.policy))
             elif isinstance(proj, ScaledSumExpr):
@@ -438,6 +458,8 @@ def _plan_select(q: Select, cat: Catalog) -> Plan:
                 qname, col = _rcol(proj.column)
                 if col.policy == "plain":
                     raise PlanError(f"k*SUM(col) requires encrypted/paired, got plain (column {col.name!r})")
+                if col.policy == "fhe":
+                    raise PlanError(f"k*SUM(col) is not supported on FHE columns (column {col.name!r})")
                 projs.append(PScaledSum(scalar=proj.scalar, column=qname,
                                         policy=col.policy))
             elif isinstance(proj, CountStar):
@@ -447,6 +469,7 @@ def _plan_select(q: Select, cat: Catalog) -> Plan:
                 if col.type == "str":
                     raise PlanError(f"AVG requires a numeric column "
                                     f"(column {col.name!r} is str)")
+                _no_fhe_in_join(is_join, col)
                 projs.append(PAvg(column=qname, policy=col.policy))
             elif isinstance(proj, (MinExpr, MaxExpr)):
                 qname, col = _rcol(proj.column)

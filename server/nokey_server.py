@@ -79,7 +79,7 @@ log = logging.getLogger("torusdb.server")
 READ_RPCS = frozenset({
     "schema", "tables", "table_info", "matching_rowids", "plain_cells", "blinded_cell",
     "blinded_cells", "blinded_sum", "blinded_scaled_sum",
-    "blinded_per_row_scaled", "mult_combine_batch",
+    "blinded_per_row_scaled", "mult_combine_batch", "fhe_sum", "fhe_dot",
 })
 WRITE_RPCS = frozenset({
     "create", "insert", "insert_many", "update_cell", "delete_rows",
@@ -131,6 +131,8 @@ class ServerConfig:
     max_items: int = 200_000          # longest id/opening list accepted in one request
     auth_deadline: float = 10.0       # seconds an unauthenticated peer may stay connected
     pre_auth_frame: int = 8192        # largest frame accepted before authentication
+    fhe_max_sum_rows: int = 5000      # rows per fhe_sum call
+    fhe_max_dot_rows: int = 300       # rows per fhe_dot call (pairings are slow)
     tx_ring: int = 100_000            # committed transaction ids remembered
     storage: str = "memory"           # "memory" | "disk" (heap files in <db>.data/)
     cache_rows: int = 50_000          # disk storage: decoded rows cached per table
@@ -141,6 +143,15 @@ class ServerConfig:
     sync_replicas: int = 0            # commits wait for this many replicas to confirm
     sync_timeout: float = 10.0        # ... at most this long
     sync_strict: bool = False         # on timeout: error (commit stays) instead of degrading
+
+
+def repl_fhe():
+    from torusdb_core import fhe
+    return fhe
+
+
+def _b64e(raw: bytes) -> str:
+    return base64.b64encode(raw).decode("ascii")
 
 
 def _ring_rec(ops: list, tx: str | None) -> dict:
@@ -866,14 +877,21 @@ class Engine:
                     if self._tx_owner not in (None, s.id) and self._overlay is not None:
                         live, self.srv = self.srv, CommittedView(self.srv, self._overlay)
                         try:
-                            return self._call(method, args)
+                            res = self._call(method, args)
                         finally:
                             self.srv = live
-                    if self._tx_owner in (None, s.id):
+                    elif self._tx_owner in (None, s.id):
                         if self._tx_owner == s.id:
                             self._tx_last = time.monotonic()
-                        return self._call(method, args)
-                continue                               # raced with a new tx; retry
+                        res = self._call(method, args)
+                    else:
+                        continue
+                if callable(res):                           # heavy math runs without the lock
+                    try:
+                        return res()
+                    except ValueError as exc:               # invalid ciphertext bytes
+                        raise BadRequest(f"invalid FHE ciphertext: {exc}") from None
+                return res                               # raced with a new tx; retry
             with self._cv:                             # writers wait out a foreign tx
                 self._check_timed_out(s)
                 while self._tx_owner not in (None, s.id):
@@ -1047,8 +1065,10 @@ class Engine:
         if any(n.startswith("__") for n in names) or table.startswith("__"):
             raise BadRequest("names starting with '__' are reserved")
         for n, t, pol in columns:
-            if t not in ("int", "str", "rational") or pol not in ("plain", "encrypted", "paired"):
+            if t not in ("int", "str", "rational") or pol not in ("plain", "encrypted", "paired", "fhe"):
                 raise BadRequest(f"bad column definition for {n!r}")
+            if pol == "fhe" and t != "int":
+                raise BadRequest(f"FHE columns must be INT (column {n!r})")
             if t == "str" and pol != "plain":
                 raise BadRequest(f"STR columns must be PLAIN (column {n!r})")
         self.srv.create(table, [tuple(c) for c in columns]); return None
@@ -1096,6 +1116,8 @@ class Engine:
         if keys - macs - hidden != names:
             raise BadRequest("INSERT must provide exactly the table's columns")
         row = {k: w.uwv(v) for k, v in row_wire.items()}
+        for k, v in row.items():
+            self._check_cell(table, k, v)
         if "__cid__" in row and not (isinstance(row["__cid__"], str)
                                      and 0 < len(row["__cid__"]) <= 64):
             raise BadRequest("__cid__ must be a short string")
@@ -1103,6 +1125,20 @@ class Engine:
                for k in hidden if k != "__cid__"):
             raise BadRequest("mask versions must be non-negative integers")
         return self.srv.insert(table, row)
+
+    def _check_cell(self, table, col, value) -> None:
+        """Binary values belong in FHE columns (and must be valid ciphertexts), and
+        FHE columns hold nothing else."""
+        pol = {c[0]: c[2] for c in self._cols(table)}.get(col)
+        if pol == "fhe":
+            if not isinstance(value, bytes):
+                raise BadRequest(f"FHE column {col!r} takes ciphertext bytes")
+            try:
+                repl_fhe().parse_cell(value)
+            except ValueError as exc:
+                raise BadRequest(f"invalid FHE ciphertext for {col!r}: {exc}") from None
+        elif isinstance(value, bytes):
+            raise BadRequest(f"column {col!r} is not an FHE column")
 
     def _rpc_update_cell(self, table, idx, col, wire_value):
         self._row(table, idx)
@@ -1112,7 +1148,9 @@ class Engine:
         if (col not in known and not self._is_hidden(col)
                 and not (col.startswith("__mac__") and col[7:] in known)):
             raise BadRequest(f"no such column: {col}")
-        self._last_undo = self.srv._rows[table].set_cell(idx, col, w.uwv(wire_value))
+        value = w.uwv(wire_value)
+        self._check_cell(table, col, value)
+        self._last_undo = self.srv._rows[table].set_cell(idx, col, value)
         return None
 
     def _check_ids(self, table, idxs) -> list:
@@ -1205,6 +1243,32 @@ class Engine:
         self._col(table, col)
         return [str(x) for x in self.srv.blinded_per_row_scaled(
             table, col, self._check_ids(table, idxs), self._scalar(k))]
+
+    # — FHE columns: ciphertext SUM / DOT with public data only (no key, no mask) —
+    def _fhe_col(self, table, col) -> None:
+        pol = {c[0]: c[2] for c in self._cols(table)}.get(col)
+        if pol != "fhe":
+            raise BadRequest(f"{col!r} is not an FHE column of {table!r}")
+
+    def _rpc_fhe_sum(self, table, col, idxs):
+        self._fhe_col(table, col)
+        ids = self._check_ids(table, idxs)
+        if len(ids) > self.cfg.fhe_max_sum_rows:
+            raise BadRequest(f"fhe_sum takes at most {self.cfg.fhe_max_sum_rows} rows per call")
+        cells = self.srv._rows[table].cells(col, ids)         # copied under the lock ...
+        return lambda: _b64e(repl_fhe().sum_cells(cells))       # ... computed outside it
+
+    def _rpc_fhe_dot(self, lt, lc, lids, rt, rc, rids):
+        self._fhe_col(lt, lc)
+        self._fhe_col(rt, rc)
+        a, b = self._check_ids(lt, lids), self._check_ids(rt, rids)
+        if len(a) != len(b):
+            raise BadRequest("fhe_dot needs equally long id lists")
+        if len(a) > self.cfg.fhe_max_dot_rows:
+            raise BadRequest(f"fhe_dot takes at most {self.cfg.fhe_max_dot_rows} rows per call")
+        left = self.srv._rows[lt].cells(lc, a)
+        right = self.srv._rows[rt].cells(rc, b)
+        return lambda: _b64e(repl_fhe().dot_cells(left, right))
 
     # — Π_mult (combine opened operands; no key) —
     def _rpc_mult_combine_batch(self, openings):

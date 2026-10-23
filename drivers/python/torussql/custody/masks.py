@@ -430,7 +430,7 @@ class ThresholdMaskStore(MaskStore):
             return {}
         cids = s.plain_cells(table, CID, ids)
         schema = s.schema(table)
-        enc = [c for (c, _t, pol) in schema if pol != "plain"]
+        enc = [c for (c, _t, pol) in schema if pol not in ("plain", "fhe")]
         cols = enc + ["__mac__" + c for c in enc]
         live = {}
         for col in cols:

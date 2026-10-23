@@ -15,6 +15,7 @@ A table has typed columns, each with a **policy**:
 | `PLAIN` | the value itself | yes | no | no |
 | `ENC` | a one-time-padded scalar | no | yes | no |
 | `PAIRED` | a one-time-padded scalar | no | yes | yes |
+| `FHE` | a 384-byte ciphertext the server can add/multiply (INT only, experimental) | no | `SUM`/`AVG` | `DOT` (two `FHE` columns) |
 
 Types: `INT`, `RATIONAL` (exact fractions), `STR` (always `PLAIN`).
 `AVG` accepts any numeric column (`PLAIN`, `ENC`, `PAIRED`).
@@ -167,6 +168,7 @@ in predicates (`IS NULL`).
 | 0.2 | `COUNT(*)`, `AVG`, `MIN/MAX`, `AND/OR/IN`, comparison ops, `ORDER BY`, `LIMIT`, `AS` |
 | 0.3 | `UPDATE`, `DELETE`, `DISTINCT`, `GROUP BY`, `HAVING COUNT(*)` |
 | 0.4 | `[INNER] JOIN … ON a = b`, qualified names |
+| 0.5+ | column policy `FHE` (INT; `SUM`, `AVG`, `COUNT`, `DOT`, projection — see docs/fhe-columns.md) |
 | 0.5+ | `CREATE/DROP INDEX`, `IF [NOT] EXISTS`, `OFFSET`, `BETWEEN`, `NOT IN`, `IS [NOT] NULL`, `[NOT] LIKE` |
 | **0.5** | table aliases, **self-joins**, **multiple joins**, **`LEFT [OUTER] JOIN`**, `GROUP BY`/`HAVING` over joins, `WHERE` on any joined table, `DOT`/`a*b` across tables, `ORDER BY` an unselected column, qualified names on single-table queries, strict exactness errors (`OutOfBudget`) |
 

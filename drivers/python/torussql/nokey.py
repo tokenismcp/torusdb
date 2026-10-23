@@ -244,6 +244,13 @@ class _Conn:
 
 # ── remote server proxy ───────────────────────────────────────────────────────
 
+def _b64d(v):
+    import base64
+    if not isinstance(v, str):
+        raise OperationalError("malformed FHE reply from the server")
+    return base64.b64decode(v.encode("ascii"), validate=True)
+
+
 class RemoteNoKeyServer:
     """Proxy with the SAME interface as torusdb_core.nokey_engine.NoKeyServer,
     forwarding each call to a remote keyless server. Holds no keys, no masks,
@@ -263,6 +270,12 @@ class RemoteNoKeyServer:
 
     def drop(self, table):
         self._c.call("drop", [table])
+
+    def fhe_sum(self, table, col, idxs):
+        return _b64d(self._c.call("fhe_sum", [table, col, idxs]))
+
+    def fhe_dot(self, lt, lc, lids, rt, rc, rids):
+        return _b64d(self._c.call("fhe_dot", [lt, lc, lids, rt, rc, rids]))
 
     def create_index(self, table, col):
         self._c.call("create_index", [table, col])
@@ -575,6 +588,7 @@ class Connection:
                  mask_cluster=None,
                  sync_schema: bool = True,
                  trust_server_schema: bool = False,
+                 fhe_key=None,
                  timeout: float | None = 30.0):
         if mask_cluster is not None and (vault_path or vault_passphrase or vault_custody):
             raise ProgrammingError(
@@ -599,7 +613,7 @@ class Connection:
         try:
             self.client = NoKeyClient(RemoteNoKeyServer(self._wire),
                                       authenticated=authenticated,
-                                      maskstore=mask_cluster)
+                                      maskstore=mask_cluster, fhe=fhe_key)
             if mask_cluster is not None:
                 if authenticated and not self.client.authenticated:
                     raise ProgrammingError(
@@ -949,7 +963,7 @@ class Connection:
         ms = self.client.maskstore
         orphans: dict[str, list[int]] = {}
         for table, cols in self.client._schema.items():
-            enc = [c for (c, _t, pol) in cols if pol != "plain"]
+            enc = [c for (c, _t, pol) in cols if pol not in ("plain", "fhe")]
             if not enc:
                 continue
             if self.client.authenticated:
@@ -1043,6 +1057,7 @@ def connect(host: str = "127.0.0.1", port: int = 8533, *,
             mask_cluster=None,
             sync_schema: bool = True,
             trust_server_schema: bool = False,
+            fhe_key=None,
             timeout: float | None = 30.0) -> Connection:
     """Open a PEP 249 connection to a no-key TorusDB server.
 
@@ -1066,6 +1081,8 @@ def connect(host: str = "127.0.0.1", port: int = 8533, *,
             custodians of a ``torussql.custody.masks.ThresholdMaskStore`` (k-of-n);
             this process is then stateless
         sync_schema: learn tables that exist on the server (schema only)
+        fhe_key: a ``torusdb_core.fhe.FheKey`` (or None) — the owner's secret for
+            ``FHE`` columns; load one with ``torusdb_core.fhe.load_key(path, passphrase)``
         trust_server_schema: allow INSERT/UPDATE on tables whose column policies
             were learned from the server (default: they are read-only, because a
             malicious server could relabel an encrypted column "plain"). Tables
@@ -1080,4 +1097,4 @@ def connect(host: str = "127.0.0.1", port: int = 8533, *,
                       vault_path=vault_path, vault_passphrase=vault_passphrase,
                       vault_custody=vault_custody, mask_cluster=mask_cluster,
                       sync_schema=sync_schema, trust_server_schema=trust_server_schema,
-                      timeout=timeout)
+                      fhe_key=fhe_key, timeout=timeout)

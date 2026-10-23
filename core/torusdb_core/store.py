@@ -52,6 +52,9 @@ def _enc_val(v):
         return v if -_MAX_INT < v < _MAX_INT else {"i": str(v)}
     if isinstance(v, Fraction):
         return {"f": [str(v.numerator), str(v.denominator)]}
+    if isinstance(v, (bytes, bytearray)):
+        import base64
+        return {"x": base64.b64encode(bytes(v)).decode("ascii")}
     raise TypeError(f"cannot store {type(v).__name__}")
 
 
@@ -59,6 +62,9 @@ def _dec_val(v):
     if isinstance(v, dict):
         if "i" in v:
             return int(v["i"])
+        if "x" in v:
+            import base64
+            return base64.b64decode(v["x"])
         return Fraction(int(v["f"][0]), int(v["f"][1]))
     return v
 

@@ -11,6 +11,15 @@ Versioning: [Versioning Policy](docs/versioning.md).
 Hardening release: SQL joins completed, server and drivers made operable, a
 cryptographic self-audit, and the open repository made self-contained.
 
+### Added — FHE columns (late 0.5.0, experimental)
+
+- Column policy `FHE` (`INT` only): the server adds (`SUM`/`AVG`) and multiplies (`DOT`)
+  **ciphertexts** with pairing arithmetic on public data — no key, bootstrap key or mask at the
+  server; the owner holds only an `FheKey`. Independent per-half randomness removes the
+  public-key value oracle of shared-randomness paired ciphertexts. `docs/fhe-columns.md`.
+- `torussql --fhe-keygen/--fhe-key`, `connect(fhe_key=…)`, RPCs `fhe_sum` / `fhe_dot`.
+- Experimental: no integrity, slow pure-Python pairings, Python driver only.
+
 ### Added — scheduling, synchronous replication, atomic IF [NOT] EXISTS (late 0.5.0)
 
 - `BEGIN` waits first-come-first-served; `--tx-idle-timeout` aborts idle transactions.

@@ -96,6 +96,14 @@ to the owner process; aggregates reveal only the sum. A malicious DB server can
 relabel schema policies — mitigated by the read-only rule for server-learned
 tables (`trust_server_schema`). Details and limits: `masks.md`.
 
+### 2.3e FHE columns (optional, experimental)
+
+For `FHE` columns the server holds ciphertexts and public parameters only; it can compute
+sums and inner products of them (that is the feature) but cannot decrypt, and it cannot test
+guessed values (independent halves; SXDH). Not covered: **integrity** (a lying server can
+return a wrong ciphertext), malleability (any sum/product of stored cells), and the
+construction itself has had no independent review. Details: `fhe-columns.md`.
+
 ### 2.4 Owner-process adversary
 
 If the owner process is compromised, the mask vault is exposed. Mask vault

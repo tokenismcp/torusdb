@@ -206,7 +206,7 @@ Query = Union[CreateTable, DropTable, CreateIndex, DropIndex, Insert, Update, De
 
 # ── Normalized vocabularies (the dialect's closed sets) ──────────────────────
 TYPES = ("int", "str", "rational")
-POLICIES = ("plain", "encrypted", "paired")
+POLICIES = ("plain", "encrypted", "paired", "fhe")
 
 TYPE_KEYWORDS = {"INT": "int", "STR": "str", "RATIONAL": "rational"}
-POLICY_KEYWORDS = {"PLAIN": "plain", "ENC": "encrypted", "PAIRED": "paired"}
+POLICY_KEYWORDS = {"PLAIN": "plain", "ENC": "encrypted", "PAIRED": "paired", "FHE": "fhe"}

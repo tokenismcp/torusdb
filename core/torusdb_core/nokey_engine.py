@@ -159,6 +159,17 @@ class NoKeyServer:
         self.schema(table)
         return self._rows[table].indexed_columns
 
+    # — FHE columns: the server evaluates on ciphertexts using PUBLIC data only —
+    def fhe_sum(self, table: str, col: str, idxs: list[int]) -> bytes:
+        from . import fhe
+        return fhe.sum_cells(self._rows[table].cells(col, idxs))
+
+    def fhe_dot(self, ltable: str, lcol: str, lids: list[int],
+                rtable: str, rcol: str, rids: list[int]) -> bytes:
+        from . import fhe
+        return fhe.dot_cells(self._rows[ltable].cells(lcol, lids),
+                             self._rows[rtable].cells(rcol, rids))
+
     # — selection over the PLAINTEXT predicate (encrypted cols never tested) —
     def matching_rowids(self, table: str, where) -> list[int]:
         store = self._rows[table]
@@ -361,6 +372,8 @@ class NoKeyClient:
     _alpha: int = 0
     # where the masks live (see maskstore.py); default = this process
     maskstore: MaskStore | None = None
+    # secret key of the FHE columns (torusdb_core.fhe.FheKey); None = no FHE columns
+    fhe: Any = None
     # Tables whose column policies were learned from the (untrusted) server
     # rather than created/vaulted by this owner. A malicious server could relabel
     # an encrypted column "plain" and receive plaintext, so writes to such
@@ -443,6 +456,8 @@ class NoKeyClient:
             value = _literal_to_value(raw, self._coltype[(table, cname)])
             if policy == "plain":
                 row[cname] = value
+            elif policy == "fhe":
+                row[cname] = self._fhe_key().encrypt(self._fhe_int(value, cname))
             else:
                 s = encode(value)
                 blinded, r = self._owner.blind(s)
@@ -509,6 +524,8 @@ class NoKeyClient:
                 value = _literal_to_value(raw, self._coltype[(table, col)])
                 if self._colpolicy[(table, col)] == "plain":
                     cells.append((col, value))
+                elif self._colpolicy[(table, col)] == "fhe":
+                    cells.append((col, self._fhe_key().encrypt(self._fhe_int(value, col))))
                 else:
                     s = encode(value)
                     blinded, r = self._owner.blind(s)
@@ -670,8 +687,12 @@ class NoKeyClient:
         return [got.get(i) if i is not None else None for i in ids]
 
     def _reveal_many(self, table: str, col: str, idxs: list[int]) -> list:
-        if self._colpolicy[(table, col)] == "plain":
+        policy = self._colpolicy[(table, col)]
+        if policy == "plain":
             return self.server.plain_cells(table, col, idxs)
+        if policy == "fhe":
+            key = self._fhe_key()
+            return [key.decrypt_cell(c) for c in self.server.plain_cells(table, col, idxs)]
         return [decode(s) for s in self._read_verified_scalars(table, col, idxs)]
 
     _AGG = (PSum, PAvg, PCountStar, PScaledSum, PDot, PScalarMul, PCtMul,
@@ -770,9 +791,13 @@ class NoKeyClient:
             return min(vals) if isinstance(p, PMin) else max(vals)
         if isinstance(p, PSum):
             table, bare, lv = live(p.column)
+            if self._colpolicy[(table, bare)] == "fhe":
+                return self._fhe_sum(table, bare, lv)
             return self._pi_lin_sum(table, bare, lv)
         if isinstance(p, PAvg):
             table, bare, lv = live(p.column)
+            if self._colpolicy[(table, bare)] == "fhe":
+                return Fraction(self._fhe_sum(table, bare, lv), len(lv)) if lv else None
             if self._colpolicy[(table, bare)] == "plain":
                 vals = [v for v in self.server.plain_cells(table, bare, lv)
                         if v is not None] if lv else []
@@ -798,6 +823,8 @@ class NoKeyClient:
             rt, rc, rids = ids(p.right)
             both = [(a, b) for a, b in zip(lids, rids)
                     if a is not None and b is not None]
+            if isinstance(p, PDot) and p.fhe:
+                return self._fhe_dot(lt, lc, [a for a, _ in both], rt, rc, [b for _, b in both])
             prods = self._pi_mult_products(
                 lt, lc, [a for a, _ in both], rt, rc, [b for _, b in both]) \
                 if both else []
@@ -807,6 +834,49 @@ class NoKeyClient:
             return [next(done) if (a is not None and b is not None) else None
                     for a, b in zip(lids, rids)]
         raise PlanError(f"unsupported projection {p}")
+
+    # — FHE columns —
+    _FHE_SUM_CHUNK = 2000
+    _FHE_DOT_CHUNK = 100               # ~0.2 s per row in pure Python: keep calls well under the timeout
+
+    def _fhe_key(self):
+        if self.fhe is None:
+            raise ExecError("this table has FHE columns but no FHE key is loaded "
+                            "(connect with fhe_key=…)")
+        return self.fhe
+
+    @staticmethod
+    def _fhe_int(value, col: str) -> int:
+        if isinstance(value, Fraction):
+            if value.denominator != 1:
+                raise ExecError(f"FHE column {col!r} holds integers only")
+            value = int(value)
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ExecError(f"FHE column {col!r} holds integers only")
+        return value
+
+    def _fhe_sum(self, table: str, col: str, idxs: list[int]) -> int:
+        from . import fhe
+        key = self._fhe_key()
+        if not idxs:
+            return 0
+        total = None
+        for i in range(0, len(idxs), self._FHE_SUM_CHUNK):
+            part = self.server.fhe_sum(table, col, idxs[i:i + self._FHE_SUM_CHUNK])
+            total = part if total is None else fhe.add_sums(total, part)
+        return key.decrypt_sum(total)
+
+    def _fhe_dot(self, lt, lc, lids, rt, rc, rids) -> int:
+        from . import fhe
+        key = self._fhe_key()
+        if not lids:
+            return 0
+        total = None
+        for i in range(0, len(lids), self._FHE_DOT_CHUNK):
+            part = self.server.fhe_dot(lt, lc, lids[i:i + self._FHE_DOT_CHUNK],
+                                       rt, rc, rids[i:i + self._FHE_DOT_CHUNK])
+            total = part if total is None else fhe.mul_dots(total, part)
+        return key.decrypt_dot(total)
 
     # — Π_lin: SUM = Σ s̃ᵢ on the server, minus Σ rᵢ at the owner —
     def _pi_lin_sum(self, table: str, col: str, idxs: list[int]):
@@ -1041,6 +1111,9 @@ def _pv(v):
         return {"t": "s", "v": v}
     if isinstance(v, Fraction):
         return {"t": "f", "n": str(v.numerator), "d": str(v.denominator)}
+    if isinstance(v, (bytes, bytearray)):
+        import base64
+        return {"t": "x", "v": base64.b64encode(bytes(v)).decode("ascii")}
     raise TypeError(f"cannot persist {type(v).__name__}")
 
 
@@ -1056,6 +1129,9 @@ def _upv(d):
         return d["v"]
     if t == "f":
         return Fraction(int(d["n"]), int(d["d"]))
+    if t == "x":
+        import base64
+        return base64.b64decode(d["v"])
     raise ValueError(f"unknown persisted tag {t!r}")
 
 

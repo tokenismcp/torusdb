@@ -29,6 +29,9 @@ def wv(v: Any) -> dict:
         return {"t": "s", "v": v}
     if isinstance(v, Fraction):
         return {"t": "f", "n": str(v.numerator), "d": str(v.denominator)}
+    if isinstance(v, (bytes, bytearray)):
+        import base64
+        return {"t": "x", "v": base64.b64encode(bytes(v)).decode("ascii")}
     raise TypeError(f"cannot wire-encode {type(v).__name__}")
 
 
@@ -53,6 +56,16 @@ def uwv(d: dict) -> Any:
         if not isinstance(d.get("v"), str):
             raise ValueError("string wire value must be a string")
         return d["v"]
+    if t == "x":
+        import base64
+        import binascii
+        v = d.get("v")
+        if not isinstance(v, str) or len(v) > 4096:
+            raise ValueError("binary wire value must be a short base64 string")
+        try:
+            return base64.b64decode(v.encode("ascii"), validate=True)
+        except (binascii.Error, UnicodeEncodeError):
+            raise ValueError("binary wire value is not valid base64") from None
     if t == "f":
         if not all(isinstance(d.get(k), (str, int)) and not isinstance(d.get(k), bool)
                    for k in ("n", "d")):

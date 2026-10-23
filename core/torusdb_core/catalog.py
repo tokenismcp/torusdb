@@ -23,7 +23,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Literal
 
-Policy = Literal["plain", "encrypted", "paired"]
+Policy = Literal["plain", "encrypted", "paired", "fhe"]
 ColumnType = Literal["int", "str", "rational"]
 
 
@@ -65,8 +65,10 @@ class Catalog:
             if c.name in seen:
                 raise ValueError(f"duplicate column {c.name!r}")
             seen.add(c.name)
-            if c.policy not in ("plain", "encrypted", "paired"):
+            if c.policy not in ("plain", "encrypted", "paired", "fhe"):
                 raise ValueError(f"bad policy {c.policy!r} on {c.name}")
+            if c.policy == "fhe" and c.type != "int":
+                raise ValueError(f"FHE columns must be INT (column {c.name!r})")
             if c.policy != "plain" and c.type == "str":
                 raise ValueError(f"string columns must be plain (column {c.name!r})")
         self.tables[spec.name] = spec
