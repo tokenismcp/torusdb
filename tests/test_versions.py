@@ -51,3 +51,15 @@ def test_open_source_tree_has_no_proprietary_dependency():
         assert not bad.search(p.read_text()), f"{p} imports the proprietary engine"
     for toml in ("drivers/python", "server", "core", "parser"):
         assert "ec-fhe" not in (ROOT / toml / "pyproject.toml").read_text()
+
+
+def test_server_wheel_ships_every_top_level_module():
+    """A module imported by nokey_server.py but missing from py-modules only fails
+    after `pip install` — catch it here."""
+    import re
+    src = (ROOT / "server/nokey_server.py").read_text()
+    listed = re.search(r"py-modules\s*=\s*\[([^\]]*)\]", (ROOT / "server/pyproject.toml").read_text()).group(1)
+    listed = set(re.findall(r'"([^"]+)"', listed))
+    local = {p.stem for p in (ROOT / "server").glob("*.py")}
+    imported = set(re.findall(r"^(?:import|from)\s+(\w+)", src, re.M))
+    assert (imported & local) - {"nokey_server"} <= listed, (imported & local) - listed

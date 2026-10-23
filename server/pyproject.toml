@@ -26,4 +26,4 @@ dependencies = ["torussql==0.5.0", "torusdb-core==0.5.0"]
 torusdb-server = "nokey_server:main"
 
 [tool.setuptools]
-py-modules = ["nokey_server", "durability"]
+py-modules = ["nokey_server", "durability", "replication"]

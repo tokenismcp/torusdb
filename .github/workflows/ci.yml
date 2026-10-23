@@ -90,6 +90,22 @@ jobs:
           assert c.execute("SELECT SUM(v) FROM t").rows == [[9]], "wrong result"
           print("smoke ok", torussql.__version__)
           PY
+      - name: smoke - disk primary + replica + shell (installed wheels)
+        working-directory: /tmp
+        run: |
+          mkdir -p smoke && cd smoke && echo "admin:ci-admin-token-0123456789" > tokens
+          export T=ci-admin-token-0123456789
+          /tmp/v/bin/torusdb-server --port 18601 --db p.db --storage disk --token-file tokens &
+          sleep 2
+          /tmp/v/bin/torusdb-server --port 18602 --db r.db --token-file tokens \
+              --replica-of 127.0.0.1:18601 --repl-token-env T &
+          sleep 3
+          /tmp/v/bin/torussql -p 18601 --token-env T --trust-server-schema \
+              -c "CREATE TABLE t (id INT PLAIN, name STR PLAIN)" \
+              -c "INSERT INTO t (id, name) VALUES (1, 'alice')"
+          sleep 2
+          /tmp/v/bin/torussql -p 18602 --token-env T --trust-server-schema \
+              -c "SELECT name FROM t WHERE name LIKE 'a%'" | grep -q alice
       - uses: actions/upload-artifact@v4
         with: { name: wheels, path: wh/*.whl }
 
