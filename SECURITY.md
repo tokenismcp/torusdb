@@ -30,5 +30,5 @@ pre-1.0.
 
 The design has had internal review and an internal audit
 (`docs/crypto-review-packet.md` §11). **It has not been independently audited.**
-We welcome and will credit external review; the review packet lists the specific
+We welcome and will credit external review (scope and brief: `docs/audit-scope.md`); the review packet lists the specific
 questions we want answered.
