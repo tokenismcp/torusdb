@@ -401,3 +401,20 @@ def test_streamed_snapshot_is_byte_identical_to_the_classic_one(tmp_path):
     empty = NoKeyServer()
     dur.write_snapshot_stream(p, empty.body_chunks({}), 0)
     assert dur.read_snapshot(p)[0]["rows"] == {}
+
+
+def test_raw_rpc_rejects_drop_of_missing_table_and_bad_predicates(dbpath):
+    s = Running(db=dbpath)
+    try:
+        with s.connect() as c:
+            c.execute("CREATE TABLE t (id INT PLAIN, name STR PLAIN)")
+            call = c._wire.call
+            with pytest.raises(Exception, match="no such table"):
+                call("drop", ["nope"])
+            with pytest.raises(Exception, match="LIKE needs a STR"):
+                call("matching_rowids", ["t", {"or": [[{"c": "id", "op": "like", "v": {"t": "s", "v": "1%"}}]]}])
+            with pytest.raises(Exception, match="unsupported predicate operator"):
+                call("matching_rowids", ["t", {"or": [[{"c": "id", "op": "regexp", "v": {"t": "i", "v": "1"}}]]}])
+            assert call("matching_rowids", ["t", {"or": [[{"c": "name", "op": "like", "v": {"t": "s", "v": "a%"}}]]}]) == []
+    finally:
+        s.stop()

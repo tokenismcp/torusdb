@@ -158,6 +158,26 @@ confidentiality is gone.
   CA bytes, masks and MAC key. The token is refused on an unencrypted
   non-loopback connection unless `allow_insecure_token`.
 
+## SQL conveniences (predicates, indexes, OFFSET, IF [NOT] EXISTS)
+
+```rust
+db.count("t", between("age", &20.into(), &50.into())?)?;   // (age >= 20) AND (age <= 50)
+db.count("t", not_in("id", &[1.into(), 2.into()])?)?;      // AND of != atoms: NULL cells never match
+db.select("t", &["id"], is_null("age"))?;                  // is_null / not_null: the only atoms that match NULL
+db.select("t", &["id"], like("name", "ali%"))?;            // STR columns; % run, _ one char, case-sensitive, no ESCAPE
+db.select_range("t", &["id"], all(), 10, Some(5))?;        // OFFSET 10 LIMIT 5 (row-id order, sliced client-side)
+db.create_index("t", "age")?; db.drop_index("t", "age")?;  // PLAIN columns, role rw+, transactional
+db.table_info("t")?.indexes;
+db.create_table_if_not_exists("t", cols)?;  db.drop_table_if_exists("t")?;
+```
+
+A NULL operand makes every atom false except `is_null`/`not_null`, so `not_in`,
+`not_like` and `!=` never match NULL cells. LIKE needs a STR column; predicates on
+encrypted columns are refused. In `JoinOptions::where_` qualify atoms with
+`on_alias("b", is_null("w"))`: on the NULL side of a LEFT JOIN `is_null` is true,
+every other atom false. `drop_table` of a missing table is an error (the server's
+`drop` RPC alone accepts it silently).
+
 ## Lost COMMIT replies
 
 `begin()` sends a random transaction id. If a COMMIT's reply is lost the

@@ -507,6 +507,35 @@ export function isIn(col: string, values: Value[], alias?: string): WirePred {
   if (alias !== undefined) atom.a = alias;
   return { or: [[atom]] };
 }
+function atom1(col: string, op: string, v: WireVal, alias?: string): WirePred {
+  const a: Atom = { c: col, op, v };
+  if (alias !== undefined) a.a = alias;
+  return { or: [[a]] };
+}
+/** `col IS NULL` (the only atom that matches NULL cells; true on the NULL side of a LEFT JOIN). */
+export function isNull(col: string, alias?: string): WirePred { return atom1(col, "is_null", { t: "n" }, alias); }
+/** `col IS NOT NULL`. */
+export function isNotNull(col: string, alias?: string): WirePred { return atom1(col, "not_null", { t: "n" }, alias); }
+/** `col LIKE pattern` (STR columns only; % = any run, _ = one char, case-sensitive, no ESCAPE). */
+export function like(col: string, pattern: string, alias?: string): WirePred {
+  if (typeof pattern !== "string") throw usage("LIKE needs a string pattern");
+  return atom1(col, "like", { t: "s", v: pattern }, alias);
+}
+/** `col NOT LIKE pattern` (NULL cells match neither LIKE nor NOT LIKE). */
+export function notLike(col: string, pattern: string, alias?: string): WirePred {
+  if (typeof pattern !== "string") throw usage("LIKE needs a string pattern");
+  return atom1(col, "not_like", { t: "s", v: pattern }, alias);
+}
+/** `col BETWEEN lo AND hi`, sent as (col >= lo) AND (col <= hi). */
+export function between(col: string, lo: Value, hi: Value, alias?: string): WirePred {
+  return and(ge(col, lo, alias), le(col, hi, alias));
+}
+/** `col NOT IN (values)`, sent as an AND of `!=` atoms (NULL cells never match). */
+export function notIn(col: string, values: Value[], alias?: string): WirePred {
+  if (values.length === 0) throw usage("NOT IN needs at least one value");
+  return and(...values.map((v) => ne(col, v, alias)));
+}
+
 /** a AND b AND ... (distributes over OR, staying in DNF). */
 export function and(...preds: WirePred[]): WirePred {
   let groups: Atom[][] = [[]];
@@ -540,8 +569,21 @@ function cmpVals(a: Value, b: Value): number | null {
   if (typeof a === "string" && typeof b === "string") return a < b ? -1 : a > b ? 1 : 0;
   return null;                                // incomparable types
 }
+function likeRegex(p: string): RegExp {
+  let out = "";
+  for (const ch of p) out += ch === "%" ? "[\\s\\S]*" : ch === "_" ? "[\\s\\S]" : ch.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp("^" + out + "$", "u");
+}
 function atomMatches(val: Value, a: Atom): boolean {
+  if (a.op === "is_null") return val === null;
+  if (a.op === "not_null") return val !== null;
   if (val === null) return false;             // SQL: a NULL operand makes the atom false
+  if (a.op === "like" || a.op === "not_like") {
+    if (typeof val !== "string") return false;
+    const pat = uwv(a.v);
+    if (typeof pat !== "string") throw usage("LIKE needs a string pattern");
+    return likeRegex(pat).test(val) === (a.op === "like");
+  }
   if (a.in) return a.in.some((w) => cmpVals(val, uwv(w) as Value) === 0);
   const c = cmpVals(val, uwv(a.v) as Value);
   if (c === null) return a.op === "!=" || a.op === "<>";
@@ -815,12 +857,13 @@ export class Client {
     return this.exclusive(async () =>
       arr(await this.call("tables", []), "tables").map((t) => str(t, "tables item")));
   }
-  tableInfo(table: string): Promise<{ rows: number; deleted: number[] }> {
+  tableInfo(table: string): Promise<{ rows: number; deleted: number[]; indexes: string[] }> {
     return this.exclusive(async () => {
       const o = obj(await this.call("table_info", [table]), "table_info");
       const rows = safeInt(o.rows, "table_info.rows");
       if (rows < 0) throw proto("table_info.rows: negative");
-      return { rows, deleted: arr(o.deleted, "table_info.deleted").map((i) => rowId(i, "table_info.deleted")) };
+      const indexes = o.indexes === undefined ? [] : arr(o.indexes, "table_info.indexes").map((c) => str(c, "table_info.indexes"));
+      return { rows, deleted: arr(o.deleted, "table_info.deleted").map((i) => rowId(i, "table_info.deleted")), indexes };
     });
   }
 
@@ -852,9 +895,13 @@ export class Client {
   }
 
   // — DDL —
-  createTable(name: string, columns: Column[]): Promise<void> {
+  createTable(name: string, columns: Column[], opts: { ifNotExists?: boolean } = {}): Promise<void> {
     return this.exclusive(async () => {
       this.assertWritable();
+      if (opts.ifNotExists) {                      // SQL-level convenience: no-op when the table exists
+        const have = arr(await this.call("tables", []), "tables").map((t) => str(t, "tables item"));
+        if (have.includes(name)) return;
+      }
       checkName("table", name);
       const seen = new Set<string>();
       for (const c of columns) {
@@ -870,13 +917,37 @@ export class Client {
   }
 
   /** Drop a table (admin). Forgets its masks. */
-  dropTable(name: string): Promise<void> {
+  dropTable(name: string, opts: { ifExists?: boolean } = {}): Promise<void> {
     return this.exclusive(async () => {
       this.assertWritable();
+      // the server's `drop` RPC silently accepts a missing table, so check first (like the SQL engine)
+      const have = arr(await this.call("tables", []), "tables").map((t) => str(t, "tables item"));
+      if (!have.includes(name)) {
+        if (opts.ifExists) { this.#schema.delete(name); return; }
+        throw new TorusError("BadRequest", `no such table: ${name}`);
+      }
       await this.call("drop", [name]);
       this.#schema.delete(name);
       const prefix = name + SEP;
       for (const k of [...this.#masks.keys()]) if (k.startsWith(prefix)) this.delMask(k);
+    });
+  }
+
+  /** CREATE INDEX ON table (col): PLAIN columns only (role rw+; rolled back with the transaction). */
+  createIndex(table: string, col: string): Promise<void> {
+    return this.exclusive(async () => {
+      this.assertWritable();
+      if (this.col(table, col).policy !== "plain") throw usage(`indexes are only for PLAIN columns (${table}.${col})`);
+      await this.call("create_index", [table, col]);
+    });
+  }
+
+  /** DROP INDEX ON table (col). */
+  dropIndex(table: string, col: string): Promise<void> {
+    return this.exclusive(async () => {
+      this.assertWritable();
+      this.col(table, col);
+      await this.call("drop_index", [table, col]);
     });
   }
 
@@ -1238,6 +1309,9 @@ export class Client {
       for (const g of where.or) for (const a of g) {
         const c = cols.find((x) => x.name === a.c);
         if (c && c.policy !== "plain") throw usage(`predicates on encrypted column '${a.c}' are not supported`);
+        if (c && (a.op === "like" || a.op === "not_like") && c.type !== "str") {
+          throw usage(`LIKE needs a STR column ('${a.c}' is ${c.type})`);
+        }
       }
     }
     return arr(await this.call("matching_rowids", [table, where ?? null]), "matching_rowids")
@@ -1408,9 +1482,16 @@ export class Client {
   }
 
   /** SELECT cols FROM table WHERE pred (plain columns as stored, encrypted ones unblinded). */
-  select(table: string, columns: string[], where?: WirePred | null): Promise<Array<Record<string, Value>>> {
+  select(table: string, columns: string[], where?: WirePred | null,
+         opts: { offset?: number; limit?: number } = {}): Promise<Array<Record<string, Value>>> {
     return this.exclusive(async () => {
-      const idxs = await this.matching(table, wirePred(where));
+      const off = opts.offset ?? 0;
+      if (!Number.isSafeInteger(off) || off < 0) throw usage("offset must be a non-negative integer");
+      if (opts.limit !== undefined && (!Number.isSafeInteger(opts.limit) || opts.limit < 0)) {
+        throw usage("limit must be a non-negative integer");
+      }
+      let idxs = await this.matching(table, wirePred(where));       // row-id order
+      idxs = idxs.slice(off, opts.limit === undefined ? undefined : off + opts.limit);
       const vecs: Value[][] = [];
       for (const c of columns) vecs.push(await this.columnIn(table, c, idxs));
       return idxs.map((_i, k) => {

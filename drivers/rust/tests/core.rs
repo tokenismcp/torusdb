@@ -110,7 +110,7 @@ fn select_update_delete() {
     assert_eq!(db.count("emp", all()).unwrap(), 2);
     assert_eq!(db.sum("emp", "salary", all()).unwrap(), int(500 + 7000));
     assert_eq!(db.delete_rows("emp", eq_int("id", 2)).unwrap(), 0);
-    assert_eq!(db.table_info("emp").unwrap(), TableInfo { rows: 3, deleted: vec![1] });
+    assert_eq!(db.table_info("emp").unwrap(), TableInfo { rows: 3, deleted: vec![1], indexes: vec![] });
 }
 
 #[test]

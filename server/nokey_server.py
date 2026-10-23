@@ -65,6 +65,7 @@ from torussql import nokey_wire as w                         # noqa: E402
 from torussql.framing import read_frame, write_frame         # noqa: E402
 from torusdb_core.protocol import N                                    # noqa: E402
 from torusdb_core.nokey_engine import CommittedView, NoKeyServer   # noqa: E402
+from torussql_parser.predicate import LIKE_OPS, PRED_OPS   # noqa: E402
 from torusdb_core.store import DiskStorage, StoreCorrupt, TxOverlay  # noqa: E402
 import durability as dur                                     # noqa: E402
 import replication as repl                                   # noqa: E402
@@ -886,8 +887,7 @@ class Engine:
             if method == "drop":
                 (table,) = args
                 if table not in srv._schema:
-                    self._rpc_drop(table)                  # no-op drop of a missing table
-                    return None, lambda: None
+                    raise BadRequest(f"no such table: {table}")
                 if self._overlay is not None and table not in self._overlay.created:
                     self._overlay.dropped[table] = (srv._schema[table], srv._rows[table])
                 saved = srv.drop(table)
@@ -1074,12 +1074,19 @@ class Engine:
             cols = [a["c"] for a in atoms]
         except (KeyError, TypeError):
             raise BadRequest("malformed predicate")
-        for c in cols:
+        ctype = {c[0]: c[1] for c in self._cols(table)}
+        for a in atoms:
+            c = a["c"]
             if c not in policy:
                 raise BadRequest(f"no such column: {c}")
             if policy[c] != "plain":
                 raise BadRequest(
                     f"predicates on encrypted column {c!r} are not supported")
+            op = a.get("op")
+            if "in" not in a and op not in PRED_OPS:
+                raise BadRequest(f"unsupported predicate operator {op!r}")
+            if op in LIKE_OPS and ctype[c] != "str":
+                raise BadRequest(f"LIKE needs a STR column (column {c!r} is {ctype[c]})")
 
     def _rpc_matching_rowids(self, table, pred):
         self._check_predicate(table, pred)

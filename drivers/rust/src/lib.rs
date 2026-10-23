@@ -277,6 +277,8 @@ pub struct ServerInfo {
 pub struct TableInfo {
     pub rows: i64,
     pub deleted: Vec<i64>,
+    /// Columns that have a server-side index.
+    pub indexes: Vec<String>,
 }
 
 // ── joins ────────────────────────────────────────────────────────────────────
@@ -649,7 +651,14 @@ impl Client {
             .filter(|r| *r >= 0)
             .ok_or_else(|| proto("table_info.rows: expected a non-negative integer"))?;
         let deleted = ids_from(o.get("deleted").unwrap_or(&Value::Null), "table_info.deleted")?;
-        Ok(TableInfo { rows, deleted })
+        let indexes = match o.get("indexes") {
+            None | Some(Value::Null) => vec![],
+            Some(v) => arr(v, "table_info.indexes", None)?
+                .iter()
+                .map(|x| string(x, "table_info.indexes"))
+                .collect::<Result<Vec<String>>>()?,
+        };
+        Ok(TableInfo { rows, deleted, indexes })
     }
 
     /// Learn tables that exist on the server but not here. They are UNTRUSTED
@@ -710,9 +719,51 @@ impl Client {
         Ok(())
     }
 
-    /// Drop a table (admin). Forgets its masks.
+    /// `CREATE TABLE IF NOT EXISTS`: a no-op when the table already exists on the server
+    /// (the existing table is left untouched and is NOT adopted as trusted).
+    pub fn create_table_if_not_exists(&mut self, name: &str, cols: Vec<Column>) -> Result<()> {
+        self.assert_writable()?;
+        if self.tables()?.iter().any(|t| t == name) {
+            return Ok(());
+        }
+        self.create_table(name, cols)
+    }
+
+    /// `DROP TABLE IF EXISTS`.
+    pub fn drop_table_if_exists(&mut self, name: &str) -> Result<()> {
+        self.assert_writable()?;
+        if !self.tables()?.iter().any(|t| t == name) {
+            self.schema.remove(name);
+            return Ok(());
+        }
+        self.drop_table(name)
+    }
+
+    /// `CREATE INDEX ON table (col)`: PLAIN columns only (role rw+; rolled back with the transaction).
+    pub fn create_index(&mut self, table: &str, col: &str) -> Result<()> {
+        self.assert_writable()?;
+        if self.col(table, col)?.policy != "plain" {
+            return Err(Error::interface(format!("indexes are only for PLAIN columns ({}.{})", table, col)));
+        }
+        self.call_max("create_index", json!([table, col]), 4096)?;
+        Ok(())
+    }
+
+    /// `DROP INDEX ON table (col)`.
+    pub fn drop_index(&mut self, table: &str, col: &str) -> Result<()> {
+        self.assert_writable()?;
+        self.col(table, col)?;
+        self.call_max("drop_index", json!([table, col]), 4096)?;
+        Ok(())
+    }
+
+    /// Drop a table (admin). Forgets its masks. Errors if the table does not exist
+    /// (the server's `drop` RPC alone would silently accept that).
     pub fn drop_table(&mut self, name: &str) -> Result<()> {
         self.assert_writable()?;
+        if !self.tables()?.iter().any(|t| t == name) {
+            return Err(Error::new(Kind::BadRequest, format!("no such table: {}", name)));
+        }
         self.call("drop", json!([name]))?;
         self.schema.remove(name);
         let keys: Vec<MaskKey> = self.masks.keys().filter(|k| k.0 == name).cloned().collect();
@@ -1224,6 +1275,13 @@ impl Client {
                                 name
                             )));
                         }
+                        let op = atom.get("op").and_then(|o| o.as_str()).unwrap_or("");
+                        if (op == "like" || op == "not_like") && c.ty != "str" {
+                            return Err(Error::interface(format!(
+                                "LIKE needs a STR column ('{}' is {})",
+                                name, c.ty
+                            )));
+                        }
                     }
                 }
             }
@@ -1470,6 +1528,28 @@ impl Client {
         Ok((0..idxs.len())
             .map(|k| vecs.iter().map(|v| v[k].clone()).collect())
             .collect())
+    }
+
+    /// SELECT ... OFFSET `offset` LIMIT `limit` (rows are in row-id order; the server selects,
+    /// the client slices). `limit: None` = no limit.
+    pub fn select_range(
+        &mut self,
+        table: &str,
+        columns: &[&str],
+        pred: Value,
+        offset: usize,
+        limit: Option<usize>,
+    ) -> Result<Vec<Vec<CellIn>>> {
+        let pred = wire_pred(&pred)?;
+        let all_ids = self.matching(table, pred)?;
+        let end = limit.map(|l| offset.saturating_add(l)).unwrap_or(usize::MAX);
+        let idxs: Vec<i64> = all_ids.into_iter().skip(offset).take(end.saturating_sub(offset)).collect();
+        let ids: Vec<Option<i64>> = idxs.iter().map(|i| Some(*i)).collect();
+        let mut vecs = vec![];
+        for c in columns {
+            vecs.push(self.column(table, c, &ids)?);
+        }
+        Ok((0..idxs.len()).map(|k| vecs.iter().map(|v| v[k].clone()).collect()).collect())
     }
 
     // — JOIN: client-side hash join over plaintext keys —
@@ -1873,6 +1953,7 @@ pub fn all() -> Value {
 
 const OPS: [&str; 7] = ["=", "!=", "<>", "<", "<=", ">", ">="];
 
+
 /// `col <op> value` with op one of `= != <> < <= > >=`. Invalid values
 /// (zero denominator, unknown operator) are rejected, never silently altered.
 pub fn cmp(col: &str, op: &str, v: &CellIn) -> Result<Value> {
@@ -1900,6 +1981,51 @@ pub fn is_in_of(alias: &str, col: &str, vs: &[CellIn]) -> Result<Value> {
     let mut p = is_in(col, vs)?;
     p["or"][0][0]["a"] = json!(alias);
     Ok(p)
+}
+fn atom1(col: &str, op: &str, v: Value) -> Value {
+    json!({"or": [[{"c": col, "op": op, "v": v}]]})
+}
+/// `col IS NULL` (the only atom that matches NULL cells; true on the NULL side of a LEFT JOIN).
+pub fn is_null(col: &str) -> Value {
+    atom1(col, "is_null", json!({"t": "n"}))
+}
+/// `col IS NOT NULL`.
+pub fn not_null(col: &str) -> Value {
+    atom1(col, "not_null", json!({"t": "n"}))
+}
+/// `col LIKE pattern` (STR columns only; % = any run, _ = one char, case-sensitive, no ESCAPE).
+pub fn like(col: &str, pattern: &str) -> Value {
+    atom1(col, "like", json!({"t": "s", "v": pattern}))
+}
+/// `col NOT LIKE pattern` (NULL cells match neither LIKE nor NOT LIKE).
+pub fn not_like(col: &str, pattern: &str) -> Value {
+    atom1(col, "not_like", json!({"t": "s", "v": pattern}))
+}
+/// `col BETWEEN lo AND hi`, sent as (col >= lo) AND (col <= hi).
+pub fn between(col: &str, lo: &CellIn, hi: &CellIn) -> Result<Value> {
+    Ok(and(&[cmp(col, ">=", lo)?, cmp(col, "<=", hi)?]))
+}
+/// `col NOT IN (values)`, sent as an AND of `!=` atoms (NULL cells never match).
+pub fn not_in(col: &str, vs: &[CellIn]) -> Result<Value> {
+    if vs.is_empty() {
+        return Err(Error::interface("NOT IN needs at least one value"));
+    }
+    let atoms = vs.iter().map(|v| cmp(col, "!=", v)).collect::<Result<Vec<Value>>>()?;
+    Ok(and(&atoms))
+}
+/// Qualify every atom of `pred` with a table alias (for [`JoinOptions::where_`]).
+pub fn on_alias(alias: &str, pred: Value) -> Value {
+    let mut p = pred;
+    if let Some(gs) = p.get_mut("or").and_then(|g| g.as_array_mut()) {
+        for g in gs {
+            if let Some(atoms) = g.as_array_mut() {
+                for a in atoms {
+                    a["a"] = json!(alias);
+                }
+            }
+        }
+    }
+    p
 }
 fn groups(p: &Value) -> Vec<Value> {
     p["or"].as_array().cloned().unwrap_or_default()
@@ -1985,10 +2111,49 @@ fn cmp_cells(a: &CellIn, b: &CellIn) -> Option<std::cmp::Ordering> {
     None
 }
 
+/// SQL LIKE: `%` any run, `_` one character, case-sensitive, no escape.
+fn like_match(text: &str, pat: &str) -> bool {
+    let (t, p): (Vec<char>, Vec<char>) = (text.chars().collect(), pat.chars().collect());
+    let (mut ti, mut pi) = (0usize, 0usize);
+    let (mut star, mut mark) = (None::<usize>, 0usize);
+    while ti < t.len() {
+        if pi < p.len() && p[pi] == '%' {
+            star = Some(pi);
+            mark = ti;
+            pi += 1;
+        } else if pi < p.len() && (p[pi] == '_' || p[pi] == t[ti]) {
+            pi += 1;
+            ti += 1;
+        } else if let Some(s) = star {
+            mark += 1;
+            ti = mark;
+            pi = s + 1;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '%' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
 fn atom_matches(val: &CellIn, a: &Value) -> Result<bool> {
     use std::cmp::Ordering::*;
+    match a["op"].as_str() {
+        Some("is_null") => return Ok(*val == CellIn::Null),
+        Some("not_null") => return Ok(*val != CellIn::Null),
+        _ => {}
+    }
     if *val == CellIn::Null {
         return Ok(false); // SQL: a NULL operand makes the atom false
+    }
+    if let Some(op @ ("like" | "not_like")) = a["op"].as_str() {
+        let CellIn::Str(text) = val else { return Ok(false) };
+        let CellIn::Str(pat) = uwv(&a["v"])? else {
+            return Err(Error::interface("LIKE needs a string pattern"));
+        };
+        return Ok(like_match(text, &pat) == (op == "like"));
     }
     if let Some(list) = a.get("in").and_then(|l| l.as_array()) {
         for w in list {

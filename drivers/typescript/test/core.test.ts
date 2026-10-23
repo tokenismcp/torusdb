@@ -124,7 +124,7 @@ T("insertMany is all-or-nothing on a bad row (no masks leak)", async () => {
 T("tables / tableInfo / syncSchema from a second connection", async () => {
   const t = await seedEmp();
   assert.ok((await db.tables()).includes(t));
-  assert.deepEqual(await db.tableInfo(t), { rows: 3, deleted: [] });
+  assert.deepEqual(await db.tableInfo(t), { rows: 3, deleted: [], indexes: [] });
   const other = await Client.connect(srv.host, srv.port);   // schema only, no vault
   try {
     assert.equal(await other.count(t, eq("dept", 5)), 2);

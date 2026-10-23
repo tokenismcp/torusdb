@@ -159,6 +159,28 @@ afford to lose.
   from `util.inspect` / `JSON.stringify`. The token is refused on an
   unencrypted non-loopback connection unless `allowInsecureToken: true`.
 
+## SQL conveniences (predicates, indexes, OFFSET, IF [NOT] EXISTS)
+
+```ts
+import { between, notIn, isNull, isNotNull, like, notLike } from "@torusdb/driver";
+await db.count("t", between("age", 20, 50));          // (age >= 20) AND (age <= 50)
+await db.count("t", notIn("id", [1, 2, 3]));          // AND of != atoms: NULL cells never match
+await db.select("t", ["id"], isNull("age"));          // the only atoms that match NULL
+await db.select("t", ["id"], like("name", "ali%"));   // STR columns, % = run, _ = one char, case-sensitive, no ESCAPE
+await db.select("t", ["id"], null, { offset: 10, limit: 5 });   // rows in row-id order, sliced client-side
+await db.createIndex("t", "age");  await db.dropIndex("t", "age");   // PLAIN columns, role rw+, transactional
+(await db.tableInfo("t")).indexes;                    // ["age", ...]
+await db.createTable("t", cols, { ifNotExists: true });
+await db.dropTable("t", { ifExists: true });          // without ifExists a missing table is an error
+```
+
+A NULL operand makes every atom false except `isNull`/`isNotNull`, so `notIn`,
+`notLike` and `ne` never match NULL cells. LIKE needs a STR column and a string
+pattern; predicates on encrypted columns are refused. In `join()` options pass an
+alias as the last argument (`isNull("w", "b")`): on the NULL side of a LEFT JOIN
+`isNull` is true and every other atom is false. OFFSET/LIMIT apply to `select`
+only (there are no per-row encrypted expressions in this driver).
+
 ## Lost COMMIT replies
 
 `begin()` sends a random transaction id. If a COMMIT's reply is lost (timeout,
