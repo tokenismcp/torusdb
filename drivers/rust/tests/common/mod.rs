@@ -64,6 +64,12 @@ pub struct Server {
 impl Server {
     /// `None` (with a SKIP note on stderr) when no interpreter/server is found.
     pub fn start(extra: &[&str]) -> Option<Server> {
+        Server::start_env(extra, &[])
+    }
+
+    /// Like `start`, with extra environment variables for the server process (e.g. PYTHONPATH
+    /// pointing at a directory with the native `mclbn256` package).
+    pub fn start_env(extra: &[&str], env: &[(&str, &str)]) -> Option<Server> {
         let py = match python() {
             Some(p) => p,
             None => {
@@ -80,6 +86,7 @@ impl Server {
             .args(["--host", "127.0.0.1", "--port", "0", "--log-level", "WARNING"])
             .args(extra)
             .env("PYTHONUNBUFFERED", "1")
+            .envs(env.iter().copied())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
@@ -135,4 +142,29 @@ pub fn emp_cols() -> Vec<Column> {
 
 pub fn kv_cols() -> Vec<Column> {
     vec![col("k", "int", "plain"), col("v", "int", "encrypted")]
+}
+
+/// Directory with the native `mclbn256` package (optional): when TORUSDB_MCL_PATH is set the
+/// server gets it on PYTHONPATH, so FHE DOT runs on the fast native back end.
+pub fn mcl_path() -> Option<String> {
+    std::env::var("TORUSDB_MCL_PATH").ok().filter(|p| Path::new(p).exists())
+}
+
+/// Run the Python peer (tests/fhe_peer.py): it connects with the Python driver and runs SQL.
+/// Returns its JSON output.
+pub fn run_peer(host: &str, port: u16, spec: &serde_json::Value) -> serde_json::Value {
+    let py = python().expect("a Python interpreter is needed for the cross-implementation tests");
+    let root = repo();
+    let sep = ":";
+    let pp = ["core", "parser", "drivers/python"].iter().map(|d| root.join(d).to_string_lossy().to_string()).collect::<Vec<_>>().join(sep);
+    let out = Command::new(py)
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fhe_peer.py"))
+        .arg(host)
+        .arg(port.to_string())
+        .arg(spec.to_string())
+        .env("PYTHONPATH", pp)
+        .output()
+        .expect("run fhe_peer");
+    assert!(out.status.success(), "fhe_peer failed: {}", String::from_utf8_lossy(&out.stderr));
+    serde_json::from_slice(&out.stdout).expect("peer output")
 }

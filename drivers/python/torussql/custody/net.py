@@ -54,6 +54,9 @@ from .keys import KeyShare
 from .quorum import QuorumError
 from .shares import (Frozen, MaskShareStore, MissingShare, Q, ShareConflict)
 from .threshold import Partial, partial_decrypt
+from . import gt as _gt
+
+MAX_PARTIAL_BATCH = 1000          # G1 points per ``partial_batch`` request
 
 log = logging.getLogger("torusdb.custodian")
 
@@ -62,7 +65,7 @@ PRE_AUTH_MAX_FRAMES = 16          # frames a connection may send before authenti
 _LOOPBACK = {"127.0.0.1", "::1", "localhost"}
 ALL_PERMS = frozenset({"key", "mask_write", "mask_read", "mask_admin"})
 _REQUIRES = {
-    "partial": "key",
+    "partial": "key", "partial_batch": "key", "gt_partial_batch": "key", "g2_partial": "key",
     "mask_put": "mask_write",
     "mask_sum": "mask_read", "mask_get": "mask_read", "mask_has": "mask_read",
     "mask_meta_get": "mask_read", "mask_tables": "mask_read",
@@ -332,6 +335,87 @@ class Custodian:
         self._audit(caller, peer, "partial", {"E": efp}, "served")
         return part.to_json(g)
 
+    # — key service, batch form (threshold FHE keys: many cells per round trip) —
+    def _batch_gate(self, caller, peer, op, items, cap):
+        """Shared admission for the batch methods: shape check, then the rate limit
+        charged PER ITEM (a batch is not a way around ``rate_per_minute``)."""
+        if self._share is None:
+            raise CustodyError("this custodian holds no key share")
+        if not isinstance(items, list) or not 1 <= len(items) <= cap:
+            self._rate_ok(self._hits, caller, 1, self._rate)
+            self._audit(caller, peer, op, {"n": str(len(items)) if isinstance(items, list) else "?"},
+                        "rejected: malformed")
+            raise CustodyError("malformed request")
+        if not self._rate_ok(self._hits, caller, len(items), self._rate):
+            self._audit_denial(caller, peer, op, "denied: rate limit")
+            raise CustodyError("rate limit exceeded")
+
+    def _m_partial_batch(self, caller, peer, E_hexes, ctx_hex=""):
+        self._batch_gate(caller, peer, "partial_batch", E_hexes, MAX_PARTIAL_BATCH)
+        share = self._share
+        g = share.public.g
+        try:
+            ctx = bytes.fromhex(ctx_hex)
+            if len(ctx) > 1024:
+                raise InvalidPoint("bad request")
+            Es = [g.from_hex(h) for h in E_hexes]          # on the curve, canonical coordinates
+            if any(g.is_identity(E) for E in Es):
+                raise InvalidPoint("bad request")
+        except (InvalidPoint, ValueError, TypeError, AttributeError):
+            self._audit(caller, peer, "partial_batch", {"n": len(E_hexes)}, "rejected: malformed")
+            raise CustodyError("malformed request")
+        canon = [g.hex(E) for E in Es]                     # what policy sees is what is used
+        efp = hashlib.sha256("".join(canon).encode()).hexdigest()[:16]
+        if self._approve:
+            for c in canon:
+                if not self._approve(caller, c, ctx):
+                    self._audit(caller, peer, "partial_batch", {"n": len(Es), "E": efp},
+                                "denied: policy")
+                    raise CustodyError("request declined by custodian policy")
+        parts = [partial_decrypt(share, E, ctx) for E in Es]
+        self._audit(caller, peer, "partial_batch", {"n": len(Es), "E": efp}, "served")
+        return [p.to_json(g) for p in parts]
+
+    def _m_gt_partial_batch(self, caller, peer, c_hexes, ctx_hex=""):
+        self._batch_gate(caller, peer, "gt_partial_batch", c_hexes, _gt.MAX_GT_BATCH)
+        share = self._share
+        g = share.public.g
+        if share.public.group != "bn254":
+            raise CustodyError("GT operations need a bn254 key")
+        try:
+            ctx = bytes.fromhex(ctx_hex)
+            if len(ctx) > 1024:
+                raise ValueError("context too long")
+            raws = [bytes.fromhex(h) for h in c_hexes]
+            for raw in raws:
+                _gt.gt_check(raw)                         # canonical, < p, in the order-q subgroup
+        except (InvalidPoint, ValueError, TypeError, AttributeError):
+            self._audit(caller, peer, "gt_partial_batch", {"n": len(c_hexes)},
+                        "rejected: malformed or not in GT")
+            raise CustodyError("malformed request (not an element of the order-q subgroup of GT)")
+        efp = hashlib.sha256(b"".join(raws)).hexdigest()[:16]
+        if self._approve:
+            for raw in raws:
+                if not self._approve(caller, "gt:" + raw.hex(), ctx):
+                    self._audit(caller, peer, "gt_partial_batch", {"n": len(raws), "E": efp},
+                                "denied: policy")
+                    raise CustodyError("request declined by custodian policy")
+        parts = _gt.gt_partial(share, raws, ctx)
+        self._audit(caller, peer, "gt_partial_batch", {"n": len(raws), "E": efp}, "served")
+        return [p.to_json(g) for p in parts]
+
+    def _m_g2_partial(self, caller, peer):
+        if self._share is None:
+            raise CustodyError("this custodian holds no key share")
+        if not self._rate_ok(self._hits, caller, 1, self._rate):
+            self._audit_denial(caller, peer, "g2_partial", "denied: rate limit")
+            raise CustodyError("rate limit exceeded")
+        if self._share.public.group != "bn254":
+            raise CustodyError("G2 shares need a bn254 key")
+        raw = _gt.g2_partial(self._share)
+        self._audit(caller, peer, "g2_partial", {}, "served")
+        return {"index": self._share.index, "Y2": raw.hex()}
+
     # — mask service —
     def _store(self) -> MaskShareStore:
         if self.masks is None:
@@ -582,7 +666,24 @@ class CustodianServer(socketserver.ThreadingTCPServer):
 
 
 # ── clients ──────────────────────────────────────────────────────────────────
-class RemoteCustodian:
+class _FheCalls:
+    """Batch / pairing-group requests shared by ``RemoteCustodian`` and ``LocalNode``
+    (they only need ``self.call`` and ``self.g``)."""
+
+    def partial_batch(self, Es, context: bytes = b"") -> list:
+        out = self.call("partial_batch", [[self.g.hex(E) for E in Es], context.hex()])
+        return [Partial.from_json(self.g, d) for d in out]
+
+    def gt_partial_batch(self, cs, context: bytes = b"") -> list:
+        out = self.call("gt_partial_batch", [[bytes(c).hex() for c in cs], context.hex()])
+        return [_gt.GtPartial.from_json(self.g, d) for d in out]
+
+    def g2_partial(self):
+        d = self.call("g2_partial", [])
+        return int(d["index"]), bytes.fromhex(d["Y2"])
+
+
+class RemoteCustodian(_FheCalls):
     """Client for a ``CustodianServer``. Keeps one authenticated connection and
     transparently reconnects (all operations are idempotent)."""
 
@@ -684,7 +785,7 @@ class RemoteCustodian:
         return Partial.from_json(self.g, self.call("partial", [self.g.hex(E), context.hex()]))
 
 
-class LocalNode:
+class LocalNode(_FheCalls):
     """In-process custodian (tests, single-host use) with the same interface as
     ``RemoteCustodian``."""
 

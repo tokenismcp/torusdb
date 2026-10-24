@@ -11,6 +11,14 @@ Versioning: [Versioning Policy](docs/versioning.md).
 Hardening release: SQL joins completed, server and drivers made operable, a
 cryptographic self-audit, and the open repository made self-contained.
 
+### Added — threshold custody of the FHE key (unreleased)
+
+- `torusdb_core.fhe_threshold.ThresholdFheKey`: the FHE secret `s` lives only as a k-of-n custodian sharing
+  (bn254 custody key); cells/`SUM` via batched threshold G1 decryption, `DOT` via threshold GT exponentiation
+  (Chaum-Pedersen proofs, `s^2` as two sequential rounds), `Q2` from pairing-verified G2 shares, integrity tags
+  from a separate MAC secret sealed under the threshold envelope. New custodian methods `partial_batch`,
+  `gt_partial_batch`, `g2_partial`; CLI `fhe-keygen-threshold`, `fhe-open-test`, `torussql --fhe-threshold`.
+
 ### Added — FHE integrity tags, `k * SUM` (late 0.5.0)
 
 - `authenticated=True` now also protects FHE cells, `SUM`, `AVG` and `k * SUM(col)` with row-bound

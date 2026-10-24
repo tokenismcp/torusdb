@@ -21,6 +21,16 @@ import * as path from "path";
 import * as util from "util";
 import { randomBytes } from "crypto";
 import { AsyncLocalStorage } from "async_hooks";
+import { TorusError } from "./errors";
+import {
+  FheKey, FheBackend, FHE_CELL_BYTES, FHE_DOT_BYTES, FHE_SUM_BYTES, addSums as fheAddSums, mulDots as fheMulDots,
+} from "./fhe";
+
+export {
+  FheKey, FHE_CELL_BYTES, FHE_DEFAULT_RANGE, FHE_MAX_RANGE, sumCells as fheSumCells,
+  addSums as fheAddSums, mulDots as fheMulDots,
+} from "./fhe";
+export type { FheBackend } from "./fhe";
 
 /** Newest wire protocol this driver speaks. */
 export const PROTOCOL_VERSION = 2;
@@ -35,27 +45,7 @@ const MARGIN_BITS = 64n;
 const RANGE = N >> MARGIN_BITS;
 
 // ── errors ──────────────────────────────────────────────────────────────────
-/**
- * Every failure surfaces as a TorusError. `kind` is the server's error class
- * (the text before the first ": " - e.g. "Unauthenticated", "Forbidden",
- * "Busy", "BadRequest", "InternalError", "PlanError") or one of the local
- * kinds: "ConnectionError" (cannot connect / connection lost / TLS failure),
- * "TimeoutError", "ProtocolError" (malformed or unsupported peer reply),
- * "InterfaceError" (client closed / misuse), "OutOfBudget" (value or
- * aggregate outside the exactly representable range), "IntegrityError" (a MAC
- * check failed: the server lied), "UntrustedSchema" (write to a table whose
- * encryption policies were only learned from the server) and
- * "TransactionInDoubt" (see {@link TransactionInDoubt}).
- */
-export class TorusError extends Error {
-  readonly kind: string;
-  constructor(kind: string, message: string) {
-    super(message);
-    this.name = "TorusError";
-    this.kind = kind;
-    Object.setPrototypeOf(this, TorusError.prototype);
-  }
-}
+export { TorusError };
 
 /**
  * A COMMIT was sent but its reply was lost, and the outcome could not be
@@ -222,13 +212,15 @@ function safeInt(x: unknown, what: string): number {
 // ── wire value codec (mirrors proto/nokey_wire.py) ──────────────────────────
 type WireVal =
   | { t: "n" } | { t: "b"; v: boolean } | { t: "i"; v: string }
-  | { t: "s"; v: string } | { t: "f"; n: string; d: string };
+  | { t: "s"; v: string } | { t: "f"; n: string; d: string }
+  | { t: "x"; v: string };                       // binary (FHE ciphertext cells only)
 
 /** A user-facing cell value. */
 export type Value = null | boolean | bigint | number | string | Rational;
 
 function wv(v: Value | undefined): WireVal {
   if (v === null || v === undefined) return { t: "n" };
+  if (v instanceof Uint8Array) throw usage("binary values are only accepted as FHE ciphertexts; this column is not an FHE column");
   if (typeof v === "boolean") return { t: "b", v };
   if (typeof v === "bigint") return { t: "i", v: v.toString() };
   if (typeof v === "number") {
@@ -265,6 +257,32 @@ function uwv(d: unknown): Value {
   throw proto("bad wire value");
 }
 
+/** An FHE ciphertext cell as a wire value. The length is checked before anything is sent. */
+function wvCell(cell: Uint8Array): WireVal {
+  if (!(cell instanceof Uint8Array) || cell.length !== FHE_CELL_BYTES) {
+    throw usage(`an FHE cell is exactly ${FHE_CELL_BYTES} bytes, got ${cell instanceof Uint8Array ? cell.length : typeof cell}`);
+  }
+  return { t: "x", v: Buffer.from(cell).toString("base64") };
+}
+
+/** A binary cell from the server: null for a NULL cell, else exactly `len` canonical-base64 bytes. */
+function binCell(d: unknown, what: string, len = FHE_CELL_BYTES): Buffer | null {
+  const o = obj(d, what);
+  if (o.t === "n") return null;
+  if (o.t !== "x" || typeof o.v !== "string") throw proto(`${what}: expected a binary cell`);
+  const b = Buffer.from(o.v, "base64");
+  if (b.length !== len || b.toString("base64") !== o.v) throw proto(`${what}: a binary cell must be ${len} bytes of canonical base64`);
+  return b;
+}
+
+/** A base64 blob reply (fhe_sum / fhe_dot) of exactly `len` bytes. */
+function blob(d: unknown, what: string, len: number): Buffer {
+  if (typeof d !== "string") throw proto(`${what}: expected a base64 string`);
+  const b = Buffer.from(d, "base64");
+  if (b.length !== len || b.toString("base64") !== d) throw proto(`${what}: expected ${len} bytes of canonical base64`);
+  return b;
+}
+
 /** A server blinded scalar (must be an int cell). */
 function scalarCell(d: unknown): bigint {
   const v = uwv(d);
@@ -273,11 +291,11 @@ function scalarCell(d: unknown): bigint {
 }
 
 // ── column spec ──────────────────────────────────────────────────────────────
-export type Policy = "plain" | "encrypted" | "paired";
+export type Policy = "plain" | "encrypted" | "paired" | "fhe";
 export type ColType = "int" | "str" | "rational";
 export interface Column { name: string; type: ColType; policy: Policy; }
 
-const POLICIES = ["plain", "encrypted", "paired"];
+const POLICIES = ["plain", "encrypted", "paired", "fhe"];
 const TYPES = ["int", "str", "rational"];
 const hasOwn = (o: object, k: string) => Object.prototype.hasOwnProperty.call(o, k);
 
@@ -323,6 +341,12 @@ export interface ConnectOptions {
    *  and every affine result / read is verified; a lying server is caught
    *  (IntegrityError). Must match how the table was written. */
   authenticated?: boolean;
+  /** The owner's key for `fhe` columns (see {@link FheKey}). Needed for INSERT/UPDATE/reads/SUM/DOT on them.
+   *  With `authenticated: true`, FHE cells also carry integrity tags in a hidden `__fmac__<col>` column. */
+  fheKey?: FheKey;
+  /** With `authenticated: true`, still allow DOT on FHE columns. A ciphertext product cannot be
+   *  tag-checked, so the result is NOT protected against a lying server. Default false. */
+  fheAllowUnverifiedDot?: boolean;
 }
 
 const DEFAULT_TIMEOUT_MS = 30_000;
@@ -646,6 +670,12 @@ function plainKey(v: Value): string | null {
 // ── the no-key client ────────────────────────────────────────────────────────
 const SEP = "\u0000";
 const MAC = "__mac__";
+const FMAC = "__fmac__";
+const FHE_SUM_CHUNK = 2000;                  // ids per fhe_sum call (server cap 5000)
+const FHE_DOT_CHUNK_NATIVE = 2000;           // server cap 6000 with the native back end
+const FHE_DOT_CHUNK = 50;                    // server cap 300 with pure Python (~0.2 s per row)
+const FHE_READ_CHUNK = 5000;                 // cells per plain_cells call (~600 bytes each)
+const FHE_MAX_K = 1n << 40n;
 function mkey(table: string, rowid: number, col: string): string {
   return table + SEP + rowid + SEP + col;
 }
@@ -677,6 +707,8 @@ export class Client {
   #trustServerSchema: boolean;
   #authenticated: boolean;
   #alpha = 0n;                                   // SECRET MAC key
+  #fhe: FheKey | undefined;                      // SECRET key of the FHE columns
+  #fheUnverifiedDot: boolean;
   #als = new AsyncLocalStorage<boolean>();
   #tail: Promise<void> = Promise.resolve();
   /** What the server said in `hello` (protocol 1 servers: {protocol:1,...}). */
@@ -691,6 +723,9 @@ export class Client {
     this.#token = o.token;
     this.#trustServerSchema = o.trustServerSchema === true;
     this.#authenticated = o.authenticated === true;
+    if (o.fheKey !== undefined && !(o.fheKey instanceof FheKey)) throw usage("fheKey must be an FheKey");
+    this.#fhe = o.fheKey;
+    this.#fheUnverifiedDot = o.fheAllowUnverifiedDot === true;
     if (this.#authenticated) this.#alpha = 1n + (randScalar() % (N - 1n));
   }
 
@@ -706,7 +741,7 @@ export class Client {
       throw usage(`refusing to send the token to ${host} over an unencrypted connection; ` +
         `use tls: true (or allowInsecureToken: true if you really mean it)`);
     }
-    const target: Target = { host, port, opts: { ...opts, token: undefined }, timeoutMs };
+    const target: Target = { host, port, opts: { ...opts, token: undefined, fheKey: undefined }, timeoutMs };
     const tr = await Client.openTransport(target, opts.token);
     const db = new Client(tr.tr, target, opts);
     db.serverInfo = tr.info;
@@ -906,6 +941,7 @@ export class Client {
         seen.add(c.name);
         if (!POLICIES.includes(c.policy)) throw usage(`bad policy for ${c.name}: ${c.policy}`);
         if (!TYPES.includes(c.type)) throw usage(`bad type for ${c.name}: ${c.type}`);
+        if (c.policy === "fhe" && c.type !== "int") throw usage(`FHE columns must be INT (column ${c.name})`);
       }
       const r = await this.call("create", opts.ifNotExists
         ? [name, columns.map((c) => [c.name, c.type, c.policy]), true]    // atomic IF NOT EXISTS
@@ -1015,7 +1051,44 @@ export class Client {
     return { cells, masks };
   }
 
-  private blindRow(table: string, row: Record<string, Value>): { wire: Record<string, WireVal>; pending: Array<[string, bigint]> } {
+  // — FHE columns —
+  private fheKey(): FheKey {
+    if (!this.#fhe) throw usage("this table has FHE columns but no FHE key is loaded (pass fheKey to connect())");
+    return this.#fhe;
+  }
+
+  /** The integer of an FHE cell: FHE columns hold integers only (no NULL, bool, string, fraction, binary). */
+  private fheInt(v: Value, table: string, col: string): bigint {
+    if (typeof v === "bigint") return v;
+    if (typeof v === "number" && Number.isSafeInteger(v)) return BigInt(v);
+    if (isRational(v) && v.den !== 0n) {
+      const r = rational(v.num, v.den);
+      if (typeof r === "bigint") return r;
+    }
+    throw usage(`FHE column ${table}.${col} holds integers only`);
+  }
+
+  /** The encrypted wire cell of an FHE column plus (authenticated) its tag. `rowid` is unknown at INSERT
+   *  time: a placeholder tag is sent and replaced by {@link fheWriteTags} once the row id exists. */
+  private fheCells(table: string, c: Column, x: bigint, rowid?: number): Array<[string, WireVal]> {
+    const key = this.fheKey();
+    const cells: Array<[string, WireVal]> = [[c.name, wvCell(key.encrypt(x))]];
+    if (this.#authenticated) {
+      cells.push([FMAC + c.name, wvCell(rowid === undefined ? key.placeholderCell() : key.tag(x, table, c.name, rowid))]);
+    }
+    return cells;
+  }
+
+  private async fheWriteTags(table: string, rowid: number, tags: Array<[string, bigint]>): Promise<void> {
+    const key = this.fheKey();
+    for (const [col, x] of tags) {
+      await this.call("update_cell", [table, rowid, FMAC + col, wvCell(key.tag(x, table, col, rowid))]);
+    }
+  }
+
+  private blindRow(table: string, row: Record<string, Value>): {
+    wire: Record<string, WireVal>; pending: Array<[string, bigint]>; tags: Array<[string, bigint]>;
+  } {
     this.assertTrusted(table);
     const cols = this.cols(table);
     const known = new Set(cols.map((c) => c.name));
@@ -1024,28 +1097,38 @@ export class Client {
     }
     const wire: Record<string, WireVal> = Object.create(null);
     const pending: Array<[string, bigint]> = [];
+    const tags: Array<[string, bigint]> = [];
     for (const c of cols) {
       if (!hasOwn(row, c.name)) throw usage(`INSERT must provide column ${table}.${c.name}`);
       const v = row[c.name];
       if (c.policy === "plain") {
         wire[c.name] = wv(v);
+      } else if (c.policy === "fhe") {
+        const x = this.fheInt(v, table, c.name);
+        for (const [n, w] of this.fheCells(table, c, x)) wire[n] = w;
+        if (this.#authenticated) tags.push([c.name, x]);
       } else {
         const b = this.blindCell(table, c, v);
         for (const [n, w] of b.cells) wire[n] = w;
         pending.push(...b.masks);
       }
     }
-    return { wire: { ...wire }, pending };
+    return { wire: { ...wire }, pending, tags };
   }
 
   // — INSERT: blind encrypted cells, keep masks locally —
   insert(table: string, row: Record<string, Value>): Promise<number> {
     return this.exclusive(async () => {
       this.assertWritable();
-      const { wire, pending } = this.blindRow(table, row);
-      const rowid = rowId(await this.call("insert", [table, wire]), "insert");
-      for (const [col, r] of pending) this.setMask(mkey(table, rowid, col), r);
-      return rowid;
+      const { wire, pending, tags } = this.blindRow(table, row);
+      const run = async (): Promise<number> => {
+        const rowid = rowId(await this.call("insert", [table, wire]), "insert");
+        for (const [col, r] of pending) this.setMask(mkey(table, rowid, col), r);
+        // authenticated FHE: the tag binds the row id, known only now - same transaction as the INSERT
+        if (tags.length) await this.fheWriteTags(table, rowid, tags);
+        return rowid;
+      };
+      return tags.length ? this.atomically(run) : run();
     });
   }
 
@@ -1057,6 +1140,7 @@ export class Client {
       this.assertWritable();
       if (rows.length === 0) return [];
       const blinded = rows.map((r) => this.blindRow(table, r));
+      const tagged = blinded.some((b) => b.tags.length > 0);
       const per = 50_000;
       const send = async (): Promise<number[]> => {
         const all: number[] = [];
@@ -1065,11 +1149,12 @@ export class Client {
           const ids = arr(await this.call("insert_many", [table, part.map((b) => b.wire)],
             part.length * 24 + 4096), "insert_many", part.length).map((x) => rowId(x, "insert_many"));
           part.forEach((b, k) => { for (const [col, r] of b.pending) this.setMask(mkey(table, ids[k], col), r); });
+          for (let k = 0; k < part.length; k++) if (part[k].tags.length) await this.fheWriteTags(table, ids[k], part[k].tags);
           all.push(...ids);
         }
         return all;
       };
-      return blinded.length > per ? this.atomically(send) : send();
+      return blinded.length > per || tagged ? this.atomically(send) : send();
     });
   }
 
@@ -1089,6 +1174,11 @@ export class Client {
             const c = this.col(table, col);
             if (c.policy === "plain") {
               await this.call("update_cell", [table, i, col, wv(v)]);
+            } else if (c.policy === "fhe") {
+              // a fresh ciphertext (and tag) per row, never one shared cell
+              for (const [n, w] of this.fheCells(table, c, this.fheInt(v, table, col), i)) {
+                await this.call("update_cell", [table, i, n, w]);
+              }
             } else {
               const b = this.blindCell(table, c, v);
               for (const [n, w] of b.cells) await this.call("update_cell", [table, i, n, w]);
@@ -1353,13 +1443,82 @@ export class Client {
   sum(table: string, col: string, where?: WirePred | null): Promise<Decoded> {
     return this.exclusive(async () => {
       this.encryptedCol(table, col);
-      return this.sumIds(table, col, await this.matching(table, wirePred(where)));
+      const idxs = await this.matching(table, wirePred(where));
+      if (this.col(table, col).policy === "fhe") return this.fheSum(table, col, idxs);
+      return this.sumIds(table, col, idxs);
+    });
+  }
+
+  /** `k * SUM(col)` over an FHE column: the SERVER multiplies the summed ciphertext by the public scalar
+   *  `k` (EC scalar multiplication, not a pairing); the result `k * sum` must lie in the key's range. */
+  scaledSum(table: string, col: string, k: bigint | number, where?: WirePred | null): Promise<bigint> {
+    return this.exclusive(async () => {
+      this.encryptedCol(table, col);
+      if (this.col(table, col).policy !== "fhe") throw usage("scaledSum is only supported on FHE columns");
+      const kk = typeof k === "bigint" ? k : Number.isSafeInteger(k) ? BigInt(k) : null;
+      if (kk === null || kk > FHE_MAX_K || kk < -FHE_MAX_K) throw usage("the scale must be an integer with |k| <= 2^40");
+      return this.fheSum(table, col, await this.matching(table, wirePred(where)), kk);
     });
   }
 
   private async sumIds(table: string, col: string, idxs: number[]): Promise<Decoded> {
     this.encryptedCol(table, col);
+    if (this.col(table, col).policy === "fhe") {
+      throw usage(`FHE column ${table}.${col} cannot be used in a join query`);
+    }
     return decode(await this.sumScalar(table, col, idxs));
+  }
+
+  /** SUM (times `k`) of an FHE column: chunked `fhe_sum` calls, partial blobs combined here by G1 addition,
+   *  then opened by the key (and, when authenticated, checked against the integrity tags). */
+  private async fheSum(table: string, col: string, idxs: number[], k: bigint = 1n): Promise<bigint> {
+    const key = this.fheKey();
+    if (idxs.length === 0) return 0n;
+    let total: Buffer | null = null, tags: Buffer | null = null;
+    for (let i = 0; i < idxs.length; i += FHE_SUM_CHUNK) {
+      const part = idxs.slice(i, i + FHE_SUM_CHUNK);
+      const args: unknown[] = k === 1n ? [table, col, part] : [table, col, part, Number(k)];
+      const b = blob(await this.call("fhe_sum", args, 4096), "fhe_sum", FHE_SUM_BYTES);
+      total = total === null ? b : fheAddSums(total, b);
+      if (this.#authenticated) {
+        let t: Buffer;
+        try {
+          t = blob(await this.call("fhe_sum", [table, FMAC + col, ...args.slice(2)], 4096), "fhe_sum", FHE_SUM_BYTES);
+        } catch (e) {
+          if (e instanceof TorusError && /integrity tag/.test(e.message)) {
+            throw new TorusError("IntegrityError", `${table}.${col} has no integrity tags - it was written without authentication`);
+          }
+          throw e;
+        }
+        tags = tags === null ? t : fheAddSums(tags, t);
+      }
+    }
+    const v = this.#authenticated
+      ? key.decryptSumVerified(total!, tags!, table, col, idxs, k)
+      : key.decryptSum(total!);
+    return BigInt(v);
+  }
+
+  /** Σ aᵢ·bᵢ over two FHE columns: the server multiplies ciphertexts with the pairing-based ★_ct. */
+  private async fheDot(lt: string, lc: string, lids: number[], rt: string, rc: string, rids: number[],
+                       backend?: FheBackend): Promise<bigint> {
+    const key = this.fheKey();
+    if (this.#authenticated && !this.#fheUnverifiedDot) {
+      throw usage("DOT on FHE columns has no integrity protection (a ciphertext product cannot be " +
+        "tag-checked); pass fheAllowUnverifiedDot: true to accept an unverified result");
+    }
+    if (backend !== undefined && backend !== "pyecc" && backend !== "mcl") throw usage("backend must be 'pyecc' or 'mcl'");
+    if (lids.length === 0) return 0n;
+    const chunk = backend === "mcl" ? FHE_DOT_CHUNK_NATIVE : FHE_DOT_CHUNK;
+    let total: Buffer | null = null;
+    for (let i = 0; i < lids.length; i += chunk) {
+      const args: unknown[] = [lt, lc, lids.slice(i, i + chunk), rt, rc, rids.slice(i, i + chunk)];
+      if (backend !== undefined) args.push(backend);
+      const b = blob(await this.call("fhe_dot", args, 8192), "fhe_dot", FHE_DOT_BYTES);
+      if (backend !== undefined && b[0] !== (backend === "mcl" ? 2 : 1)) throw proto("fhe_dot: the back-end tag does not match the requested back end");
+      total = total === null ? b : fheMulDots(total, b);
+    }
+    return BigInt(key.decryptDot(total!));
   }
 
   count(table: string, where?: WirePred | null): Promise<number> {
@@ -1372,13 +1531,24 @@ export class Client {
       this.encryptedCol(table, col);
       const idxs = await this.matching(table, wirePred(where));
       if (idxs.length === 0) return null;
-      return divide(await this.sumIds(table, col, idxs), BigInt(idxs.length));
+      const total = this.col(table, col).policy === "fhe"
+        ? await this.fheSum(table, col, idxs) : await this.sumIds(table, col, idxs);
+      return divide(total, BigInt(idxs.length));
     });
   }
 
   // — Π_mult: encrypted inner product sum a_i*b_i (Beaver triples) —
-  dot(table: string, left: string, right: string, where?: WirePred | null): Promise<Decoded> {
+  dot(table: string, left: string, right: string, where?: WirePred | null, backend?: FheBackend): Promise<Decoded> {
     return this.exclusive(async () => {
+      const fl = this.col(table, left).policy === "fhe", fr = this.col(table, right).policy === "fhe";
+      if (fl || fr) {
+        // FHE: Σ aᵢ·bᵢ by the server's pairings. `backend` picks the pairing library of the server
+        // ("pyecc" slow/portable, "mcl" native); undefined = the server's default.
+        if (!(fl && fr)) throw new TorusError("PlanError", "DOT cannot mix FHE and PAIRED columns");
+        const idxs = await this.matching(table, wirePred(where));
+        return this.fheDot(table, left, idxs, table, right, idxs, backend);
+      }
+      if (backend !== undefined) throw usage("the backend argument is only for FHE columns");
       this.checkDot(table, left); this.checkDot(table, right);
       const idxs = await this.matching(table, wirePred(where));
       return this.dotPairs(table, left, idxs, table, right, idxs);
@@ -1469,12 +1639,34 @@ export class Client {
             "plain_cells", part.length);
           ws.forEach((w, k) => got.set(part[k], uwv(w)));
         }
+      } else if (c.policy === "fhe") {
+        const vs = await this.fheReveal(table, col, uniq);
+        vs.forEach((v, k) => got.set(uniq[k], v));
       } else {
         const ss = await this.unblindCells(table, col, uniq);
         ss.forEach((s, k) => got.set(uniq[k], decode(s)));
       }
     }
     return ids.map((i) => (i === null ? null : got.get(i) ?? null));
+  }
+
+  /** Decrypt the FHE cells of `ids` (verified against their tags when authenticated). */
+  private async fheReveal(table: string, col: string, ids: number[]): Promise<bigint[]> {
+    const key = this.fheKey();
+    const fetch = async (c: string): Promise<Array<Buffer | null>> => {
+      const out: Array<Buffer | null> = [];
+      for (let i = 0; i < ids.length; i += FHE_READ_CHUNK) {
+        const part = ids.slice(i, i + FHE_READ_CHUNK);
+        const ws = arr(await this.call("plain_cells", [table, c, part], part.length * 700 + 4096), "plain_cells", part.length);
+        for (const w of ws) out.push(binCell(w, "plain_cells"));
+      }
+      return out;
+    };
+    const cells = await fetch(col);
+    if (cells.some((c) => c === null)) throw proto(`${table}.${col}: the server returned an empty FHE cell`);
+    if (!this.#authenticated) return cells.map((c) => BigInt(key.decryptCell(c!)));
+    const tags = await fetch(FMAC + col);
+    return cells.map((c, k) => BigInt(key.decryptCellVerified(c, tags[k], table, col, ids[k])));
   }
 
   /** SELECT cols FROM table WHERE pred (plain columns as stored, encrypted ones unblinded). */
@@ -1592,6 +1784,9 @@ export class Client {
   joinColumn(j: JoinResult, alias: string, col: string): Promise<Value[]> {
     return this.exclusive(async () => {
       const p = this.aliasPos(j, alias);
+      if (this.col(j.tables[alias], col).policy === "fhe") {
+        throw usage(`FHE column ${j.tables[alias]}.${col} cannot be used in a join query`);
+      }
       return this.columnIn(j.tables[alias], col, j.tuples.map((t) => t[p]));
     });
   }
@@ -1626,7 +1821,8 @@ export class Client {
     return this.exclusive(async () => {
       const out: Record<string, number[]> = {};
       for (const [table, d] of this.#schema) {
-        const enc = d.cols.filter((c) => c.policy !== "plain").map((c) => c.name);
+        // FHE columns need no mask: any client holding the key reads them
+        const enc = d.cols.filter((c) => c.policy !== "plain" && c.policy !== "fhe").map((c) => c.name);
         if (!enc.length) continue;
         const live = await this.matching(table, null);
         const bad = live.filter((i) => enc.some((c) => !this.#masks.has(mkey(table, i, c))));

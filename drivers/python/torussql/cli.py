@@ -170,12 +170,42 @@ def _parser() -> argparse.ArgumentParser:
                     help="create a new FHE key file at PATH and exit (see --fhe-range)")
     ap.add_argument("--fhe-range", type=int, default=1_000_000,
                     help="largest |value| / result the key can decrypt (default 1000000)")
+    ap.add_argument("--fhe-threshold", metavar="BUNDLE",
+                    help="THRESHOLD FHE key: public bundle from `python -m torussql.custody "
+                         "fhe-keygen-threshold`; s lives only as custodian shares "
+                         "(needs --custody-public, --custodian, --custody-token-env)")
+    ap.add_argument("--custody-public", metavar="PATH", help="custody public key (bn254)")
+    ap.add_argument("--custodian", action="append", metavar="HOST:PORT",
+                    help="custodian daemon (repeat); used with --fhe-threshold")
+    ap.add_argument("--custody-token-env", metavar="VAR",
+                    help="env var with the custodian caller token")
+    ap.add_argument("--custody-tls", action="store_true")
+    ap.add_argument("--custody-cafile", metavar="PATH")
     ap.add_argument("-c", "--command", action="append", metavar="SQL")
     ap.add_argument("-f", "--file", metavar="PATH")
     ap.add_argument("--timing", action="store_true")
     ap.add_argument("--version", action="version", version=f"torussql {nokey.__version__}"
                     if hasattr(nokey, "__version__") else "torussql")
     return ap
+
+
+def _threshold_key(a):
+    from torusdb_core.fhe_threshold import ThresholdFheKey
+    from torussql.custody import PublicKey
+    from torussql.custody.net import RemoteCustodian
+    if not (a.custody_public and a.custodian and a.custody_token_env):
+        raise ValueError("--fhe-threshold needs --custody-public, --custodian and "
+                         "--custody-token-env")
+    tok = os.environ.get(a.custody_token_env)
+    if not tok:
+        raise ValueError(f"${a.custody_token_env} is not set")
+    pub = PublicKey.load(a.custody_public)
+    nodes = []
+    for spec in a.custodian:
+        host, _, port = spec.rpartition(":")
+        nodes.append(RemoteCustodian(host.strip("[]"), int(port), tok, group=pub.g,
+                                     tls=a.custody_tls, cafile=a.custody_cafile))
+    return ThresholdFheKey.load(a.fhe_threshold, pub, nodes)
 
 
 def main(argv=None) -> int:
@@ -202,6 +232,12 @@ def main(argv=None) -> int:
             fhe_key = fhe.load_key(a.fhe_key, fhe_pass)
         except (OSError, ValueError) as exc:
             print(f"error: cannot load the FHE key: {exc}", file=sys.stderr)
+            return 2
+    if a.fhe_threshold:
+        try:
+            fhe_key = _threshold_key(a)
+        except Exception as exc:                                # noqa: BLE001
+            print(f"error: cannot open the threshold FHE key: {exc}", file=sys.stderr)
             return 2
     token = os.environ.get(a.token_env) if a.token_env else None
     if a.token_env and not token:

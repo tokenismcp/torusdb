@@ -102,6 +102,11 @@ class PyEcc:
     def gt_pow(self, a, k): return a ** (k % N)
     def gt_to(self, g) -> bytes: return b"".join(_i32(c.n if hasattr(c, "n") else c) for c in g.coeffs)
 
+    def gt_in_subgroup(self, g) -> bool:
+        """g ∈ μ_n (the order-n subgroup pairings land in): g^n = 1. (``gt_pow`` reduces its
+        exponent mod n, so test with the unreduced exponent.)"""
+        return g ** N == self.gt_one()
+
     def gt_from(self, raw: bytes):
         return FQ12(_rd(raw, 12))
 
@@ -223,6 +228,10 @@ class Mcl:
 
     def gt_key(self, g) -> bytes:
         return g.serialize()
+
+    def gt_in_subgroup(self, g) -> bool:
+        # g^(n-1) · g == 1, avoiding an exponent that the library would reduce to 0
+        return (g.pow(self._fr(N - 1)) * g).serialize() == self.gt_one().serialize()
 
     def gt_gen_bytes(self) -> bytes:
         return self.gt_to(self.gt_gen())

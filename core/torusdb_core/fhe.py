@@ -24,7 +24,7 @@ guessed value: ``e(C2 − v·P, G2) == e(Q, D1)``. Independent randomness remove
 test (see ``tests/test_fhe.py``); security rests on SXDH in BN254 (≈100-bit).
 
 Limits: plaintexts are integers; results must lie in ``[-range, range]`` (the discrete log
-is a baby-step/giant-step search, memory ≈ √range table entries); ciphertexts are 512 bytes;
+is a baby-step/giant-step search, memory ≈ √range table entries); cells are 384 bytes;
 the server does 4 pairings per DOT row (native back end ≈ 1 ms/row, pure-Python fallback
 ≈ 0.2 s/row — see ``fhe_backend``); no integrity — a lying server can return a
 wrong ciphertext (MAC columns are future work); no WHERE/ORDER/GROUP on FHE columns.
@@ -137,36 +137,21 @@ def mul_dots(a: bytes, b: bytes) -> bytes:
 
 
 # ── the owner's side ─────────────────────────────────────────────────────────
-class FheKey:
-    """The secret scalar ``s`` and the derived public key. ``s`` never leaves the owner."""
+class _OwnerOps:
+    """Everything the owner does that needs only PUBLIC data (encryption), a MAC secret
+    (integrity tags) and *some way to compute s·P* — supplied by the subclass:
 
-    def __init__(self, s: int | None = None, value_range: int = DEFAULT_RANGE, backend=None):
-        self._s = s if s is not None else secrets.randbelow(N - 1) + 1
-        if not 0 < self._s < N:
-            raise FheError("secret out of range")
-        self.range = value_range
-        self.be = _be(backend)
-        self.Q = self.be.g1_mul(self.be.G1, self._s)
-        self.Q2 = self.be.g2_mul(self.be.G2, self._s)
-        self._tables: dict[str, dict] = {}
+    * ``FheKey`` holds ``s`` locally;
+    * ``fhe_threshold.ThresholdFheKey`` obtains ``s·P`` from a quorum of custodians and
+      never holds ``s`` at all.
+
+    Subclass contract: ``self.be``, ``self.range``, ``self.Q``, ``self.Q2``,
+    ``_mul_s_many(points) -> [s·P]`` (G1 points of ``self.be``), ``_mac_secret() -> bytes``
+    and ``decrypt_dot``."""
 
     @property
     def backend(self) -> str:
         return self.be.name
-
-    def __repr__(self) -> str:                      # never print the secret
-        return f"<FheKey range={self.range} backend={self.be.name}>"
-
-    def __reduce__(self):
-        raise TypeError("FheKey holds a secret and cannot be pickled or copied")
-
-    @property
-    def secret_bytes(self) -> bytes:
-        return int(self._s).to_bytes(32, "big")
-
-    @staticmethod
-    def from_secret_bytes(raw: bytes, value_range: int = DEFAULT_RANGE, backend=None) -> "FheKey":
-        return FheKey(int.from_bytes(raw, "big"), value_range, backend)
 
     # encryption needs only public data
     def encrypt(self, v: int) -> bytes:
@@ -190,14 +175,15 @@ class FheKey:
     # ── integrity tags (optional, ``authenticated=True``) ─────────────────────
     # Next to the value ciphertext Enc(v) each cell carries a TAG ciphertext
     # Enc(α·v + γ) where α is a secret MAC key and γ = PRF(table, column, row id) is a
-    # secret per-cell tweak; both derive from the owner's secret. For any set of rows I the
-    # owner checks, in the exponent and without any discrete log,
+    # secret per-cell tweak; both derive from the owner's MAC secret (for a plain
+    # ``FheKey`` that is ``s`` itself; for a threshold key a separate 32-byte secret).
+    # For any set of rows I the owner checks, in the exponent and without any discrete log,
     #       tag-sum point  ==  α · value-sum point  +  k · (Σ_{i∈I} γᵢ)·P
     # (k = public scalar multiplier). A server that alters a value, drops/duplicates/swaps a
     # row, or scales a result cannot satisfy it without α and γ (soundness ≈ 1/n per attempt).
     # Not covered: replaying an older version of the same cell; ct×ct (DOT) results.
     def _prf(self, label: bytes, *parts) -> int:
-        h = hmac.new(self.secret_bytes, b"torussql/fhe/" + label, hashlib.sha256).digest()
+        h = hmac.new(self._mac_secret(), b"torussql/fhe/" + label, hashlib.sha256).digest()
         msg = b"\x00".join(str(p).encode() for p in parts)
         return int.from_bytes(hmac.new(h, msg, hashlib.sha512).digest(), "big") % N
 
@@ -211,30 +197,64 @@ class FheKey:
     def tag(self, v: int, table: str, col: str, rowid: int) -> bytes:
         return self.encrypt_scalar(self.alpha * v + self.gamma(table, col, rowid))
 
-    def _opened(self, blob: bytes):
-        """(ΣC2 − s·ΣC1) of a SUM blob — the plaintext times P, as a group element."""
-        be = self.be
-        c1, c2 = self._point_pair(blob)
-        return be.g1_add(c2, be.g1_neg(be.g1_mul(c1, self._s)))
+    def _in_range(self, x: int) -> int:
+        """The baby-step grid overshoots ±range slightly; the contract is strict."""
+        if abs(x) > self.range:
+            raise FheError("result is outside the key's value range (or the ciphertext is invalid)")
+        return x
 
-    def decrypt_sum_verified(self, value_blob: bytes, tag_blob: bytes, table: str, col: str,
-                             rowids, scale: int = 1) -> int:
+    def _point_pair(self, blob: bytes):
+        try:
+            return self.be.g1_from(blob[:64]), self.be.g1_from(blob[64:128])
+        except _fb.BackendError as exc:
+            raise FheError(str(exc)) from None
+
+    def _open_pairs(self, pairs):
+        """[(C1, C2)] -> [C2 − s·C1] (the plaintext times P, as group elements)."""
         be = self.be
-        gam = sum(self.gamma(table, col, i) for i in rowids) % N
-        mv, mt = self._opened(value_blob), self._opened(tag_blob)
-        want = be.g1_add(be.g1_mul(mv, self.alpha), be.g1_mul(be.G1, scale * gam))
+        sc = self._mul_s_many([c1 for c1, _c2 in pairs])
+        return [be.g1_add(c2, be.g1_neg(x)) for (_c1, c2), x in zip(pairs, sc)]
+
+    def _opened(self, blob: bytes):
+        return self._open_pairs([self._point_pair(blob)])[0]
+
+    def _verify_open(self, mv, mt, table, col, gam_sum, scale):
+        be = self.be
+        want = be.g1_add(be.g1_mul(mv, self.alpha), be.g1_mul(be.G1, scale * gam_sum))
         if be.g1_key(mt) != be.g1_key(want):
             raise IntegrityError(f"integrity check failed for {table}.{col}: the server's "
                                  f"aggregate does not match the authenticated cells")
+
+    def decrypt_sum_verified(self, value_blob: bytes, tag_blob: bytes, table: str, col: str,
+                             rowids, scale: int = 1) -> int:
+        gam = sum(self.gamma(table, col, i) for i in rowids) % N
+        mv, mt = self._open_pairs([self._point_pair(value_blob), self._point_pair(tag_blob)])
+        self._verify_open(mv, mt, table, col, gam, scale)
         return self._g1_dlog(mv)
 
     def decrypt_cell_verified(self, cell: bytes | None, tag: bytes | None, table: str,
                               col: str, rowid: int) -> int:
-        if tag is None or cell is None:
-            raise IntegrityError(f"{table}.{col} row {rowid} has no integrity tag "
-                                 f"(written without authentication, or tampered)")
-        return self.decrypt_sum_verified(sum_cells([cell], self.be), sum_cells([tag], self.be),
-                                         table, col, [rowid])
+        return self.decrypt_cells_verified([cell], [tag], table, col, [rowid])[0]
+
+    def decrypt_cells_verified(self, cells, tags, table: str, col: str, rowids) -> list[int]:
+        """Verified read of many cells; a threshold key opens them in as few quorum
+        rounds as possible."""
+        for cell, tag, rowid in zip(cells, tags, rowids):
+            if tag is None or cell is None:
+                raise IntegrityError(f"{table}.{col} row {rowid} has no integrity tag "
+                                     f"(written without authentication, or tampered)")
+        pairs = []
+        for cell, tag in zip(cells, tags):
+            c1, c2, _d1, _d2 = parse_cell(cell, self.be)
+            t1, t2, _e1, _e2 = parse_cell(tag, self.be)
+            pairs += [(c1, c2), (t1, t2)]
+        opened = self._open_pairs(pairs)
+        out = []
+        for j, rowid in enumerate(rowids):
+            mv, mt = opened[2 * j], opened[2 * j + 1]
+            self._verify_open(mv, mt, table, col, self.gamma(table, col, rowid), 1)
+            out.append(self._g1_dlog(mv))
+        return out
 
     # decryption: bounded discrete logs (baby-step / giant-step)
     def _g1_dlog(self, M) -> int:
@@ -252,27 +272,24 @@ class FheKey:
         for i in range(m + 1):
             j = tab["t"].get(be.g1_key(cur))
             if j is not None:
-                return i * m + j - self.range
+                return self._in_range(i * m + j - self.range)
             cur = be.g1_add(cur, step)
         raise FheError("result is outside the key's value range (or the ciphertext is invalid)")
-
-    def _point_pair(self, blob: bytes):
-        try:
-            return self.be.g1_from(blob[:64]), self.be.g1_from(blob[64:128])
-        except _fb.BackendError as exc:
-            raise FheError(str(exc)) from None
 
     def decrypt_sum(self, blob: bytes) -> int:
         if len(blob) != SUM_BYTES:
             raise FheError("bad SUM ciphertext")
-        be = self.be
-        c1, c2 = self._point_pair(blob)
-        return self._g1_dlog(be.g1_add(c2, be.g1_neg(be.g1_mul(c1, self._s))))
+        return self._g1_dlog(self._opened(blob))
 
     def decrypt_cell(self, raw: bytes) -> int:
-        be = self.be
-        c1, c2, _d1, _d2 = parse_cell(raw, be)
-        return self._g1_dlog(be.g1_add(c2, be.g1_neg(be.g1_mul(c1, self._s))))
+        return self.decrypt_cells([raw])[0]
+
+    def decrypt_cells(self, raws) -> list[int]:
+        pairs = []
+        for raw in raws:
+            c1, c2, _d1, _d2 = parse_cell(raw, self.be)
+            pairs.append((c1, c2))
+        return [self._g1_dlog(m) for m in self._open_pairs(pairs)]
 
     def _gt_dlog(self, be, M) -> int:
         m = math.isqrt(self.range * 2 + 1) + 1
@@ -289,9 +306,43 @@ class FheKey:
         for i in range(m + 1):
             j = tab["t"].get(be.gt_key(cur))
             if j is not None:
-                return i * m + j - self.range
+                return self._in_range(i * m + j - self.range)
             cur = be.gt_mul(cur, giant)
         raise FheError("result is outside the key's value range (or the ciphertext is invalid)")
+
+
+class FheKey(_OwnerOps):
+    """The secret scalar ``s`` and the derived public key. ``s`` never leaves the owner."""
+
+    def __init__(self, s: int | None = None, value_range: int = DEFAULT_RANGE, backend=None):
+        self._s = s if s is not None else secrets.randbelow(N - 1) + 1
+        if not 0 < self._s < N:
+            raise FheError("secret out of range")
+        self.range = value_range
+        self.be = _be(backend)
+        self.Q = self.be.g1_mul(self.be.G1, self._s)
+        self.Q2 = self.be.g2_mul(self.be.G2, self._s)
+        self._tables: dict[str, dict] = {}
+
+    def __repr__(self) -> str:                      # never print the secret
+        return f"<FheKey range={self.range} backend={self.be.name}>"
+
+    def __reduce__(self):
+        raise TypeError("FheKey holds a secret and cannot be pickled or copied")
+
+    @property
+    def secret_bytes(self) -> bytes:
+        return int(self._s).to_bytes(32, "big")
+
+    @staticmethod
+    def from_secret_bytes(raw: bytes, value_range: int = DEFAULT_RANGE, backend=None) -> "FheKey":
+        return FheKey(int.from_bytes(raw, "big"), value_range, backend)
+
+    def _mac_secret(self) -> bytes:                 # tags derive from s itself
+        return self.secret_bytes
+
+    def _mul_s_many(self, points):
+        return [self.be.g1_mul(p, self._s) for p in points]
 
     def decrypt_dot(self, blob: bytes) -> int:
         if len(blob) != DOT_BYTES:
@@ -306,6 +357,12 @@ class FheKey:
                                   for i in range(4))
         except _fb.BackendError as exc:
             raise FheError(str(exc)) from None
+        # The secret is used as an exponent below, so every base it touches must lie in the
+        # order-n subgroup of GT. Otherwise a hostile server could send an element of small
+        # order and learn s modulo that order from whether decryption succeeds.
+        for x in (c00, be.gt_mul(c01, c10)):
+            if not be.gt_in_subgroup(x):
+                raise FheError("invalid DOT ciphertext: component outside the GT subgroup")
         s = self._s
         M = be.gt_mul(be.gt_mul(c11, be.gt_pow(c01, N - s)),
                       be.gt_mul(be.gt_pow(c10, N - s), be.gt_pow(c00, s * s)))

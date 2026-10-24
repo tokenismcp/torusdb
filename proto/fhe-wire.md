@@ -52,5 +52,15 @@ cell    = C1 ‖ C2 ‖ D1 ‖ D2                                       384 byte
 | `fhe_sum` | `[table, col, ids, k?]` (col may be `__fmac__<col>`; ≤ 5000 ids) | base64 SUM blob |
 | `fhe_dot` | `[ltable, lcol, lids, rtable, rcol, rids, backend?]` (≤ 300 ids pyecc / 6000 mcl) | base64 DOT blob |
 
+Details clients must know:
+* `fhe_sum`'s `k` is an integer with |k| ≤ 2^40 (server-enforced); `fhe_sum` / `fhe_dot` return a plain
+  base64 **string**; a missing `__fmac__<col>` cell reads back as a NULL wire value, not an error.
+* The caps above cannot be discovered via `hello`; use conservative chunks (≤ 2000 ids for SUM; ≤ 50 for
+  DOT unless the native back end is requested) and a generous timeout (pure Python ≈ 0.2 s per DOT row).
+* **Subgroup checks (mandatory before decrypting a DOT blob):** the secret is used as an exponent, so
+  verify `x^n == 1` in GT for `c00` and for `c01·c10` (this covers every component the secret
+  touches); otherwise a hostile server can send small-order elements and learn `s` modulo their order.
+* Results of a discrete log must satisfy |x| ≤ range (the BSGS grid can overshoot slightly; reject).
+
 Column policy is `fhe` (`INT` only). The server accepts only valid 384-byte cells in FHE columns and never
 binary values elsewhere. Clients must chunk requests below the caps and combine partial blobs themselves.

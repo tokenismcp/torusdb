@@ -31,3 +31,11 @@ tls = ["dep:rustls", "dep:webpki-roots"]
 [[example]]
 name = "demo"
 path = "examples/demo.rs"
+
+# The FHE column arithmetic (BN254 on num-bigint) is ~10x slower unoptimised; keep `cargo test`
+# practical without `--release`. Profiles of dependencies are ignored by crates.io consumers.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3

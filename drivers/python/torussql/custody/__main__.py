@@ -10,6 +10,9 @@ Typical production flow (one command per custodian host):
                        dealerless key generation (exchange the files in ``--out``)
   serve                run the custodian daemon holding one share
   open-test            prove a quorum can open a fresh envelope
+  fhe-keygen-threshold turn a bn254 key into an FHE-column key: derive the G2 public key
+                       from the custodians, seal a MAC secret, write the PUBLIC bundle
+  fhe-open-test        encrypt/decrypt (cell, SUM, DOT, MAC) through a quorum with a bundle
   reshare-start / reshare-finish
                        proactive refresh / change k, n / replace a custodian
 
@@ -340,6 +343,61 @@ def cmd_open_test(a):
     sys.exit(0 if got == K else 1)
 
 
+def _fhe_custodians(a, pub: PublicKey):
+    tok = os.environ.get(a.token_env or "")
+    if not tok:
+        raise SystemExit("set the caller token in the environment variable named by --token-env "
+                         "(tokens are never accepted on the command line)")
+    custs = []
+    for spec in a.custodian:
+        host, port = _hostport(spec)
+        custs.append(RemoteCustodian(host, port, tok, group=pub.g, tls=a.tls, cafile=a.cafile,
+                                     tls_insecure=a.tls_insecure, allow_insecure=a.allow_insecure))
+    return custs
+
+
+def _fhe_selftest(key, dot: bool) -> None:
+    from torusdb_core import fhe
+    cells = [key.encrypt(v) for v in (7, -3)]
+    assert key.decrypt_cells(cells) == [7, -3], "cell decryption mismatch"
+    assert key.decrypt_sum(fhe.sum_cells(cells, key.be)) == 4, "SUM mismatch"
+    if dot:
+        a, b = [key.encrypt(v) for v in (3, 4)], [key.encrypt(v) for v in (5, 6)]
+        assert key.decrypt_dot(fhe.dot_cells(a, b, key.be)) == 39, "DOT mismatch"
+
+
+def cmd_fhe_keygen_threshold(a):
+    """After the bn254 DKG: Q2 from the custodians (pairing-verified), a MAC secret sealed
+    under the threshold envelope, and one PUBLIC bundle file. No secret is written."""
+    from torusdb_core.fhe_threshold import ThresholdFheKey
+    pub = PublicKey.load(a.public)
+    if pub.group != "bn254":
+        raise SystemExit("an FHE key needs a 'bn254' custody key (run the DKG with --group bn254)")
+    if os.path.exists(a.out):
+        raise SystemExit(f"{a.out} already exists")
+    key = ThresholdFheKey.create(pub, _fhe_custodians(a, pub), with_mac=not a.no_mac,
+                                 value_range=a.range)
+    _fhe_selftest(key, dot=False)
+    key.save_bundle(a.out)
+    print(f"threshold FHE bundle written to {a.out} (range +-{a.range}, key {pub.key_id}, "
+          f"quorum {pub.k}-of-{pub.n}); it holds NO secret: s exists only as custodian shares")
+    print("cell/SUM self-test through the quorum: OK")
+    if not a.no_mac:
+        print("NOTE: an owner process using authenticated=True holds the opened "
+              "MAC secret in memory (not s); see docs/fhe-columns.md")
+
+
+def cmd_fhe_open_test(a):
+    from torusdb_core.fhe_threshold import ThresholdFheKey
+    pub = PublicKey.load(a.public)
+    key = ThresholdFheKey.load(a.bundle, pub, _fhe_custodians(a, pub))
+    _fhe_selftest(key, dot=not a.skip_dot)
+    if a.mac:
+        key.alpha
+    print("threshold FHE key: cells, SUM" + ("" if a.skip_dot else ", DOT")
+          + (", MAC" if a.mac else "") + " through the quorum: OK")
+
+
 def _spec(a, old: PublicKey) -> ReshareSpec:
     return ReshareSpec(old, tuple(int(i) for i in a.quorum.split(",")), a.new_k, a.new_n,
                        _session(a.session))
@@ -417,6 +475,27 @@ def main(argv=None):
     p.add_argument("--tls-insecure", action="store_true")
     p.add_argument("--allow-insecure", action="store_true",
                    help="allow plaintext TCP to a non-loopback host (trusted networks only)")
+    for name, fn in (("fhe-keygen-threshold", cmd_fhe_keygen_threshold),
+                     ("fhe-open-test", cmd_fhe_open_test)):
+        p = add(name, fn)
+        p.add_argument("--public", required=True, help="custody public key (group bn254)")
+        p.add_argument("--custodian", action="append", required=True, metavar="HOST:PORT")
+        p.add_argument("--token-env", required=True, metavar="VAR",
+                       help="environment variable holding the caller token")
+        p.add_argument("--tls", action="store_true"); p.add_argument("--cafile")
+        p.add_argument("--tls-insecure", action="store_true")
+        p.add_argument("--allow-insecure", action="store_true",
+                       help="allow plaintext TCP to a non-loopback host (trusted networks only)")
+        if name == "fhe-keygen-threshold":
+            p.add_argument("--out", required=True, help="public bundle to write")
+            p.add_argument("--range", type=int, default=1_000_000,
+                           help="largest |value| / result the key can decrypt")
+            p.add_argument("--no-mac", action="store_true",
+                           help="no integrity-tag secret (authenticated=True will be unavailable)")
+        else:
+            p.add_argument("--bundle", required=True)
+            p.add_argument("--skip-dot", action="store_true")
+            p.add_argument("--mac", action="store_true", help="also open the sealed MAC secret")
     for name, fn in (("reshare-start", cmd_reshare_start), ("reshare-finish", cmd_reshare_finish)):
         p = add(name, fn)
         p.add_argument("--public", required=True); p.add_argument("--quorum", required=True)
@@ -444,9 +523,15 @@ def main(argv=None):
         if name == "mask-reshare":
             p.add_argument("--new-cluster", required=True)
     args = ap.parse_args(argv)
+    errs = (CustodyError,)
+    try:
+        from torusdb_core.fhe import FheError
+        errs += (FheError,)
+    except ImportError:                                           # pragma: no cover
+        pass
     try:
         args.fn(args)
-    except CustodyError as exc:
+    except errs as exc:
         raise SystemExit(f"error: {exc}")
 
 

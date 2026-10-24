@@ -15,21 +15,34 @@
 //! schema was merely learned from the server are read-only for plain columns
 //! (see [`ConnectOptions::trust_server_schema`]).
 //!
+//! **FHE columns.** `policy: "fhe"` INT columns (EC-FHE on BN254, see [`FheKey`]) let the server sum
+//! ciphertexts, scale them by public scalars and multiply two ciphertext columns with a pairing, with no
+//! key and no per-cell state at the server: [`Client::sum`], [`Client::avg`], [`Client::scaled_sum`],
+//! [`Client::dot`]/[`Client::dot_with_backend`], integrity tags via `authenticated`.
+//!
 //! Cargo feature `tls` (off by default) adds TLS via rustls; certificates and
 //! hostnames are verified unless [`ConnectOptions::tls_insecure`] is set.
 
 mod conn;
 mod error;
 mod field;
+mod fhe;
+mod hash;
 
 pub use error::{Error, Kind};
+pub use fhe::{
+    add_sums as fhe_add_sums, cell_to_sum as fhe_cell_to_sum, mul_dots as fhe_mul_dots, sum_cells as fhe_sum_cells,
+    FheBackend, FheKey, FHE_CELL_BYTES, FHE_DEFAULT_RANGE, FHE_DOT_BYTES, FHE_MAX_RANGE, FHE_SUM_BYTES,
+};
+#[doc(hidden)]
+pub use fhe::internals as fhe_internals;
 pub use field::{decode, encode_int, encode_rational, n, reduce, Decoded};
 
 use conn::{Conn, TransportOpts, HARD_MAX_FRAME};
 use field::{md, rand_scalar};
 use num_bigint::BigInt;
 use num_integer::Integer;
-use num_traits::{Signed, Zero};
+use num_traits::{One, Signed, ToPrimitive, Zero};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -46,7 +59,13 @@ type Result<T> = std::result::Result<T, Error>;
 /// Server-side limit on list arguments is 200 000; stay well under it.
 const LIST_CHUNK: usize = 100_000;
 const MAC: &str = "__mac__";
-const POLICIES: [&str; 3] = ["plain", "encrypted", "paired"];
+const FMAC: &str = "__fmac__";
+const FHE_SUM_CHUNK: usize = 2000; // ids per fhe_sum call (server cap 5000)
+const FHE_DOT_CHUNK_NATIVE: usize = 2000; // server cap 6000 with the native back end
+const FHE_DOT_CHUNK: usize = 50; // server cap 300 with pure Python (~0.2 s per row)
+const FHE_READ_CHUNK: usize = 5000; // cells per plain_cells call (~600 bytes each)
+const FHE_MAX_K: i64 = 1 << 40;
+const POLICIES: [&str; 4] = ["plain", "encrypted", "paired", "fhe"];
 const TYPES: [&str; 3] = ["int", "str", "rational"];
 
 // ── column spec / cell values ────────────────────────────────────────────────
@@ -54,7 +73,7 @@ const TYPES: [&str; 3] = ["int", "str", "rational"];
 pub struct Column {
     pub name: String,
     pub ty: String,     // "int" | "str" | "rational"
-    pub policy: String, // "plain" | "encrypted" | "paired"
+    pub policy: String, // "plain" | "encrypted" | "paired" | "fhe"
 }
 
 /// A cell value, used both for input and for revealed plain/decrypted output.
@@ -147,6 +166,42 @@ fn check_name(kind: &str, n: &str) -> Result<()> {
 }
 
 // ── wire value codec (mirrors proto/nokey_wire.py) ───────────────────────────
+/// An FHE ciphertext cell as a wire value. The length is checked before anything is sent.
+fn wv_cell(cell: &[u8]) -> Result<Value> {
+    if cell.len() != FHE_CELL_BYTES {
+        return Err(Error::interface(format!(
+            "an FHE cell is exactly {} bytes, got {}",
+            FHE_CELL_BYTES,
+            cell.len()
+        )));
+    }
+    Ok(json!({"t": "x", "v": fhe::b64_encode(cell)}))
+}
+
+/// A binary cell from the server: `None` for a NULL cell, else exactly `len` canonical-base64 bytes.
+fn bin_cell(d: &Value, what: &str, len: usize) -> Result<Option<Vec<u8>>> {
+    match d.get("t").and_then(|t| t.as_str()) {
+        Some("n") => Ok(None),
+        Some("x") => {
+            let s = d["v"].as_str().ok_or_else(|| proto(format!("{}: expected a binary cell", what)))?;
+            match fhe::b64_decode(s) {
+                Some(b) if b.len() == len => Ok(Some(b)),
+                _ => Err(proto(format!("{}: a binary cell must be {} bytes of canonical base64", what, len))),
+            }
+        }
+        _ => Err(proto(format!("{}: expected a binary cell", what))),
+    }
+}
+
+/// A base64 blob reply (`fhe_sum` / `fhe_dot`) of exactly `len` bytes.
+fn blob(d: &Value, what: &str, len: usize) -> Result<Vec<u8>> {
+    let s = d.as_str().ok_or_else(|| proto(format!("{}: expected a base64 string", what)))?;
+    match fhe::b64_decode(s) {
+        Some(b) if b.len() == len => Ok(b),
+        _ => Err(proto(format!("{}: expected {} bytes of canonical base64", what, len))),
+    }
+}
+
 fn wv(v: &CellIn) -> Result<Value> {
     Ok(match v {
         CellIn::Null => json!({"t": "n"}),
@@ -227,6 +282,12 @@ pub struct ConnectOptions {
     /// padded MAC alpha*s (hidden `__mac__<col>` cells, alpha kept in the
     /// vault) and every affine result / read is verified (`Kind::Integrity`).
     pub authenticated: bool,
+    /// The owner's key for `fhe` columns (see [`FheKey`]). Needed for INSERT/UPDATE/reads/SUM/DOT on
+    /// them. With `authenticated`, FHE cells also carry integrity tags in a hidden `__fmac__<col>` column.
+    pub fhe_key: Option<FheKey>,
+    /// With `authenticated`, still allow DOT on FHE columns. A ciphertext product cannot be
+    /// tag-checked, so the result is NOT protected against a lying server. Default false.
+    pub fhe_allow_unverified_dot: bool,
 }
 
 impl Default for ConnectOptions {
@@ -242,6 +303,8 @@ impl Default for ConnectOptions {
             sync_schema: true,
             trust_server_schema: false,
             authenticated: false,
+            fhe_key: None,
+            fhe_allow_unverified_dot: false,
         }
     }
 }
@@ -259,6 +322,8 @@ impl fmt::Debug for ConnectOptions {
             .field("sync_schema", &self.sync_schema)
             .field("trust_server_schema", &self.trust_server_schema)
             .field("authenticated", &self.authenticated)
+            .field("fhe_key", &self.fhe_key)
+            .field("fhe_allow_unverified_dot", &self.fhe_allow_unverified_dot)
             .finish()
     }
 }
@@ -373,7 +438,13 @@ struct TableDef {
     trusted: bool,
 }
 type Schema = HashMap<String, TableDef>;
-type BlindedRow = (serde_json::Map<String, Value>, Vec<(String, BigInt)>);
+/// A row ready to send: the wire cells, the masks to remember, and (authenticated FHE) the
+/// `(column, plaintext)` pairs whose row-bound tags are written once the row id is known.
+struct BlindedRow {
+    wire: serde_json::Map<String, Value>,
+    pending: Vec<(String, BigInt)>,
+    tags: Vec<(String, i64)>,
+}
 
 pub struct Client {
     conn: Conn,
@@ -716,6 +787,9 @@ impl Client {
             if !TYPES.contains(&c.ty.as_str()) {
                 return Err(Error::interface(format!("bad type for {}: {}", c.name, c.ty)));
             }
+            if c.policy == "fhe" && c.ty != "int" {
+                return Err(Error::interface(format!("FHE columns must be INT (column {})", c.name)));
+            }
         }
         let wire: Vec<Value> = cols.iter().map(|c| json!([c.name, c.ty, c.policy])).collect();
         let args = if if_not_exists { json!([name, wire, true]) } else { json!([name, wire]) };
@@ -890,12 +964,55 @@ impl Client {
         Ok((cells, masks))
     }
 
-    #[allow(clippy::type_complexity)]
-    fn blind_row(
-        &self,
-        table: &str,
-        row: &[(&str, CellIn)],
-    ) -> Result<(serde_json::Map<String, Value>, Vec<(String, BigInt)>)> {
+    // — FHE columns —
+    fn fhe_key(&self) -> Result<&FheKey> {
+        self.opts.fhe_key.as_ref().ok_or_else(|| {
+            Error::interface("this table has FHE columns but no FHE key is loaded (set ConnectOptions::fhe_key)")
+        })
+    }
+
+    /// The integer of an FHE cell: FHE columns hold integers only (no NULL, bool, string, fraction).
+    fn fhe_int(v: &CellIn, table: &str, col: &str) -> Result<i64> {
+        let int = match v {
+            CellIn::Int(i) => Some(i.clone()),
+            CellIn::Rational(a, b) if !b.is_zero() => match reduce(a, b) {
+                Decoded::Int(i) => Some(i),
+                _ => None,
+            },
+            _ => None,
+        };
+        match int {
+            Some(i) => i64::try_from(&i).map_err(|_| {
+                Error::budget(format!("value of {}.{} is outside the range of any FHE key", table, col))
+            }),
+            None => Err(Error::interface(format!("FHE column {}.{} holds integers only", table, col))),
+        }
+    }
+
+    /// The encrypted wire cell of an FHE column plus (authenticated) its tag. `rowid` is unknown at
+    /// INSERT time: a placeholder tag is sent and replaced by `fhe_write_tags` once the row id exists.
+    fn fhe_cells(&self, table: &str, col: &str, x: i64, rowid: Option<i64>) -> Result<Vec<(String, Value)>> {
+        let key = self.fhe_key()?;
+        let mut cells = vec![(col.to_string(), wv_cell(&key.encrypt(x)?)?)];
+        if self.opts.authenticated {
+            let tag = match rowid {
+                None => key.placeholder_cell()?,
+                Some(id) => key.tag(x, table, col, id)?,
+            };
+            cells.push((format!("{}{}", FMAC, col), wv_cell(&tag)?));
+        }
+        Ok(cells)
+    }
+
+    fn fhe_write_tags(&mut self, table: &str, rowid: i64, tags: &[(String, i64)]) -> Result<()> {
+        for (col, x) in tags {
+            let cell = self.fhe_key()?.tag(*x, table, col, rowid)?;
+            self.call_max("update_cell", json!([table, rowid, format!("{}{}", FMAC, col), wv_cell(&cell)?]), 4096)?;
+        }
+        Ok(())
+    }
+
+    fn blind_row(&self, table: &str, row: &[(&str, CellIn)]) -> Result<BlindedRow> {
         self.assert_trusted(table)?;
         let cols = self.cols(table)?;
         let mut seen = HashSet::new();
@@ -909,6 +1026,7 @@ impl Client {
         }
         let mut wire = serde_json::Map::new();
         let mut pending = vec![];
+        let mut tags = vec![];
         for c in cols {
             let v = row
                 .iter()
@@ -919,6 +1037,14 @@ impl Client {
                 })?;
             if c.policy == "plain" {
                 wire.insert(c.name.clone(), wv(v)?);
+            } else if c.policy == "fhe" {
+                let x = Self::fhe_int(v, table, &c.name)?;
+                for (n, w) in self.fhe_cells(table, &c.name, x, None)? {
+                    wire.insert(n, w);
+                }
+                if self.opts.authenticated {
+                    tags.push((c.name.clone(), x));
+                }
             } else {
                 let (cells, masks) = self.blind_cell(table, &c.name, v)?;
                 for (n, w) in cells {
@@ -927,19 +1053,31 @@ impl Client {
                 pending.extend(masks);
             }
         }
-        Ok((wire, pending))
+        Ok(BlindedRow { wire, pending, tags })
     }
 
-    /// INSERT: blind encrypted cells, keep the masks locally. Returns the row id.
+    /// INSERT: blind encrypted cells, keep the masks locally. Returns the row id. With
+    /// authenticated FHE columns the row-bound tags are written in the same transaction.
     pub fn insert(&mut self, table: &str, row: Vec<(&str, CellIn)>) -> Result<i64> {
         self.assert_writable()?;
-        let (wire, pending) = self.blind_row(table, &row)?;
-        let v = self.call_max("insert", json!([table, Value::Object(wire)]), 4096)?;
-        let rowid = row_id(&v, "insert")?;
-        for (col, r) in pending {
-            self.set_mask((table.to_string(), rowid, col), r);
+        let b = self.blind_row(table, &row)?;
+        let tagged = !b.tags.is_empty();
+        let table_s = table.to_string();
+        let run = move |db: &mut Client| -> Result<i64> {
+            let v = db.call_max("insert", json!([table_s, Value::Object(b.wire)]), 4096)?;
+            let rowid = row_id(&v, "insert")?;
+            for (col, r) in b.pending {
+                db.set_mask((table_s.clone(), rowid, col), r);
+            }
+            // the tag binds the row id, known only now - same transaction as the INSERT
+            db.fhe_write_tags(&table_s, rowid, &b.tags)?;
+            Ok(rowid)
+        };
+        if tagged {
+            self.atomically(run)
+        } else {
+            run(self)
         }
-        Ok(rowid)
     }
 
     /// Bulk insert: all rows are blinded locally and sent in `insert_many` round
@@ -954,6 +1092,7 @@ impl Client {
         for r in &rows {
             blinded.push(self.blind_row(table, r)?);
         }
+        let tagged = blinded.iter().any(|b| !b.tags.is_empty());
         const PER: usize = 50_000;
         let table = table.to_string();
         let send = move |db: &mut Client, blinded: Vec<BlindedRow>| -> Result<Vec<i64>> {
@@ -961,22 +1100,23 @@ impl Client {
             let mut it = blinded.into_iter().peekable();
             while it.peek().is_some() {
                 let part: Vec<_> = it.by_ref().take(PER).collect();
-                let wires: Vec<Value> = part.iter().map(|(w, _)| Value::Object(w.clone())).collect();
+                let wires: Vec<Value> = part.iter().map(|b| Value::Object(b.wire.clone())).collect();
                 let v = db.call_max("insert_many", json!([table, wires]), part.len() * 24 + 4096)?;
                 let ids = arr(&v, "insert_many", Some(part.len()))?
                     .iter()
                     .map(|x| row_id(x, "insert_many"))
                     .collect::<Result<Vec<i64>>>()?;
-                for (rid, (_, pending)) in ids.iter().zip(part) {
-                    for (col, r) in pending {
+                for (rid, b) in ids.iter().zip(part) {
+                    for (col, r) in b.pending {
                         db.set_mask((table.clone(), *rid, col), r);
                     }
+                    db.fhe_write_tags(&table, *rid, &b.tags)?;
                 }
                 all.extend(ids);
             }
             Ok(all)
         };
-        if blinded.len() > PER {
+        if blinded.len() > PER || tagged {
             self.atomically(|db| send(db, blinded))
         } else {
             send(self, blinded)
@@ -996,8 +1136,15 @@ impl Client {
             let idxs = db.matching(table, pred)?;
             for i in &idxs {
                 for (col, v) in &set {
-                    if db.policy(table, col)? == "plain" {
+                    let policy = db.policy(table, col)?;
+                    if policy == "plain" {
                         db.call_max("update_cell", json!([table, i, col, wv(v)?]), 4096)?;
+                    } else if policy == "fhe" {
+                        // a fresh ciphertext (and tag) per row, never one shared cell
+                        let x = Self::fhe_int(v, table, col)?;
+                        for (n, w) in db.fhe_cells(table, col, x, Some(*i))? {
+                            db.call_max("update_cell", json!([table, i, n, w]), 4096)?;
+                        }
                     } else {
                         let (cells, masks) = db.blind_cell(table, col, v)?;
                         for (n, w) in cells {
@@ -1346,17 +1493,159 @@ impl Client {
         Ok(y)
     }
 
-    /// Π_lin: SUM over matched rows (the server never holds a key).
+    /// Π_lin: SUM over matched rows (the server never holds a key). On an FHE column the server
+    /// adds the ciphertexts (EC addition) and this client opens the result with its [`FheKey`].
     pub fn sum(&mut self, table: &str, col: &str, pred: Value) -> Result<Decoded> {
         self.encrypted_col(table, col)?;
         let pred = wire_pred(&pred)?;
         let idxs = self.matching(table, pred)?;
+        if self.policy(table, col)? == "fhe" {
+            return Ok(Decoded::Int(BigInt::from(self.fhe_sum(table, col, &idxs, &BigInt::one())?)));
+        }
         self.sum_ids(table, col, &idxs)
+    }
+
+    /// `k * SUM(col)` over an FHE column: the SERVER multiplies the summed ciphertext by the public
+    /// scalar `k` (EC scalar multiplication, not a pairing); `k * sum` must lie in the key's range.
+    pub fn scaled_sum(&mut self, table: &str, col: &str, k: i64, pred: Value) -> Result<Decoded> {
+        self.encrypted_col(table, col)?;
+        if self.policy(table, col)? != "fhe" {
+            return Err(Error::interface("scaled_sum is only supported on FHE columns"));
+        }
+        if k.abs() > FHE_MAX_K {
+            return Err(Error::interface("the scale must be an integer with |k| <= 2^40"));
+        }
+        let pred = wire_pred(&pred)?;
+        let idxs = self.matching(table, pred)?;
+        Ok(Decoded::Int(BigInt::from(self.fhe_sum(table, col, &idxs, &BigInt::from(k))?)))
     }
 
     fn sum_ids(&mut self, table: &str, col: &str, idxs: &[i64]) -> Result<Decoded> {
         self.encrypted_col(table, col)?;
+        if self.policy(table, col)? == "fhe" {
+            return Err(Error::interface(format!("FHE column {}.{} cannot be used in a join query", table, col)));
+        }
         decode(&self.sum_scalar(table, col, idxs)?)
+    }
+
+    /// SUM (times `k`) of an FHE column: chunked `fhe_sum` calls, partial blobs combined here by G1
+    /// addition, then opened by the key (and, when authenticated, checked against the integrity tags).
+    fn fhe_sum(&mut self, table: &str, col: &str, idxs: &[i64], k: &BigInt) -> Result<i64> {
+        let key = self.fhe_key()?.clone();
+        if idxs.is_empty() {
+            return Ok(0);
+        }
+        let (mut total, mut tags): (Option<Vec<u8>>, Option<Vec<u8>>) = (None, None);
+        for part in idxs.chunks(FHE_SUM_CHUNK) {
+            let mut args = vec![json!(table), json!(col), json!(part)];
+            if !k.is_one() {
+                args.push(json!(k.to_i64().unwrap_or(0)));
+            }
+            let b = blob(&self.call_max("fhe_sum", Value::Array(args.clone()), 4096)?, "fhe_sum", FHE_SUM_BYTES)?;
+            total = Some(match total {
+                None => b,
+                Some(t) => fhe_add_sums(&t, &b)?,
+            });
+            if self.opts.authenticated {
+                args[1] = json!(format!("{}{}", FMAC, col));
+                let r = match self.call_max("fhe_sum", Value::Array(args), 4096) {
+                    Ok(v) => v,
+                    Err(e) if e.message.contains("integrity tag") => {
+                        return Err(Error::new(
+                            Kind::Integrity,
+                            format!("{}.{} has no integrity tags - it was written without authentication", table, col),
+                        ))
+                    }
+                    Err(e) => return Err(e),
+                };
+                let t = blob(&r, "fhe_sum", FHE_SUM_BYTES)?;
+                tags = Some(match tags {
+                    None => t,
+                    Some(x) => fhe_add_sums(&x, &t)?,
+                });
+            }
+        }
+        let total = total.unwrap();
+        if self.opts.authenticated {
+            key.decrypt_sum_verified(&total, &tags.unwrap(), table, col, idxs, k)
+        } else {
+            key.decrypt_sum(&total)
+        }
+    }
+
+    /// Σ aᵢ·bᵢ over two FHE columns: the server multiplies ciphertexts with the pairing-based ★_ct.
+    #[allow(clippy::too_many_arguments)]
+    fn fhe_dot(
+        &mut self,
+        lt: &str,
+        lc: &str,
+        lids: &[i64],
+        rt: &str,
+        rc: &str,
+        rids: &[i64],
+        backend: Option<FheBackend>,
+    ) -> Result<i64> {
+        let key = self.fhe_key()?.clone();
+        if self.opts.authenticated && !self.opts.fhe_allow_unverified_dot {
+            return Err(Error::interface(
+                "DOT on FHE columns has no integrity protection (a ciphertext product cannot be \
+                 tag-checked); set ConnectOptions::fhe_allow_unverified_dot to accept an unverified result",
+            ));
+        }
+        if lids.is_empty() {
+            return Ok(0);
+        }
+        let chunk = if backend == Some(FheBackend::Mcl) { FHE_DOT_CHUNK_NATIVE } else { FHE_DOT_CHUNK };
+        let mut total: Option<Vec<u8>> = None;
+        for (l, r) in lids.chunks(chunk).zip(rids.chunks(chunk)) {
+            let mut args = vec![json!(lt), json!(lc), json!(l), json!(rt), json!(rc), json!(r)];
+            if let Some(b) = backend {
+                args.push(json!(b.as_str()));
+            }
+            let b = blob(&self.call_max("fhe_dot", Value::Array(args), 8192)?, "fhe_dot", FHE_DOT_BYTES)?;
+            if let Some(be) = backend {
+                if b[0] != be.tag() {
+                    return Err(proto("fhe_dot: the back-end tag does not match the requested back end"));
+                }
+            }
+            total = Some(match total {
+                None => b,
+                Some(t) => fhe_mul_dots(&t, &b)?,
+            });
+        }
+        key.decrypt_dot(&total.unwrap())
+    }
+
+    /// Decrypt the FHE cells of `ids` (verified against their tags when authenticated).
+    fn fhe_reveal(&mut self, table: &str, col: &str, ids: &[i64]) -> Result<Vec<i64>> {
+        let key = self.fhe_key()?.clone();
+        let fetch = |db: &mut Client, c: &str| -> Result<Vec<Option<Vec<u8>>>> {
+            let mut out = vec![];
+            for part in ids.chunks(FHE_READ_CHUNK) {
+                let v = db.call_max("plain_cells", json!([table, c, part]), part.len() * 700 + 4096)?;
+                for w in arr(&v, "plain_cells", Some(part.len()))? {
+                    out.push(bin_cell(w, "plain_cells", FHE_CELL_BYTES)?);
+                }
+            }
+            Ok(out)
+        };
+        let cells = fetch(self, col)?;
+        if !self.opts.authenticated {
+            return cells
+                .iter()
+                .map(|c| match c {
+                    Some(c) => key.decrypt_cell(c),
+                    None => Err(proto(format!("{}.{}: the server returned an empty FHE cell", table, col))),
+                })
+                .collect();
+        }
+        let tags = fetch(self, &format!("{}{}", FMAC, col))?;
+        cells
+            .iter()
+            .zip(&tags)
+            .zip(ids)
+            .map(|((c, t), id)| key.decrypt_cell_verified(c.as_deref(), t.as_deref(), table, col, *id))
+            .collect()
     }
 
     pub fn count(&mut self, table: &str, pred: Value) -> Result<usize> {
@@ -1372,7 +1661,11 @@ impl Client {
         if idxs.is_empty() {
             return Ok(None);
         }
-        let s = self.sum_ids(table, col, &idxs)?;
+        let s = if self.policy(table, col)? == "fhe" {
+            Decoded::Int(BigInt::from(self.fhe_sum(table, col, &idxs, &BigInt::one())?))
+        } else {
+            self.sum_ids(table, col, &idxs)?
+        };
         let (a, b) = match s {
             Decoded::Int(a) => (a, BigInt::from(1)),
             Decoded::Rational(a, b) => (a, b),
@@ -1398,8 +1691,37 @@ impl Client {
         Ok(())
     }
 
-    /// Π_mult: encrypted inner product Σ aᵢ·bᵢ via Beaver triples.
+    /// Π_mult: encrypted inner product Σ aᵢ·bᵢ via Beaver triples (PAIRED columns) or, for two FHE
+    /// columns, by the server's pairing-based ciphertext product (the server's default back end).
     pub fn dot(&mut self, table: &str, left: &str, right: &str, pred: Value) -> Result<Decoded> {
+        self.dot_with_backend(table, left, right, pred, None)
+    }
+
+    /// Like [`Client::dot`] but, for FHE columns, asks the server for a specific pairing back end
+    /// (`Pyecc` portable/slow, `Mcl` native/fast); `None` = the server's default. Both DOT result
+    /// encodings are decoded here. Only valid for FHE columns.
+    pub fn dot_with_backend(
+        &mut self,
+        table: &str,
+        left: &str,
+        right: &str,
+        pred: Value,
+        backend: Option<FheBackend>,
+    ) -> Result<Decoded> {
+        let fl = self.policy(table, left)? == "fhe";
+        let fr = self.policy(table, right)? == "fhe";
+        if fl || fr {
+            if !(fl && fr) {
+                return Err(Error::new(Kind::PlanError, "DOT cannot mix FHE and PAIRED columns"));
+            }
+            let pred = wire_pred(&pred)?;
+            let idxs = self.matching(table, pred)?;
+            let v = self.fhe_dot(table, left, &idxs, table, right, &idxs, backend)?;
+            return Ok(Decoded::Int(BigInt::from(v)));
+        }
+        if backend.is_some() {
+            return Err(Error::interface("the backend argument is only for FHE columns"));
+        }
         self.check_dot(table, left)?;
         self.check_dot(table, right)?;
         let pred = wire_pred(&pred)?;
@@ -1508,6 +1830,11 @@ impl Client {
                     for (w, i) in ws.iter().zip(part) {
                         got.insert(*i, uwv(w)?);
                     }
+                }
+            } else if policy == "fhe" {
+                let vs = self.fhe_reveal(table, col, &uniq)?;
+                for (v, i) in vs.iter().zip(&uniq) {
+                    got.insert(*i, CellIn::Int(BigInt::from(*v)));
                 }
             } else {
                 let ss = self.unblind_cells(table, col, &uniq)?;
@@ -1702,6 +2029,12 @@ impl Client {
     /// Values of alias.col for every joined row (Null on the NULL side).
     pub fn join_column(&mut self, j: &JoinResult, alias: &str, col: &str) -> Result<Vec<CellIn>> {
         let p = Self::alias_pos(j, alias)?;
+        if self.policy(&j.tables[alias], col)? == "fhe" {
+            return Err(Error::interface(format!(
+                "FHE column {}.{} cannot be used in a join query",
+                j.tables[alias], col
+            )));
+        }
         let ids: Vec<Option<i64>> = j.tuples.iter().map(|t| t[p]).collect();
         self.column(&j.tables[alias], col, &ids)
     }
@@ -1751,7 +2084,8 @@ impl Client {
             .map(|(t, d)| {
                 (
                     t.clone(),
-                    d.cols.iter().filter(|c| c.policy != "plain").map(|c| c.name.clone()).collect(),
+                    // FHE columns need no mask: any client holding the key reads them
+                    d.cols.iter().filter(|c| c.policy != "plain" && c.policy != "fhe").map(|c| c.name.clone()).collect(),
                 )
             })
             .collect();

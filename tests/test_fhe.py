@@ -406,3 +406,32 @@ def test_published_vectors():
     gens = v["gt_generators"]
     assert fhe._fb.get("pyecc").gt_to(fhe._fb.get("pyecc").gt_gen()).hex() == gens["pyecc_tag01"]
     assert fhe._fb.MCL_GT_GENERATOR.hex() == gens["mcl_tag02"]
+
+
+@pytest.mark.parametrize("backend", ["pyecc", "mcl"])
+def test_dot_decryption_refuses_components_outside_the_gt_subgroup(backend):
+    """A hostile server must not be able to make the secret exponent act on a small-order element."""
+    import random
+    from py_ecc.optimized_bn128 import FQ12
+    if backend == "mcl" and not HAVE_MCL:
+        pytest.skip("mclbn256 not installed")
+    key = fhe.FheKey(KEY._s, 50_000, backend=backend)
+    A, B = [key.encrypt(3), key.encrypt(4)], [key.encrypt(5), key.encrypt(6)]
+    blob = fhe.dot_cells(A, B, backend)
+    assert key.decrypt_dot(blob) == 3 * 5 + 4 * 6
+    be = fhe._fb.by_tag(blob[:1])
+    junk = be.gt_from(be.gt_to(FQ12([random.randrange(2, fhe._fb.P_MOD) for _ in range(12)])) if False else
+                      b"".join(random.randrange(2, fhe._fb.P_MOD).to_bytes(32, "big") for _ in range(12))) \
+        if backend == "pyecc" else None
+    for pos in (0, 1, 2):                                                          # c00, c01, c10
+        parts = [blob[1 + i * 384:1 + (i + 1) * 384] for i in range(4)]
+        if backend == "pyecc":
+            parts[pos] = be.gt_to(be.gt_mul(be.gt_from(parts[pos]), junk))
+        else:                                  # a random Fp12 element in the canonical encoding
+            parts[pos] = b"".join(random.randrange(2, fhe._fb.P_MOD).to_bytes(32, "big") for _ in range(12))
+        with pytest.raises((fhe.FheError)):
+            key.decrypt_dot(blob[:1] + b"".join(parts))
+    # an out-of-range answer is refused even if the BSGS grid happens to reach it
+    small = fhe.FheKey(KEY._s, 10, backend="pyecc")
+    with pytest.raises(fhe.FheError):
+        small.decrypt_sum(fhe.sum_cells([KEY.encrypt(10), KEY.encrypt(10)], "pyecc"))

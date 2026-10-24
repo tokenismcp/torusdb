@@ -55,11 +55,18 @@ export interface RunningServer {
   stop(): Promise<void>;
 }
 
-export function startServer(extra: string[] = []): Promise<RunningServer> {
+/** Directory holding the native `mclbn256` package (optional): when TORUSDB_MCL_PATH is set the
+ *  server gets it on PYTHONPATH, so FHE DOT runs on the fast native back end. */
+export function mclPath(): string | undefined {
+  const p = process.env.TORUSDB_MCL_PATH;
+  return p && fs.existsSync(p) ? p : undefined;
+}
+
+export function startServer(extra: string[] = [], env: NodeJS.ProcessEnv = {}): Promise<RunningServer> {
   const py = findPython()!;
   return new Promise((resolve, reject) => {
     const child: ChildProcess = spawn(py, [SERVER_PY, "--host", "127.0.0.1", "--port", "0", "--log-level", "WARNING", ...extra],
-      { stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, PYTHONUNBUFFERED: "1" } });
+      { stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, PYTHONUNBUFFERED: "1", ...env } });
     let out = "", err = "";
     let done = false;
     const timer = setTimeout(() => { if (!done) { done = true; child.kill("SIGKILL"); reject(new Error("server start timeout\n" + out + err)); } }, 30000);
@@ -99,3 +106,20 @@ export const EMP_COLS: Column[] = [
   { name: "rate", type: "int", policy: "paired" },
   { name: "hours", type: "int", policy: "paired" },
 ];
+
+/** The repo's Python packages for helper scripts (core, parser, python driver). */
+export function pythonEnv(): NodeJS.ProcessEnv {
+  const sep = path.delimiter;
+  const pp = [path.join(REPO, "core"), path.join(REPO, "parser"), path.join(REPO, "drivers/python")];
+  return { ...process.env, PYTHONPATH: pp.join(sep) + (process.env.PYTHONPATH ? sep + process.env.PYTHONPATH : "") };
+}
+
+/** Run the Python peer (test/fhe_peer.py): it connects with the Python driver and runs SQL. */
+export function runPeer(host: string, port: number, spec: unknown): any {
+  const py = findPython()!;
+  const script = path.resolve(__dirname, "../../test/fhe_peer.py");
+  const r = spawnSync(py, [script, host, String(port), JSON.stringify(spec)],
+    { env: pythonEnv(), encoding: "utf8", timeout: 240000 });
+  if (r.status !== 0) throw new Error(`fhe_peer failed (${r.status}): ${r.stderr}`);
+  return JSON.parse(r.stdout);
+}

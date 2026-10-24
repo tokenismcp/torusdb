@@ -98,11 +98,82 @@ ciphertext and verified it finds nothing here (`tests/test_fhe.py`).
 * The native back end switches the `mcl` library's process-wide curve to `alt_bn128`
   (`BN_SNARK1`), validates every point **including subgroup membership**, and self-tests
   against `py_ecc` at start-up. Do not mix it with other `mcl` users in the same process.
-* **Key custody:** the key is a file (sealed with a passphrase). Threshold custody of the FHE
-  key is not wired up yet. Losing the key loses the data.
+* **Key custody:** by default the key is a file (sealed with a passphrase); losing it loses the
+  data. For no single-holder of `s` use **threshold custody** (next section).
 * **Cryptographic review:** this construction is new in this codebase and has had no
   independent review. Treat it as experimental.
-* Only the Python driver supports FHE columns so far.
+* Python, TypeScript and Rust drivers support FHE columns (same wire format; known-answer vectors
+  in `proto/fhe-vectors.json` and cross-language tests).
+
+## Threshold custody of the FHE key (`ThresholdFheKey`)
+
+The secret `s` can live **only** as a k-of-n sharing among custodians (the Laurent-series
+sharing of `torussql.custody`, group `bn254`, dealerless DKG). No server, custodian or owner
+process holds `s`, and `s` is never reassembled (the tests run every operation with
+`laurent.reconstruct` patched to raise).
+
+```bash
+# 1. dealerless DKG on the bn254 group (docs/custody.md section 2.1), then run the daemons
+python -m torussql.custody keygen-local --k 3 --n 5 --group bn254 --out keys/   # dev only; use identity-new/dkg-* in production
+# 2. one owner-side step: Q2 from the custodians, a sealed MAC secret, ONE public bundle (no secret)
+python -m torussql.custody fhe-keygen-threshold --public public.json --token-env CT \
+    --custodian host1:8601 --custodian host2:8601 --custodian host3:8601 --out fhe-bundle.json
+python -m torussql.custody fhe-open-test --public public.json --bundle fhe-bundle.json ...  # cells, SUM, DOT, MAC
+torussql --fhe-threshold fhe-bundle.json --custody-public public.json --custodian host1:8601 ... \
+         --custody-token-env CT -p 8533
+```
+```python
+from torusdb_core.fhe_threshold import ThresholdFheKey
+key = ThresholdFheKey.load("fhe-bundle.json", PublicKey.load("public.json"), remote_custodians)
+conn = torussql.connect(host, fhe_key=key, authenticated=True)     # the same surface as FheKey
+```
+
+| owner operation | without `s` |
+|---|---|
+| encrypt | needs only `Q = s*G1` (= the custody public key `X`) and `Q2 = s*G2`. `Q2` is assembled from the custodians' G2 shares `y_i*G2` (each checked by the pairing `e(Y_i, G2) = e(G1, Y2_i)` plus a G2 subgroup test) and re-checked against `Q` by `e(Q, G2) = e(G1, Q2)`; a wrong `Q2` is refused at load. It is stored in the public bundle. |
+| decrypt a cell / `SUM` / `k*SUM` | the existing threshold decryption: the owner sends `E = C1` to the custodians, each answers `y_i*E` with a DLEQ proof against its verification key, the client combines `s*C1 = sum(lambda_i * y_i*E)`. Batched: a `SELECT` of n cells is one round (n points per custodian request). |
+| decrypt `DOT` | `M = c11 * c01^-s * c10^-s * c00^(s^2)` by **threshold exponentiation in GT**: custodian i returns `c^(y_i)` with a Chaum-Pedersen proof, the client combines `c^s = prod(D_i^lambda_i)`. `s^2` is **two sequential rounds** (`u = c00^s`, then `u^s`); `s*s` is never computed. |
+| integrity tags | see the MAC trade-off below. |
+
+**Soundness of the GT proof** (`torussql/custody/gt.py`). Statement: `Y_i = y_i*G1` is custodian i's public
+verification key and `D = c^(y_i)`. G1 and the order-q subgroup mu_q of GT have the same prime order q, so the
+standard Chaum-Pedersen protocol runs across them: `R1 = k*G1`, `R2 = c^k`, `h = H(ctx, G1, Y_i, c, D, R1, R2)`,
+`z = k + h*y_i`; verify `z*G1 = R1 + h*Y_i` and `c^z = R2 * D^h`. Special soundness: two accepting transcripts with
+the same commitments extract `y = (z-z')/(h-h')` with `Y_i = y*G1` and `D^(h-h') = c^((h-h')*y)`; because `c` and `D`
+lie in mu_q and `gcd(h-h', q) = 1`, `u -> u^(h-h')` is injective there, so `D = c^y` — the same `y` as the
+verification key. **Both `c` and `D` are tested for `u^q = 1`**: without that a hostile server could hand the
+owner a GT element carrying a small-order component, and a custodian that exponentiated it would leak `y_i`
+modulo small primes, and a lying custodian could add such a factor to `D`. Custodians refuse such elements
+(`malformed request`); the owner refuses them before asking. A lying custodian is excluded (and listed in
+`quorum.last_problems`); if fewer than k honest answers remain the call fails — it never returns a wrong value.
+The challenge also binds the key id, epoch and a per-use context, so a transcript cannot be replayed elsewhere.
+Exponentiation by the secret `y_i` is split-scalar blinded like the G1 code, which is *not* constant-time.
+
+**What the custodians learn.** A custodian sees the ciphertext elements it is asked to exponentiate
+(`E`, `c`) and, for `s^2`, the intermediate `c00^s` — exactly the information the data owner would
+have, no more; it does not see other custodians' shares, plaintexts or results beyond that. Like the vault envelope
+this is a **decryption oracle for whoever holds a caller token**: any token holder can have *any* ciphertext opened
+(it cannot be tied to "this column"). Inputs are validated (canonical encoding, on-curve / subgroup membership,
+identity refused), the `approve(caller, E_hex, ctx)` hook is called for every item with its canonical encoding
+(GT elements as `"gt:" + hex`), and the **rate limit is charged per item**, so a batch is not a way around it.
+Reading n cells costs n requests: raise `serve --rate` accordingly (the default of 30 per minute is meant for
+vault unsealing). Treat tokens as decryption capabilities.
+
+**Integrity tags and the MAC secret (trade-off).** Tags need `alpha` and per-cell `gamma`, which for a plain
+`FheKey` are PRFs of `s`. With a threshold key nobody holds `s`, so a **separate random 32-byte MAC secret** is generated
+at `fhe-keygen-threshold`, sealed under the threshold envelope (`wrap_key`/`unwrap_key`, authenticated, bound to the key id
+and purpose) and stored in the public bundle. It is opened by a quorum **lazily and only when `authenticated=True` is
+used**; the owner process then holds it in memory. Consequence: that process (and anyone who compromises it) can
+forge tags — i.e. defeat integrity checking against a lying server — but **can not decrypt anything**, because the
+MAC secret is unrelated to `s`. Without `authenticated=True` the MAC secret is never opened. The process that ran
+`fhe-keygen-threshold` also saw it once. `--no-mac` creates a key with no MAC secret (authenticated mode then fails with a
+clear error). Rotating the MAC secret means re-tagging the data.
+
+**Limits.** Every threshold read/decryption needs a live quorum (that is the point); latency is network round trips
+plus pure-Python proof checking (a `DOT` decryption of a 3-of-5 quorum takes ~2 s: two GT rounds). The custody code
+is pure Python; the exponentiations are variable-time. `DOT` has no integrity protection, same as before.
+Refresh/reshare of the custody shares keeps `Q`, `Q2` and the bundle valid (the key id is unchanged).
+`secp256k1` custody keys cannot be used (the pairing groups are BN254).
 
 ## Wire / storage format
 

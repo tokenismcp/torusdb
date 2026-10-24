@@ -176,6 +176,15 @@ conn = torussql.connect(host, port, token=db_token, vault_path="owner.vault",
 | **k or more** shares compromised | the key is compromised. New ceremony, then `reseal_vault(custody=new)`; treat vault ciphertexts that were exposed as readable |
 | Change quorum (e.g. 2-of-3 → 3-of-5) | `reshare-*` with new `--new-k/--new-n` |
 
+### 2.5 FHE columns on a threshold key
+
+A `bn254` custody key can be the secret of `FHE` columns (`docs/fhe-columns.md`, "Threshold custody of the
+FHE key"). Custodians gain three key-service methods, all under the existing `key` permission and the same
+`approve` / rate-limit / audit machinery: `partial_batch` (many G1 points per request, rate charged per
+item), `gt_partial_batch` (GT exponentiation with a Chaum-Pedersen proof, for `DOT`) and `g2_partial` (the
+G2 share used once to publish `Q2`). `python -m torussql.custody fhe-keygen-threshold` / `fhe-open-test`
+are the ceremony and check commands.
+
 ## 3. What it protects — and what it does not
 
 **Protects**

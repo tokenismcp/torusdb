@@ -736,9 +736,15 @@ class NoKeyClient:
         if policy == "fhe":
             key = self._fhe_key()
             cells = self.server.plain_cells(table, col, idxs)
+            # batch entry points (threshold keys open many cells in few quorum rounds);
+            # keys without them are driven cell by cell
             if not self.authenticated:
+                if hasattr(key, "decrypt_cells"):
+                    return key.decrypt_cells(cells)
                 return [key.decrypt_cell(c) for c in cells]
             tags = self.server.plain_cells(table, _fmac_col(col), idxs)
+            if hasattr(key, "decrypt_cells_verified"):
+                return key.decrypt_cells_verified(cells, tags, table, col, idxs)
             return [key.decrypt_cell_verified(c, t, table, col, i)
                     for c, t, i in zip(cells, tags, idxs)]
         return [decode(s) for s in self._read_verified_scalars(table, col, idxs)]
