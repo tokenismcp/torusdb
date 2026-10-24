@@ -688,10 +688,11 @@ fn authenticated_memory_and_disk_tags_verified_reads_sums_tamper_detection_dot_o
         assert_eq!(db.select(t, &["hours"], dept(1)).unwrap(), vec![vec![ci(2)], vec![ci(3)]]);
         assert_eq!(kind_of(db.insert(t, row(12, 1, 10_000_000, 1))), Kind::OutOfBudget);
         assert_eq!(db.count(t, all()).unwrap(), 5);
-        // DOT has no integrity protection: refused unless explicitly accepted
+        // authenticated + auto = "local": verified, computed by the owner (no pairing, no server DOT call)
         let py = Some(FheBackend::Pyecc);
-        let e = db.dot_with_backend(t, "rate", "hours", id_is(2), py).unwrap_err();
-        assert!(e.message.contains("no integrity protection"), "{}", e);
+        assert_eq!(int(db.dot_with_backend(t, "rate", "hours", id_is(2), py).unwrap()), 55 * 150);
+        assert_eq!(int(db.dot(t, "rate", "hours", dept(1)).unwrap()), 2 + 2 * 3);
+        // the legacy flag selects "delegated" (server pairing, unverified)
         let mut lax = Client::connect_with(&s.addr, &opts(&key, true, true)).unwrap();
         lax.trust_table(t).unwrap();
         assert_eq!(int(lax.dot_with_backend(t, "rate", "hours", id_is(2), py).unwrap()), 55 * 150);
@@ -947,4 +948,79 @@ fn an_old_server_without_update_cells_falls_back_to_update_cell_once_and_remembe
     let seen = f.seen();
     assert_eq!(seen.iter().filter(|m| *m == "update_cells").count(), 1); // asked once only
     assert_eq!(seen.iter().filter(|m| *m == "update_cell").count(), 4); // 1 + 1 + 2 tags by repetition
+}
+
+// ── DOT modes: auto / local / delegated ──────────────────────────────────────
+fn mode_client(addr: &str, key: &FheKey, auth: bool, mode: FheDotMode) -> Client {
+    let mut o = opts(key, auth, false);
+    o.fhe_dot_mode = mode;
+    Client::connect_with(addr, &o).unwrap()
+}
+
+#[test]
+fn dot_modes_local_is_verified_delegated_is_not_auto_depends_on_authentication() {
+    assert_eq!(FheDotMode::parse("auto").unwrap(), FheDotMode::Auto);
+    assert_eq!(FheDotMode::parse("local").unwrap(), FheDotMode::Local);
+    assert_eq!(FheDotMode::parse("delegated").unwrap(), FheDotMode::Delegated);
+    for bad in ["", "Local", "remote", "unverified"] {
+        assert_eq!(kind_of(FheDotMode::parse(bad)), Kind::Interface);
+    }
+    let Some(s) = server(&[]) else { return };
+    let key = key100k();
+    let mut auth = mode_client(&s.addr, &key, true, FheDotMode::Auto);
+    seed(&mut auth, "dm", &ROWS);
+    let py = Some(FheBackend::Pyecc);
+    let want = DOT_ALL;
+    assert_eq!(int(auth.dot("dm", "rate", "hours", all()).unwrap()), want); // authenticated auto = local
+    let mut local = mode_client(&s.addr, &key, true, FheDotMode::Local);
+    let mut deleg = mode_client(&s.addr, &key, true, FheDotMode::Delegated);
+    let mut plain = mode_client(&s.addr, &key, false, FheDotMode::Auto); // unauthenticated auto = delegated
+    let mut plain_local = mode_client(&s.addr, &key, false, FheDotMode::Local);
+    for c in [&mut local, &mut deleg, &mut plain, &mut plain_local] {
+        c.trust_table("dm").unwrap();
+    }
+    assert_eq!(int(deleg.dot_with_backend("dm", "rate", "hours", dept(5), py).unwrap()), DOT_D5);
+    assert_eq!(int(local.dot("dm", "rate", "hours", dept(5)).unwrap()), DOT_D5);
+    assert_eq!(int(plain_local.dot("dm", "rate", "hours", dept(5)).unwrap()), DOT_D5);
+    // which path ran: delegated/auto-unauthenticated call fhe_dot on the server, local never does
+    let proxy = Proxy::start(s.addr.clone());
+    let mut via_local = Client::connect_with(&proxy.addr, &{ let mut o = opts(&key, true, false); o.fhe_dot_mode = FheDotMode::Local; o }).unwrap();
+    via_local.trust_table("dm").unwrap();
+    via_local.dot("dm", "rate", "hours", all()).unwrap();
+    assert_eq!(proxy.count("fhe_dot"), 0);
+    let mut via_plain = connect_to(&proxy.addr, &key, false);
+    via_plain.trust_table("dm").unwrap();
+    assert_eq!(int(via_plain.dot_with_backend("dm", "rate", "hours", id_is(2), py).unwrap()), 55 * 150);
+    assert_eq!(proxy.count("fhe_dot"), 1);
+    // the server alters one operand cell (raw RPC): local detects it, delegated returns a WRONG number
+    let lie = key.encrypt(400).unwrap();
+    assert!(raw_call(&s.addr, "update_cell", json!(["dm", 1, "rate", xcell(&lie)]))["ok"].is_null());
+    assert_eq!(kind_of(local.dot("dm", "rate", "hours", all())), Kind::Integrity);
+    assert_eq!(kind_of(auth.dot("dm", "rate", "hours", all())), Kind::Integrity);
+    let wrong = int(deleg.dot_with_backend("dm", "rate", "hours", all(), py).unwrap());
+    assert_eq!(wrong, DOT_ALL - 55 * 150 + 400 * 150); // silently wrong: delegated DOT cannot be verified
+    // the legacy alias selects delegated on an authenticated connection
+    let mut legacy = Client::connect_with(&s.addr, &opts(&key, true, true)).unwrap();
+    legacy.trust_table("dm").unwrap();
+    assert_eq!(int(legacy.dot_with_backend("dm", "rate", "hours", all(), py).unwrap()), wrong);
+}
+
+#[test]
+fn local_dot_has_no_range_limit_on_the_result() {
+    let Some(s) = server(&[]) else { return };
+    let key = FheKey::from_hex(&secret(), 1_000_000).unwrap();
+    let mut db = mode_client(&s.addr, &key, true, FheDotMode::Auto);
+    db.create_table("big", vec![col("a", "int", "fhe"), col("b", "int", "fhe")]).unwrap();
+    for (a, b) in [(1_000_000i64, 1_000_000i64), (-1_000_000, 999_999), (7, 8)] {
+        db.insert("big", vec![("a", ci(a)), ("b", ci(b))]).unwrap();
+    }
+    let want = 1_000_000_000_000i64 - 999_999_000_000 + 56;
+    assert_eq!(int(db.dot("big", "a", "b", all()).unwrap()), want);
+    let mut deleg = mode_client(&s.addr, &key, false, FheDotMode::Delegated);
+    deleg.sync_schema().unwrap();
+    deleg.trust_table("big").unwrap();
+    assert_eq!(kind_of(deleg.dot_with_backend("big", "a", "b", id_is_all(), Some(FheBackend::Pyecc))), Kind::OutOfBudget);
+}
+fn id_is_all() -> Value {
+    all()
 }

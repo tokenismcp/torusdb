@@ -445,10 +445,12 @@ def test_cli_reshare_replaces_a_custodian(tmp_path):
     for i in (1, 3):                                                   # custodian 2 is gone
         cli("reshare-start", *common, "--share", str(d / "old" / f"share_{i}.json"),
             "--identity", str(d / f"old_id{i}.json"), "--new-ids", str(d / "new_ids.json"),
+            "--old-ids", str(d / "old_ids.json"),
             "--out", str(d / "rbox"), "--passphrase-env", "PW", env_extra=pw)
     for j in (1, 2, 3):
         cli("reshare-finish", *common, "--identity", str(d / f"new_id{j}.json"),
-            "--old-ids", str(d / "old_ids.json"), "--inbox", str(d / "rbox"),
+            "--old-ids", str(d / "old_ids.json"), "--new-ids", str(d / "new_ids.json"),
+            "--inbox", str(d / "rbox"),
             "--out", str(d / f"new_share{j}.json"), "--public-out", str(d / f"new_pub{j}.json"),
             "--passphrase-env", "PW", env_extra=pw)
     from torussql.custody import KeyShare, PublicKey

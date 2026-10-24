@@ -56,7 +56,6 @@ from .shares import (Frozen, MaskShareStore, MissingShare, Q, ShareConflict)
 from .threshold import Partial, partial_decrypt
 from . import gt as _gt
 
-MAX_PARTIAL_BATCH = 1000          # G1 points per ``partial_batch`` request
 
 log = logging.getLogger("torusdb.custodian")
 
@@ -110,22 +109,48 @@ class Limits:
 class Custodian:
     """Server-side state: shares, callers, policy, audit log."""
 
-    def __init__(self, share: KeyShare | None, tokens: dict[str, str], *,
+    def __init__(self, share, tokens: dict[str, str], *,
                  permissions: dict[str, set] | None = None,
                  masks: MaskShareStore | None = None, limits: Limits | None = None,
                  approve=None, audit_path: str | None = None,
                  rate_per_minute: int = 30, audit_max_bytes: int = 64 * 1024 * 1024,
-                 unauth_audit_per_minute: int = 20):
+                 audit_keep: int = 7, unauth_audit_per_minute: int = 20,
+                 item_budget_per_minute: int | None = 20_000, max_batch: int = 2000,
+                 key_access: dict[str, set] | None = None):
+        """``share``: one ``KeyShare``, a list of shares of DIFFERENT keys (one daemon serving
+        several keys; requests then name a ``key_id``), or None.
+
+        Limits: ``rate_per_minute`` caps REQUESTS per caller and key; a batch is one request.
+        ``item_budget_per_minute`` caps the ITEMS (points / GT elements) answered per caller
+        and key per minute (None = unlimited); ``max_batch`` caps the items in one request.
+        ``approve`` is a callable or ``{key_id: callable}``; ``key_access`` is
+        ``{key_id: {caller, ...}}`` (a key absent from the map is open to every caller that
+        has the ``key`` permission)."""
         if not tokens:
             raise CustodyError("a custodian needs at least one caller token")
         for name, tok in tokens.items():
             _check_token_strength(name, tok)
-        if share is None and masks is None:
+        shares = [] if share is None else ([share] if isinstance(share, KeyShare) else list(share))
+        if not shares and masks is None:
             raise CustodyError("a custodian needs a key share, a mask store, or both")
+        if len({sh.public.key_id for sh in shares}) != len(shares):
+            raise CustodyError("two shares of the same key")
+        self._shares = {sh.public.key_id: sh for sh in shares}
         hashes = [_tok_hash(t) for t in tokens.values()]
         if len(set(hashes)) != len(hashes):
             raise CustodyError("two callers share the same token")
-        self._share = share
+        self._share = shares[0] if len(shares) == 1 else None   # single-key convenience / legacy
+        self._item_cap = item_budget_per_minute
+        if max_batch < 1:
+            raise CustodyError("max_batch must be >= 1")
+        self.max_batch = int(max_batch)
+        self._items: dict[str, deque] = defaultdict(deque)
+        self._audit_keep = max(0, int(audit_keep))
+        self._key_access = {}
+        for kid, names in (key_access or {}).items():
+            if kid not in self._shares or not set(names) <= set(tokens):
+                raise CustodyError(f"bad key_access entry for {kid!r}")
+            self._key_access[kid] = frozenset(names)
         self._callers = {_tok_hash(t): name for name, t in tokens.items()}
         perms = permissions or {}
         for name, p in perms.items():
@@ -160,8 +185,8 @@ class Custodian:
         """Install the refreshed share: same key, SAME custodian index, and a
         strictly newer epoch (a replaced/rolled-back file is refused)."""
         with self._lock:
-            cur = self._share
-            if cur is None or share.public.key_id != cur.public.key_id:
+            cur = self._shares.get(share.public.key_id)
+            if cur is None:
                 raise CustodyError("refusing a share of a different key")
             if share.index != cur.index:
                 raise CustodyError(f"refusing a share for custodian {share.index} "
@@ -169,13 +194,55 @@ class Custodian:
             if share.epoch <= cur.epoch:
                 raise CustodyError(f"refusing a share of epoch {share.epoch} "
                                    f"(current epoch is {cur.epoch})")
-            self._share = share
+            self._shares[share.public.key_id] = share
+            if self._share is not None:
+                self._share = share
+
+    def _pick(self, key_id) -> KeyShare:
+        """The share a request is for. A single-share daemon accepts a request without a
+        key_id (legacy clients); a request that NAMES a key must name one this daemon holds —
+        a key-1 request is never answered with the key-2 share."""
+        if not self._shares:
+            raise CustodyError("this custodian holds no key share")
+        if key_id is None:
+            if len(self._shares) == 1:
+                return next(iter(self._shares.values()))
+            raise CustodyError("this custodian serves several keys: the request must name a key_id")
+        if not isinstance(key_id, str) or key_id not in self._shares:
+            raise CustodyError("this custodian holds no share of that key")
+        return self._shares[key_id]
+
+    def _check_key_access(self, caller: str, peer: str, op: str, share: KeyShare) -> None:
+        allowed = self._key_access.get(share.public.key_id)
+        if allowed is not None and caller not in allowed:
+            self._audit(caller, peer, op, {"key_id": share.public.key_id},
+                        "denied: caller has no access to this key")
+            raise CustodyError(f"caller {caller!r} has no access to that key")
+
+    def _approver(self, share: KeyShare):
+        a = self._approve
+        return a.get(share.public.key_id) if isinstance(a, dict) else a
+
+    def _admit(self, caller: str, peer: str, op: str, share: KeyShare, n_items: int) -> None:
+        """Rate limits, per caller AND key: one REQUEST against ``rate_per_minute`` and
+        ``n_items`` against the item budget. Both are charged before any work."""
+        bucket = f"{caller}|{share.public.key_id}"
+        if not self._rate_ok(self._hits, bucket, 1, self._rate):
+            self._audit_denial(caller, peer, op, "denied: rate limit")
+            raise CustodyError(f"rate limit exceeded ({self._rate} requests per minute per "
+                               f"caller and key)")
+        if not self._rate_ok(self._items, bucket, n_items, self._item_cap):
+            self._audit_denial(caller, peer, op, "denied: item budget")
+            raise CustodyError(f"item budget exceeded ({self._item_cap} items per minute per "
+                               f"caller and key)")
 
     def info(self) -> dict:
         s = self._share
-        out = {"auth_required": True, "has_key": s is not None,
-               "has_masks": self.masks is not None}
-        if s is not None:
+        out = {"auth_required": True, "has_key": bool(self._shares),
+               "has_masks": self.masks is not None,
+               "keys": [{"key_id": k, "epoch": v.epoch, "index": v.index, "group": v.public.group,
+                         "k": v.public.k, "n": v.public.n} for k, v in self._shares.items()]}
+        if s is not None:                                  # single-key daemons keep the old fields
             out |= {"key_id": s.public.key_id, "epoch": s.epoch, "index": s.index,
                     "group": s.public.group, "k": s.public.k, "n": s.public.n}
         return out
@@ -224,11 +291,25 @@ class Custodian:
             raise
         self._audit_fd, self._audit_size = fd, st.st_size
 
+    def _rotate_audit(self) -> None:
+        """path -> path.1 -> path.2 ... keeping ``audit_keep`` rotated files (the oldest is
+        deleted); with ``audit_keep = 0`` the full log is discarded."""
+        base, keep = self._audit_path, self._audit_keep
+        if keep == 0:
+            os.unlink(base)
+            return
+        for i in range(keep, 0, -1):
+            src = base if i == 1 else f"{base}.{i - 1}"
+            if os.path.exists(src):
+                os.replace(src, f"{base}.{i}")
+
     def _audit(self, caller: str, peer: str, op: str, detail: dict, outcome: str) -> None:
         rec = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "caller": caller, "peer": peer,
                "op": op, "outcome": outcome}
         if self._share is not None:
             rec |= {"key_id": self._share.public.key_id, "epoch": self._share.epoch}
+        elif "key_id" in detail and detail["key_id"] in self._shares:
+            rec |= {"epoch": self._shares[detail["key_id"]].epoch}
         rec |= {k: (v if isinstance(v, (int, float, bool)) else str(v)[:64])
                 for k, v in detail.items()}
         line = json.dumps(rec)                                  # json escapes newlines
@@ -236,9 +317,9 @@ class Custodian:
         if self._audit_path:
             data = (line + "\n").encode()
             with self._audit_lock:
-                if self._audit_size + len(data) > self._audit_max:      # bounded: rotate once
+                if self._audit_size + len(data) > self._audit_max:      # bounded: rotate
                     os.close(self._audit_fd)
-                    os.replace(self._audit_path, self._audit_path + ".1")
+                    self._rotate_audit()
                     self._open_audit()
                 os.write(self._audit_fd, data)
                 self._audit_size += len(data)
@@ -308,52 +389,58 @@ class Custodian:
             raise CustodyError(f"bad arguments for {method}: {exc}") from None
 
     # — key service —
-    def _m_partial(self, caller, peer, E_hex, ctx_hex=""):
-        if self._share is None:
-            raise CustodyError("this custodian holds no key share")
-        # rate limit FIRST: malformed requests also cost budget, so an
-        # authenticated caller cannot flood the audit log with junk
-        if not self._rate_ok(self._hits, caller, 1, self._rate):
-            self._audit_denial(caller, peer, "partial", "denied: rate limit")
-            raise CustodyError("rate limit exceeded")
-        share = self._share
+    def _prelude(self, caller, peer, op, key_id, n_items):
+        """Select the share, check key access, then charge the rate limits FIRST: malformed
+        requests also cost budget, so an authenticated caller cannot flood the audit log."""
+        share = self._pick(key_id)
+        self._check_key_access(caller, peer, op, share)
+        self._admit(caller, peer, op, share, n_items)
+        return share
+
+    def _m_partial(self, caller, peer, E_hex, ctx_hex="", key_id=None):
+        share = self._prelude(caller, peer, "partial", key_id, 1)
         g = share.public.g
+        kid = share.public.key_id
         try:
             E = g.from_hex(E_hex)
             ctx = bytes.fromhex(ctx_hex)
             if len(ctx) > 1024 or g.is_identity(E):
                 raise InvalidPoint("bad request")
         except (InvalidPoint, ValueError, TypeError, AttributeError):
-            self._audit(caller, peer, "partial", {"E": str(E_hex)[:16]}, "rejected: malformed")
+            self._audit(caller, peer, "partial", {"E": str(E_hex)[:16], "key_id": kid},
+                        "rejected: malformed")
             raise CustodyError("malformed request")
         E_canon = g.hex(E)               # canonical encoding: what policy sees is what is used
         efp = hashlib.sha256(E_canon.encode()).hexdigest()[:16]
-        if self._approve and not self._approve(caller, E_canon, ctx):
-            self._audit(caller, peer, "partial", {"E": efp}, "denied: policy")
+        ap = self._approver(share)
+        if ap and not ap(caller, E_canon, ctx):
+            self._audit(caller, peer, "partial", {"E": efp, "key_id": kid}, "denied: policy")
             raise CustodyError("request declined by custodian policy")
         part = partial_decrypt(share, E, ctx)
-        self._audit(caller, peer, "partial", {"E": efp}, "served")
+        self._audit(caller, peer, "partial", {"E": efp, "key_id": kid}, "served")
         return part.to_json(g)
 
     # — key service, batch form (threshold FHE keys: many cells per round trip) —
-    def _batch_gate(self, caller, peer, op, items, cap):
-        """Shared admission for the batch methods: shape check, then the rate limit
-        charged PER ITEM (a batch is not a way around ``rate_per_minute``)."""
-        if self._share is None:
-            raise CustodyError("this custodian holds no key share")
-        if not isinstance(items, list) or not 1 <= len(items) <= cap:
-            self._rate_ok(self._hits, caller, 1, self._rate)
-            self._audit(caller, peer, op, {"n": str(len(items)) if isinstance(items, list) else "?"},
-                        "rejected: malformed")
+    def _batch_shape(self, caller, peer, op, items, cap, key_id):
+        """Shape check, then the admission charges: ONE request plus ``len(items)`` items."""
+        share = self._pick(key_id)
+        self._check_key_access(caller, peer, op, share)
+        if not isinstance(items, list) or not items:
+            self._admit(caller, peer, op, share, 1)
+            self._audit(caller, peer, op, {"key_id": share.public.key_id}, "rejected: malformed")
             raise CustodyError("malformed request")
-        if not self._rate_ok(self._hits, caller, len(items), self._rate):
-            self._audit_denial(caller, peer, op, "denied: rate limit")
-            raise CustodyError("rate limit exceeded")
+        if len(items) > cap:
+            self._admit(caller, peer, op, share, 1)
+            self._audit(caller, peer, op, {"n": len(items), "key_id": share.public.key_id},
+                        "rejected: batch too large")
+            raise CustodyError(f"batch too large ({len(items)} items; at most {cap} per request)")
+        self._admit(caller, peer, op, share, len(items))
+        return share
 
-    def _m_partial_batch(self, caller, peer, E_hexes, ctx_hex=""):
-        self._batch_gate(caller, peer, "partial_batch", E_hexes, MAX_PARTIAL_BATCH)
-        share = self._share
+    def _m_partial_batch(self, caller, peer, E_hexes, ctx_hex="", key_id=None):
+        share = self._batch_shape(caller, peer, "partial_batch", E_hexes, self.max_batch, key_id)
         g = share.public.g
+        kid = share.public.key_id
         try:
             ctx = bytes.fromhex(ctx_hex)
             if len(ctx) > 1024:
@@ -362,24 +449,27 @@ class Custodian:
             if any(g.is_identity(E) for E in Es):
                 raise InvalidPoint("bad request")
         except (InvalidPoint, ValueError, TypeError, AttributeError):
-            self._audit(caller, peer, "partial_batch", {"n": len(E_hexes)}, "rejected: malformed")
+            self._audit(caller, peer, "partial_batch", {"n": len(E_hexes), "key_id": kid},
+                        "rejected: malformed")
             raise CustodyError("malformed request")
         canon = [g.hex(E) for E in Es]                     # what policy sees is what is used
         efp = hashlib.sha256("".join(canon).encode()).hexdigest()[:16]
-        if self._approve:
+        ap = self._approver(share)
+        if ap:
             for c in canon:
-                if not self._approve(caller, c, ctx):
-                    self._audit(caller, peer, "partial_batch", {"n": len(Es), "E": efp},
-                                "denied: policy")
+                if not ap(caller, c, ctx):
+                    self._audit(caller, peer, "partial_batch",
+                                {"n": len(Es), "E": efp, "key_id": kid}, "denied: policy")
                     raise CustodyError("request declined by custodian policy")
         parts = [partial_decrypt(share, E, ctx) for E in Es]
-        self._audit(caller, peer, "partial_batch", {"n": len(Es), "E": efp}, "served")
+        self._audit(caller, peer, "partial_batch", {"n": len(Es), "E": efp, "key_id": kid}, "served")
         return [p.to_json(g) for p in parts]
 
-    def _m_gt_partial_batch(self, caller, peer, c_hexes, ctx_hex=""):
-        self._batch_gate(caller, peer, "gt_partial_batch", c_hexes, _gt.MAX_GT_BATCH)
-        share = self._share
+    def _m_gt_partial_batch(self, caller, peer, c_hexes, ctx_hex="", key_id=None):
+        share = self._batch_shape(caller, peer, "gt_partial_batch", c_hexes,
+                                  min(self.max_batch, _gt.MAX_GT_BATCH), key_id)
         g = share.public.g
+        kid = share.public.key_id
         if share.public.group != "bn254":
             raise CustodyError("GT operations need a bn254 key")
         try:
@@ -390,31 +480,29 @@ class Custodian:
             for raw in raws:
                 _gt.gt_check(raw)                         # canonical, < p, in the order-q subgroup
         except (InvalidPoint, ValueError, TypeError, AttributeError):
-            self._audit(caller, peer, "gt_partial_batch", {"n": len(c_hexes)},
+            self._audit(caller, peer, "gt_partial_batch", {"n": len(c_hexes), "key_id": kid},
                         "rejected: malformed or not in GT")
             raise CustodyError("malformed request (not an element of the order-q subgroup of GT)")
         efp = hashlib.sha256(b"".join(raws)).hexdigest()[:16]
-        if self._approve:
+        ap = self._approver(share)
+        if ap:
             for raw in raws:
-                if not self._approve(caller, "gt:" + raw.hex(), ctx):
-                    self._audit(caller, peer, "gt_partial_batch", {"n": len(raws), "E": efp},
-                                "denied: policy")
+                if not ap(caller, "gt:" + raw.hex(), ctx):
+                    self._audit(caller, peer, "gt_partial_batch",
+                                {"n": len(raws), "E": efp, "key_id": kid}, "denied: policy")
                     raise CustodyError("request declined by custodian policy")
         parts = _gt.gt_partial(share, raws, ctx)
-        self._audit(caller, peer, "gt_partial_batch", {"n": len(raws), "E": efp}, "served")
+        self._audit(caller, peer, "gt_partial_batch", {"n": len(raws), "E": efp, "key_id": kid},
+                    "served")
         return [p.to_json(g) for p in parts]
 
-    def _m_g2_partial(self, caller, peer):
-        if self._share is None:
-            raise CustodyError("this custodian holds no key share")
-        if not self._rate_ok(self._hits, caller, 1, self._rate):
-            self._audit_denial(caller, peer, "g2_partial", "denied: rate limit")
-            raise CustodyError("rate limit exceeded")
-        if self._share.public.group != "bn254":
+    def _m_g2_partial(self, caller, peer, key_id=None):
+        share = self._prelude(caller, peer, "g2_partial", key_id, 1)
+        if share.public.group != "bn254":
             raise CustodyError("G2 shares need a bn254 key")
-        raw = _gt.g2_partial(self._share)
-        self._audit(caller, peer, "g2_partial", {}, "served")
-        return {"index": self._share.index, "Y2": raw.hex()}
+        raw = _gt.g2_partial(share)
+        self._audit(caller, peer, "g2_partial", {"key_id": share.public.key_id}, "served")
+        return {"index": share.index, "Y2": raw.hex()}
 
     # — mask service —
     def _store(self) -> MaskShareStore:
@@ -668,18 +756,26 @@ class CustodianServer(socketserver.ThreadingTCPServer):
 # ── clients ──────────────────────────────────────────────────────────────────
 class _FheCalls:
     """Batch / pairing-group requests shared by ``RemoteCustodian`` and ``LocalNode``
-    (they only need ``self.call`` and ``self.g``)."""
+    (they only need ``self.call``, ``self.g`` and ``self.key_id``).
+
+    ``key_id`` selects the share on a daemon that serves several keys; ``for_key`` returns a
+    client for the same endpoint addressed to another key."""
+    key_id = None
+
+    def _kid(self) -> list:
+        return [] if self.key_id is None else [self.key_id]
 
     def partial_batch(self, Es, context: bytes = b"") -> list:
-        out = self.call("partial_batch", [[self.g.hex(E) for E in Es], context.hex()])
+        out = self.call("partial_batch", [[self.g.hex(E) for E in Es], context.hex()] + self._kid())
         return [Partial.from_json(self.g, d) for d in out]
 
     def gt_partial_batch(self, cs, context: bytes = b"") -> list:
-        out = self.call("gt_partial_batch", [[bytes(c).hex() for c in cs], context.hex()])
+        out = self.call("gt_partial_batch", [[bytes(c).hex() for c in cs], context.hex()]
+                        + self._kid())
         return [_gt.GtPartial.from_json(self.g, d) for d in out]
 
     def g2_partial(self):
-        d = self.call("g2_partial", [])
+        d = self.call("g2_partial", self._kid())
         return int(d["index"]), bytes.fromhex(d["Y2"])
 
 
@@ -690,13 +786,16 @@ class RemoteCustodian(_FheCalls):
     def __init__(self, host: str, port: int, token: str, *, group=None, tls: bool = False,
                  cafile: str | None = None, tls_insecure: bool = False,
                  certfile: str | None = None, keyfile: str | None = None,
-                 timeout: float = 30.0, allow_insecure: bool = False):
+                 timeout: float = 30.0, allow_insecure: bool = False, key_id: str | None = None):
         if not tls and not allow_insecure and not _is_loopback(host):
             raise CustodyError(
                 f"refusing plaintext TCP to non-loopback host {host!r}: the bearer token and "
                 f"requests would travel in the clear — use tls=True (or allow_insecure=True "
                 f"if the network is fully trusted)")
         self.host, self.port, self.token, self.g = host, port, token, group
+        self.key_id = key_id
+        self._kw = dict(tls=tls, cafile=cafile, tls_insecure=tls_insecure, certfile=certfile,
+                        keyfile=keyfile, timeout=timeout, allow_insecure=allow_insecure)
         self.tls, self.cafile, self.insecure = tls, cafile, tls_insecure
         self.certfile, self.keyfile, self.timeout = certfile, keyfile, timeout
         self.label = f"{host}:{port}"
@@ -705,6 +804,12 @@ class RemoteCustodian(_FheCalls):
 
     def __repr__(self) -> str:                    # never include the token
         return f"RemoteCustodian({self.label})"
+
+    def for_key(self, public) -> "RemoteCustodian":
+        """A client for the same host:port (own connection, same token) addressed to the key
+        of ``public`` (a ``PublicKey``) on a daemon that serves several keys."""
+        return RemoteCustodian(self.host, self.port, self.token, group=public.g,
+                               key_id=public.key_id, **self._kw)
 
     def _connect(self) -> None:
         sock = socket.create_connection((self.host, self.port), timeout=self.timeout)
@@ -782,16 +887,28 @@ class RemoteCustodian(_FheCalls):
             sock.close()
 
     def partial(self, E, context: bytes = b"") -> Partial:
-        return Partial.from_json(self.g, self.call("partial", [self.g.hex(E), context.hex()]))
+        ctx = context.hex()
+        return Partial.from_json(self.g, self.call("partial", [self.g.hex(E), ctx] + self._kid()))
 
 
 class LocalNode(_FheCalls):
     """In-process custodian (tests, single-host use) with the same interface as
     ``RemoteCustodian``."""
 
-    def __init__(self, custodian: Custodian, caller: str = "local", label: str = "local"):
+    def __init__(self, custodian: Custodian, caller: str = "local", label: str = "local",
+                 key_id: str | None = None):
         self.custodian, self.caller, self.label = custodian, caller, label
-        self.g = custodian._share.public.g if custodian._share else None
+        self.key_id = key_id
+        shares = custodian._shares
+        sh = shares.get(key_id) if key_id else (next(iter(shares.values())) if len(shares) == 1 else None)
+        self.g = sh.public.g if sh else (next(iter(shares.values())).public.g if shares else None)
+
+    def for_key(self, public) -> "LocalNode":
+        import copy
+        n = copy.copy(self)                          # keeps subclass state (test doubles)
+        n.key_id = public.key_id
+        n.g = public.g
+        return n
 
     def __repr__(self) -> str:
         return f"LocalNode({self.label})"
@@ -811,4 +928,5 @@ class LocalNode(_FheCalls):
         pass
 
     def partial(self, E, context: bytes = b"") -> Partial:
-        return Partial.from_json(self.g, self.call("partial", [self.g.hex(E), context.hex()]))
+        ctx = context.hex()
+        return Partial.from_json(self.g, self.call("partial", [self.g.hex(E), ctx] + self._kid()))

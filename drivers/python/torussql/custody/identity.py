@@ -154,7 +154,12 @@ def open_broadcast(g: Group, signer_pub, msg: dict, kind: str, session: bytes, *
         if not schnorr_verify(g, signer_pub, SchnorrProof.from_json(g, msg["sig"]),
                               b"sig\x00" + _canon(body)):
             raise CustodyError(f"bad signature on broadcast from participant {msg.get('signer')}")
-        if body.get("params", {}) != (params or {}):
+        got, want = body.get("params", {}), (params or {})
+        if got != want and "new_ids" in want and "new_ids" not in got:
+            raise CustodyError("this reshare broadcast uses the OLD format: it is not bound to the "
+                               "new committee's identity list. Re-run reshare-start with this "
+                               "version (it needs --old-ids and --new-ids)")
+        if got != want:
             raise CustodyError("broadcast was made for a different ceremony specification "
                                "(group/k/n/participants differ)")
         b = Broadcast.from_json(g, body["bcast"])

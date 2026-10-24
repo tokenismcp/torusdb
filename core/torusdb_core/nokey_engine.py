@@ -391,7 +391,12 @@ class NoKeyClient:
     maskstore: MaskStore | None = None
     # secret key of the FHE columns (torusdb_core.fhe.FheKey); None = no FHE columns
     fhe: Any = None
-    fhe_allow_unverified_dot: bool = False
+    fhe_allow_unverified_dot: bool = False     # legacy spelling of fhe_dot_mode="delegated"
+    # How DOT on FHE columns is computed: "delegated" = the server multiplies the ciphertexts
+    # (fast, but the result cannot be integrity-checked); "local" = the owner reads the
+    # operand cells (each verified by its tag) and multiplies the plaintexts itself (verified,
+    # O(n) decryptions); "auto" = delegated without authentication, local with it.
+    fhe_dot_mode: str = "auto"
     _batch_ok: bool = True                     # does the server know update_cells?
     # Tables whose column policies were learned from the (untrusted) server
     # rather than created/vaulted by this owner. A malicious server could relabel
@@ -974,12 +979,19 @@ class NoKeyClient:
     def _fhe_dot(self, lt, lc, lids, rt, rc, rids) -> int:
         from . import fhe
         key = self._fhe_key()
-        if self.authenticated and not self.fhe_allow_unverified_dot:
-            raise ExecError("DOT on FHE columns has no integrity protection (a ciphertext "
-                            "product cannot be tag-checked); connect with "
-                            "fhe_allow_unverified_dot=True to accept an unverified result")
+        mode = self.fhe_dot_mode
+        if mode not in ("auto", "local", "delegated"):
+            raise ExecError("fhe_dot_mode must be 'auto', 'local' or 'delegated'")
+        if mode == "auto":
+            mode = "delegated" if (not self.authenticated or self.fhe_allow_unverified_dot) else "local"
         if not lids:
             return 0
+        if mode == "local":
+            # A ciphertext product cannot be tag-checked, so verify the OPERANDS instead: read both
+            # columns (every cell is checked against its row-bound tag), multiply the plaintexts here.
+            a = self._reveal_many(lt, lc, lids)
+            b = self._reveal_many(rt, rc, rids)
+            return sum(x * y for x, y in zip(a, b))
         total = None
         lim = self._fhe_limits()
         chunk = int((lim.get("recommended_dot_rows") or {}).get(key.backend)

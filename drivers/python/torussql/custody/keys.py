@@ -65,6 +65,29 @@ class PublicKey:
             h.update(self.g.encode(c))
         return h.hexdigest()[:32]
 
+    @property
+    def fingerprint(self) -> str:
+        """The TRUST ANCHOR of a public.json: a full SHA-256 over group, k, n, epoch and EVERY
+        commitment (the verification keys of all custodians derive from them), printed by
+        ``public-show``; pin it with ``--expect-fingerprint``. Unlike ``key_id`` (X only) it
+        changes at refresh/reshare, so re-pin after those."""
+        h = hashlib.sha256(b"torussql/custody/pubfingerprint/v1\x00" + self.group.encode()
+                           + b"\x00" + struct.pack(">QQQ", self.k, self.n, self.epoch))
+        for c in self.commitments:
+            h.update(self.g.encode(c))
+        d = h.hexdigest()
+        return "-".join(d[i:i + 8] for i in range(0, 64, 8))
+
+    def check_fingerprint(self, expected: str | None) -> None:
+        """Raise ``ShareError`` unless ``expected`` (spaces/dashes/colons/case ignored) is this
+        key file's fingerprint."""
+        if expected is None:
+            return
+        norm = "".join(ch for ch in expected.lower() if ch not in " -:\n\t")
+        if norm != self.fingerprint.replace("-", ""):
+            raise ShareError("public key file does not match the expected fingerprint "
+                             f"(file: {self.fingerprint}) — refusing to use it")
+
     def verification_key(self, x: int):
         g = self.g
         w = laurent.commit_check_weights(x, self.k - 1, g.order)

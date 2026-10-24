@@ -286,8 +286,9 @@ pub struct ConnectOptions {
     /// The owner's key for `fhe` columns (see [`FheKey`]). Needed for INSERT/UPDATE/reads/SUM/DOT on
     /// them. With `authenticated`, FHE cells also carry integrity tags in a hidden `__fmac__<col>` column.
     pub fhe_key: Option<FheKey>,
-    /// With `authenticated`, still allow DOT on FHE columns. A ciphertext product cannot be
-    /// tag-checked, so the result is NOT protected against a lying server. Default false.
+    /// How DOT on two FHE columns is computed, see [`FheDotMode`]. Default `Auto`.
+    pub fhe_dot_mode: FheDotMode,
+    /// Backward-compatible alias: with `authenticated` and mode `Auto`, selects `Delegated`.
     pub fhe_allow_unverified_dot: bool,
 }
 
@@ -305,6 +306,7 @@ impl Default for ConnectOptions {
             trust_server_schema: false,
             authenticated: false,
             fhe_key: None,
+            fhe_dot_mode: FheDotMode::Auto,
             fhe_allow_unverified_dot: false,
         }
     }
@@ -324,6 +326,7 @@ impl fmt::Debug for ConnectOptions {
             .field("trust_server_schema", &self.trust_server_schema)
             .field("authenticated", &self.authenticated)
             .field("fhe_key", &self.fhe_key)
+            .field("fhe_dot_mode", &self.fhe_dot_mode)
             .field("fhe_allow_unverified_dot", &self.fhe_allow_unverified_dot)
             .finish()
     }
@@ -339,6 +342,32 @@ pub struct ServerInfo {
     pub persistent: Option<bool>,
     /// Request-size limits published in `hello` (`None` on older servers: conservative defaults apply).
     pub limits: Option<ServerLimits>,
+}
+
+/// How DOT on two FHE columns is computed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FheDotMode {
+    /// `Delegated` unless the connection is `authenticated`, then `Local`.
+    #[default]
+    Auto,
+    /// The owner reads both operand columns (every cell tag-verified when `authenticated`), decrypts and
+    /// multiplies/sums the plaintexts itself: verified, O(n) decryptions, no range limit on the result.
+    Local,
+    /// The server multiplies ciphertexts with its pairing: fast, but the result CANNOT be integrity-checked
+    /// (a lying server makes you decrypt a wrong number) and must lie in the key's range.
+    Delegated,
+}
+
+impl FheDotMode {
+    /// Parse "auto" | "local" | "delegated"; anything else is `Kind::Interface`.
+    pub fn parse(s: &str) -> Result<FheDotMode> {
+        match s {
+            "auto" => Ok(FheDotMode::Auto),
+            "local" => Ok(FheDotMode::Local),
+            "delegated" => Ok(FheDotMode::Delegated),
+            other => Err(Error::interface(format!("fhe_dot_mode must be \"auto\", \"local\" or \"delegated\", got {:?}", other))),
+        }
+    }
 }
 
 /// Per-back-end row counts (`None` = not published).
@@ -1683,16 +1712,21 @@ impl Client {
         rc: &str,
         rids: &[i64],
         backend: Option<FheBackend>,
-    ) -> Result<i64> {
+    ) -> Result<BigInt> {
         let key = self.fhe_key()?.clone();
-        if self.opts.authenticated && !self.opts.fhe_allow_unverified_dot {
-            return Err(Error::interface(
-                "DOT on FHE columns has no integrity protection (a ciphertext product cannot be \
-                 tag-checked); set ConnectOptions::fhe_allow_unverified_dot to accept an unverified result",
-            ));
-        }
         if lids.is_empty() {
-            return Ok(0);
+            return Ok(BigInt::zero());
+        }
+        let local = match self.opts.fhe_dot_mode {
+            FheDotMode::Local => true,
+            FheDotMode::Delegated => false,
+            FheDotMode::Auto => self.opts.authenticated && !self.opts.fhe_allow_unverified_dot,
+        };
+        if local {
+            // verified: every operand cell is read (tag-checked when authenticated), the owner multiplies
+            let a = self.fhe_reveal(lt, lc, lids)?;
+            let b = self.fhe_reveal(rt, rc, rids)?;
+            return Ok(a.iter().zip(&b).map(|(x, y)| BigInt::from(*x) * BigInt::from(*y)).sum());
         }
         // the server's recommended size for the requested back end (unspecified = its default is "auto":
         // be conservative and size for pyecc), never above its published cap
@@ -1718,7 +1752,7 @@ impl Client {
                 Some(t) => fhe_mul_dots(&t, &b)?,
             });
         }
-        key.decrypt_dot(&total.unwrap())
+        Ok(BigInt::from(key.decrypt_dot(&total.unwrap())?))
     }
 
     /// Decrypt the FHE cells of `ids` (verified against their tags when authenticated).
@@ -1822,7 +1856,7 @@ impl Client {
             let pred = wire_pred(&pred)?;
             let idxs = self.matching(table, pred)?;
             let v = self.fhe_dot(table, left, &idxs, table, right, &idxs, backend)?;
-            return Ok(Decoded::Int(BigInt::from(v)));
+            return Ok(Decoded::Int(v));
         }
         if backend.is_some() {
             return Err(Error::interface("the backend argument is only for FHE columns"));

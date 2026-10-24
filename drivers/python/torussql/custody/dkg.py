@@ -119,6 +119,12 @@ def check_dealing(g: Group, p: laurent.Params, b: Broadcast, my_x: int, my_share
                   session: bytes, *, need_pok: bool = True) -> None:
     if len(b.commitments) != p.k:
         raise DKGError("wrong number of commitments", b.index)
+    # a dealing with an identity constant term or residue commitment contributes nothing (the
+    # coefficient would be 0 mod q; a random honest coefficient is 0 with probability 1/q, so
+    # this never rejects an honest dealer)
+    if g.is_identity(b.commitments[0]) or g.is_identity(b.commitments[1]):
+        raise DKGError("dealing contributes nothing (identity constant-term / residue commitment)",
+                       b.index)
     if need_pok and not schnorr_verify(g, b.commitments[1], b.proof, _pok_ctx(session, b.index)):
         raise DKGError("invalid proof of knowledge", b.index)
     w = laurent.commit_check_weights(my_x, p.t, g.order)

@@ -13,6 +13,12 @@ here. Points are opaque objects; ``encode``/``decode`` give a canonical 64-byte
 form (``x ‖ y``, all-zero for the identity) and ``decode`` validates the curve
 equation, so a malformed or off-curve point is always rejected.
 
+Constant-time arithmetic on ``bn254``: when the native ``mclbn256`` library is importable
+(and ``TORUSSQL_CUSTODY_NATIVE`` is not ``0``), every secret-scalar multiplication
+(``mul_blinded`` / ``mul_secret``: shares, nonces, private keys) goes through mcl's
+constant-time ladder ``mclBnG1_mulCT``. Everything else — ``secp256k1``, and ``bn254``
+without the native library — is the pure-Python path below and is NOT constant time.
+
 Constant-time arithmetic is **not** available in pure Python: ``py_ecc`` uses
 variable-time big-int double-and-add, so scalar-multiplication time depends on
 the scalar. ``mul_blinded`` splits the scalar, k·P = (k−r)·P + r·P with a fresh
@@ -25,6 +31,7 @@ library (libsecp256k1 / coincurve) and run custodians on isolated hosts.
 from __future__ import annotations
 
 import hashlib
+import os
 import secrets
 
 try:
@@ -83,6 +90,12 @@ class Group:
         q = self.order
         r = secrets.randbelow(q - 1) + 1
         return self.add(self.mul(a, (k - r) % q), self.mul(a, r))
+
+    constant_time = False                 # True only for the native (mcl mulCT) path
+
+    def mul_secret(self, a, k: int):
+        """Multiplication by a SECRET scalar (constant time when ``constant_time``)."""
+        return self.mul_blinded(a, k)
 
     def msm(self, pairs):
         """Σ kᵢ·Pᵢ for (k, P) pairs."""
@@ -160,6 +173,38 @@ class _Bn254(Group):
         self.order = _BN_N
         self.G = _BN_G
         self.identity = _BN_Z
+
+    def _native(self):
+        if not hasattr(self, "_nat"):
+            self._nat = None
+            if os.environ.get("TORUSSQL_CUSTODY_NATIVE", "1") != "0":
+                try:
+                    from torusdb_core import fhe_backend as _fb
+                    be = _fb.get("mcl")
+                    if getattr(be, "constant_time", False):
+                        self._nat = be
+                except Exception:                             # noqa: BLE001 — optional accelerator
+                    self._nat = None
+        return self._nat
+
+    @property
+    def constant_time(self) -> bool:                          # type: ignore[override]
+        return self._native() is not None
+
+    def mul_secret(self, a, k):
+        be = self._native()
+        k %= self.order
+        if be is None:
+            return self.mul_blinded(a, k)
+        if k == 0 or self.is_identity(a):
+            return self.identity
+        r = be.g1_mul_secret(be.g1_from(self.encode(a)), k)
+        return self.decode(be.g1_to(r))
+
+    def mul_blinded(self, a, k):
+        if self._native() is not None:
+            return self.mul_secret(a, k)
+        return Group.mul_blinded(self, a, k)
 
     def add(self, a, b): return _bn_add(a, b)
     def mul(self, a, k):

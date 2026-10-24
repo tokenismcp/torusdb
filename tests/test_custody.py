@@ -540,3 +540,141 @@ def test_file_based_ceremony_end_to_end_and_substitution_attacks(tmp_path):
     a.write_text(ta); b.write_text(tb)                                   # swap back
     with pytest.raises(CustodyError, match="missing files"):
         ident.import_dealings(ids[0], "dkg", session, box, pubs, [1, 2, 3, 4, 5])
+
+
+# ═══ hardening round: constant-time mul, audit rotation, C-15 residue, fingerprints ═══════════
+def _have_mcl():
+    try:
+        from torusdb_core import fhe_backend
+        return "mcl" in fhe_backend.available()
+    except Exception:                                                  # noqa: BLE001
+        return False
+
+
+def test_bn254_secret_multiplication_matches_pure_python_and_reports_its_mode(monkeypatch):
+    g = get_group("bn254")
+    from py_ecc.optimized_bn128 import G1, multiply
+    for k in [1, 2, 12345, g.order - 1, secrets.randbelow(g.order), 0, g.order]:
+        want = g.identity if k % g.order == 0 else multiply(G1, k % g.order)
+        assert g.eq(g.mul_secret(g.G, k), want) and g.eq(g.mul_blinded(g.G, k), want)
+        P = g.mul(g.G, 777)
+        assert g.eq(g.mul_secret(P, k), g.mul(P, k))
+    assert g.is_identity(g.mul_secret(g.identity, 5))
+    assert g.constant_time is _have_mcl()                              # native mulCT iff mclbn256 is there
+    assert get_group("secp256k1").constant_time is False                # pure Python: documented, not CT
+    # switching the accelerator off falls back to the (variable-time) blinded path, same results
+    monkeypatch.setenv("TORUSSQL_CUSTODY_NATIVE", "0")
+    from torussql.custody.group import _Bn254
+    off = _Bn254()
+    assert off.constant_time is False and off.eq(off.mul_secret(off.G, 99), multiply(G1, 99))
+
+
+@pytest.mark.skipif(not _have_mcl(), reason="native mclbn256 back end not available")
+def test_native_backend_constant_time_multiplication_agrees_with_py_ecc():
+    from torusdb_core import fhe_backend as fb
+    m, p = fb.get("mcl"), fb.get("pyecc")
+    assert m.constant_time and not p.constant_time
+    for k in [0, 1, fb.N - 1, secrets.randbelow(fb.N), secrets.randbelow(fb.N)]:
+        assert m.g1_to(m.g1_mul_secret(m.G1, k)) == p.g1_to(p.g1_mul_secret(p.G1, k)) == m.g1_to(m.g1_mul(m.G1, k))
+        assert m.g2_to(m.g2_mul_secret(m.G2, k)) == p.g2_to(p.g2_mul_secret(p.G2, k))
+    # DLEQ / Schnorr proofs made through the CT path verify and shares verify
+    shares, pub, _ = run_local_ceremony(2, 3, "bn254")
+    assert all(s.verify() for s in shares)
+    E = pub.g.mul(pub.g.G, 31337)
+    part = partial_decrypt(shares[0], E, b"x")
+    assert verify_partial(pub, E, part, b"x")
+
+
+def test_audit_log_rotation_keeps_the_configured_number_of_files(tmp_path):
+    from torussql.custody.net import Custodian, LocalNode
+    shares, pub, _ = run_local_ceremony(2, 3, "secp256k1")
+    g = pub.g
+    E = g.mul(g.G, 5)
+    for keep in (3, 1, 0):
+        path = tmp_path / f"audit{keep}.log"
+        c = Custodian(shares[0], {"owner": "owner-token-0123456789abc"}, audit_path=str(path),
+                      audit_max_bytes=400, audit_keep=keep, rate_per_minute=100_000)
+        node = LocalNode(c, caller="owner")
+        for _ in range(60):
+            node.partial(E, b"")
+        files = sorted(f.name for f in tmp_path.glob(f"audit{keep}.log*"))
+        assert files == sorted([f"audit{keep}.log"] + [f"audit{keep}.log.{i}" for i in range(1, keep + 1)])
+        for f in tmp_path.glob(f"audit{keep}.log*"):
+            assert (f.stat().st_mode & 0o777) == 0o600
+            assert f.stat().st_size < 1200                     # bounded
+    assert (tmp_path / "audit3.log.1").read_text().count("served") > 0
+
+
+def test_dealings_that_contribute_nothing_are_rejected(key35):
+    g = get_group("bn254")
+    p = laurent.Params(2, 3, g.order)
+    sess = b"s" * 16
+    d = deal(g, p, 1, None, sess)
+    b = d.broadcast
+    check_dealing(g, p, b, 2, d.shares[2], sess)                       # an honest dealing is accepted
+    for pos in (0, 1):                                                 # constant term / residue = identity
+        comms = list(b.commitments); comms[pos] = g.identity
+        with pytest.raises(DKGError, match="contributes nothing"):
+            check_dealing(g, p, Broadcast(1, tuple(comms), b.proof), 2, d.shares[2], sess)
+        with pytest.raises(DKGError, match="contributes nothing"):
+            check_dealing(g, p, Broadcast(1, tuple(comms), b.proof), 2, d.shares[2], sess, need_pok=False)
+    # a zero-residue dealer with a VALID proof of knowledge of 0 is also caught
+    zd = deal(g, p, 2, 0, sess)
+    with pytest.raises(DKGError, match="contributes nothing"):
+        check_dealing(g, p, zd.broadcast, 1, zd.shares[1], sess)
+    # through the participant API too
+    parts = [Participant("bn254", 2, 3, i, sess) for i in (1, 2, 3)]
+    ds = {pt.index: pt.round1() for pt in parts}
+    bad = Broadcast(2, (ds[2].broadcast.commitments[0], g.identity), ds[2].broadcast.proof)
+    bc = {i: ds[i].broadcast for i in ds}; bc[2] = bad
+    with pytest.raises(DKGError, match="contributes nothing"):
+        parts[0].finish(bc, {i: ds[i].shares[1] for i in ds})
+    # reshare: never rejects honest dealers (fresh coefficients are never 0)
+    shares, pub, _ = run_local_ceremony(2, 3, "bn254")
+    new, npub = run_local_reshare(shares, [1, 2], 2, 3)
+    assert npub.key_id == pub.key_id
+
+
+def test_reshare_broadcasts_are_bound_to_both_committees_identity_lists(tmp_path):
+    from torussql.custody.identity import Identity, export_dealing, ids_digest, import_dealings
+    shares, pub, _ = run_local_ceremony(2, 3, "secp256k1")
+    g = pub.g
+    old = {i: Identity.new("secp256k1", i) for i in (1, 2, 3)}
+    new = {i: Identity.new("secp256k1", i) for i in (1, 2, 3)}
+    evil = {i: Identity.new("secp256k1", i) for i in (1, 2, 3)}
+    pubs = lambda ids: {i: x.public for i, x in ids.items()}
+    spec = ReshareSpec(pub, (1, 2), 2, 3, b"r" * 16)
+    dig = lambda ids: ids_digest(g, pubs(ids))
+    good = spec.params(dig(old), dig(new))
+    assert good["new_ids"] == dig(new) and good["old_ids"] == dig(old)
+    d1 = reshare_deal(spec, shares[0])
+    export_dealing(old[1], "reshare", spec.session, d1, pubs(new), str(tmp_path / "ok"), good)
+    # same files, but the recipient believes the new committee is someone else: refused
+    with pytest.raises(CustodyError, match="different ceremony"):
+        import_dealings(new[1], "reshare", spec.session, str(tmp_path / "ok"), pubs(old), [1],
+                        spec.params(dig(old), dig(evil)))
+    # an old-format broadcast (no new_ids in its signed params) is refused with a clear message
+    legacy = {k: v for k, v in good.items() if k != "new_ids"}
+    export_dealing(old[1], "reshare", spec.session, d1, pubs(new), str(tmp_path / "old"), legacy)
+    with pytest.raises(CustodyError, match="OLD format"):
+        import_dealings(new[1], "reshare", spec.session, str(tmp_path / "old"), pubs(old), [1], good)
+    bc, sh = import_dealings(new[1], "reshare", spec.session, str(tmp_path / "ok"), pubs(old), [1], good)
+    assert set(bc) == {1}
+
+
+def test_public_key_fingerprint_is_a_trust_anchor():
+    shares, pub, _ = run_local_ceremony(2, 3, "bn254")
+    fp = pub.fingerprint
+    assert len(fp.replace("-", "")) == 64 and fp == PublicKey.from_json(pub.to_json()).fingerprint
+    pub.check_fingerprint(None)
+    pub.check_fingerprint(fp)
+    pub.check_fingerprint(fp.upper().replace("-", " "))                 # formatting is irrelevant
+    pub.check_fingerprint(fp.replace("-", ":"))
+    for bad in ("", "00" * 32, fp[:-1] + ("0" if fp[-1] != "0" else "1")):
+        with pytest.raises(ShareError, match="fingerprint"):
+            pub.check_fingerprint(bad)
+    new, npub = refresh(shares)
+    assert npub.key_id == pub.key_id and npub.fingerprint != fp          # re-pin after a refresh
+    # a file with swapped non-X commitments (same key_id!) has a different fingerprint
+    forged = PublicKey(pub.group, pub.k, pub.n, (pub.g.mul(pub.g.G, 3), pub.commitments[1]), pub.epoch)
+    assert forged.key_id == pub.key_id and forged.fingerprint != fp

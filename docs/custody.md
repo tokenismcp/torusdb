@@ -178,13 +178,60 @@ conn = torussql.connect(host, port, token=db_token, vault_path="owner.vault",
 
 ### 2.5 FHE columns on a threshold key
 
-A `bn254` custody key can be the secret of `FHE` columns (`docs/fhe-columns.md`, "Threshold custody of the
-FHE key"). Custodians gain three key-service methods, all under the existing `key` permission and the same
-`approve` / rate-limit / audit machinery: `partial_batch` (many G1 points per request, rate charged per
-item), `gt_partial_batch` (GT exponentiation with a Chaum-Pedersen proof, for `DOT`) and `g2_partial` (the
-G2 share used once to publish `Q2 = s2*G2`; the FHE scheme needs TWO independent bn254 keys, `s` and `s2`,
-from two DKGs on the same hosts, each served by its own daemon). `python -m torussql.custody fhe-keygen-threshold` / `fhe-open-test`
-are the ceremony and check commands.
+A `bn254` custody key pair can be the secrets of `FHE` columns (`docs/fhe-columns.md`, "Threshold custody
+of the FHE key"): `s` and an independent `s2`, from two DKGs on the same hosts. Custodians gain three
+key-service methods under the existing `key` permission and the same `approve` / rate-limit / audit
+machinery: `partial_batch` (many G1 points per request), `gt_partial_batch` (GT exponentiation with a
+Chaum-Pedersen proof, for `DOT`) and `g2_partial` (the G2 share used once to publish `Q2 = s2*G2`).
+`python -m torussql.custody fhe-keygen-threshold` / `fhe-open-test` are the ceremony and check commands.
+
+**One daemon, several keys.** `serve --share A.json --share B.json` makes one daemon hold the shares of
+several different keys (typically `s` and `s2`). Every request then names its `key_id`
+(`RemoteCustodian.for_key(public)` does this); a request without one is refused on a multi-key daemon, a
+request naming a key the daemon does not hold is refused, and a key-1 request is never answered with the key-2
+share (the proof is also bound to the key id and epoch, so a swapped answer fails verification). A single-share
+daemon still accepts legacy requests without a `key_id`. `--key-access KEY_ID:caller,caller` restricts a key to
+named tokens; `approve` may be a `{key_id: callable}` map; request and item limits are counted per (caller, key).
+The audit log records the `key_id` of every key-service decision.
+
+**Limits (all per caller and key, all with a clear error):**
+
+| flag | default | meaning |
+|---|---|---|
+| `--rate` | 30 | REQUESTS per minute; a batch is one request |
+| `--item-budget` | 20000 | ITEMS (points / GT elements / G2 shares) answered per minute; `0` = unlimited |
+| `--max-batch` | 2000 | items in one batch request (GT batches are further capped at 64 by their cost) |
+
+Reading n FHE cells is one request of n items, so the default budget allows ~20000 cells/minute per caller
+while the request limit and the audit-log/DoS protections stay as they were (malformed requests also cost budget).
+
+**Audit log rotation.** `--audit-max-mb` (default 64) rotates `audit.log` to `.1`, `.2`, ... and `--audit-keep N`
+(default 7) is the number of rotated files kept (the oldest is deleted; `0` discards the full log). Rotated files
+stay `0600`.
+
+**Constant-time arithmetic: partial mitigation.** With `mclbn256` importable (and `TORUSSQL_CUSTODY_NATIVE`
+not `0`), every secret-scalar multiplication on the `bn254` group (shares, nonces, private keys, G2 shares)
+uses mcl's constant-time ladder (`mclBnG1_mulCT` / `mclBnG2_mulCT`); the FHE owner side does the same for
+`s*C1`, encryption randomness, plaintexts and public-key derivation. This is **not** complete: (a) the pure-Python
+paths (`py_ecc`, and `secp256k1` always) are variable-time big-int arithmetic; (b) GT exponentiation (the custodian's
+`c^(y_i)` and the owner's DOT decryption) has no constant-time primitive in mcl and keeps the split-exponent
+randomisation (`c^(k-r)*c^r` with fresh `r`), which only decorrelates repeated measurements; (c) point
+conversions and Python itself are not constant time; (d) the bounded discrete logarithm works on plaintexts.
+Run custodians on isolated hosts.
+
+**Public-key trust anchor.** `public.json` carries every verification key, so a swapped file defeats DLEQ
+verification. `public-show` prints a **fingerprint** (SHA-256 over group, k, n, epoch and all commitments);
+procedure: (1) after the DKG every custodian runs `public-show` and the fingerprints are compared out of band;
+(2) every client and operator command that reads the file takes `--expect-fingerprint FP` (`open-test`,
+`fhe-keygen-threshold`, `fhe-open-test` also `--expect-fingerprint2`, `reshare-start/finish`, `public-show`;
+`torussql --custody-expect-fingerprint[2]`) and refuses a mismatch before contacting anyone; (3) re-pin after a
+refresh/reshare, which changes the epoch and commitments (the `key_id` does not change).
+
+**Ceremony hardening.** A DKG/reshare dealing whose constant-term or residue commitment is the identity
+(a "contribution-less" dealing) is rejected; this cannot reject an honest dealer (a random coefficient is 0 with
+probability 1/q). `reshare-start` now needs `--old-ids` and `--new-ids` and `reshare-finish` needs `--new-ids`:
+the digests of both committees' identity lists are signed into every reshare broadcast, so a dealing cannot be
+replayed to a different set of recipients; broadcasts in the old format are refused with an explicit message.
 
 ## 3. What it protects — and what it does not
 

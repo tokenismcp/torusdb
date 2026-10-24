@@ -24,6 +24,7 @@ from torusdb_core.errors import IntegrityError as CoreIntegrity
 from torussql.custody import (InsufficientPartials, LocalCustodian, Quorum, QuorumError,
                               laurent, run_local_ceremony)
 from torussql.custody import gt as cgt
+from torussql.custody.group import InvalidPoint
 from torussql.custody.net import Custodian, CustodianServer, LocalNode, RemoteCustodian
 from test_ops import Running
 
@@ -133,13 +134,10 @@ def run_sql_suite(c, authenticated=False):
     assert c.execute("SELECT SUM(rate) FROM emp").rows == [[60 + 55 + 30 + 20]]
     c.execute("DELETE FROM emp WHERE id = 4")
     assert c.execute("SELECT SUM(rate) FROM emp").rows == [[145]]
-    if authenticated:
-        with pytest.raises(Exception, match="no integrity protection"):
-            c.execute("SELECT DOT(rate, hours) FROM emp")
-    else:
-        assert c.execute("SELECT DOT(rate, hours) FROM emp").rows == [[60 * 160 + 55 * 150 + 30 * 120]]
-        assert c.execute("SELECT DOT(rate, hours) FROM emp WHERE dept = 5").rows == \
-            [[60 * 160 + 55 * 150]]
+    # authenticated: DOT is computed and verified locally (fhe_dot_mode="auto"); otherwise the
+    # server's ★_ct product is decrypted through the quorum
+    assert c.execute("SELECT DOT(rate, hours) FROM emp").rows == [[60 * 160 + 55 * 150 + 30 * 120]]
+    assert c.execute("SELECT DOT(rate, hours) FROM emp WHERE dept = 5").rows == [[60 * 160 + 55 * 150]]
 
 
 # ── equality with the non-threshold key ──────────────────────────────────────
@@ -465,7 +463,7 @@ def test_custodians_refuse_gt_elements_outside_the_subgroup(keyset, keyset2):
         node.call("gt_partial_batch", [["zz"], ""])
     with pytest.raises(QuorumError, match="malformed"):
         node.call("gt_partial_batch", [[], ""])
-    with pytest.raises(QuorumError, match="malformed"):
+    with pytest.raises(QuorumError, match="batch too large"):
         node.call("gt_partial_batch", [["00"] * (cgt.MAX_GT_BATCH + 1), ""])
     # and the owner side refuses to even ask for them
     key = mk(keyset, keyset2)
@@ -486,7 +484,7 @@ def test_custodian_validates_points_and_enforces_policy_and_rate(keyset, tmp_pat
         return not state["deny"]
 
     cust = Custodian(shares[0], {"owner": TOKEN}, rate_per_minute=100, approve=approve,
-                     audit_path=str(tmp_path / "a.log"))
+                     item_budget_per_minute=1000, max_batch=50, audit_path=str(tmp_path / "a.log"))
     node = LocalNode(cust, caller="owner", label="c1")
     E = g.mul(g.G, 777)
     # canonical, validated: junk / off-curve / identity / non-canonical are all refused
@@ -506,21 +504,29 @@ def test_custodian_validates_points_and_enforces_policy_and_rate(keyset, tmp_pat
     craw = cgt.gt_encode(pairing(G2, G1) ** 5)
     node.gt_partial_batch([craw], b"")
     assert seen[-1] == ("owner", "gt:" + craw.hex())
-    # the rate limit is charged PER ITEM: a batch is not a way around it
-    cust._hits.clear()
-    cust._rate = 6
-    with pytest.raises(QuorumError, match="rate limit"):
+    # a batch is ONE request for the request limit, but its items are charged to the item
+    # budget; both limits give clear errors
+    cust._hits.clear(); cust._items.clear()
+    cust._item_cap = 6
+    with pytest.raises(QuorumError, match="item budget exceeded"):
         node.call("partial_batch", [[g.hex(E)] * 7, ""])
-    cust._hits.clear()
+    cust._hits.clear(); cust._items.clear()
     node.call("partial_batch", [[g.hex(E)] * 6, ""])
-    with pytest.raises(QuorumError, match="rate limit"):
+    with pytest.raises(QuorumError, match="item budget exceeded"):
         node.call("partial_batch", [[g.hex(E)], ""])
-    with pytest.raises(QuorumError, match="rate limit"):
+    with pytest.raises(QuorumError, match="item budget exceeded"):
         node.gt_partial_batch([craw], b"")
-    with pytest.raises(QuorumError, match="rate limit"):
+    with pytest.raises(QuorumError, match="item budget exceeded"):
         node.g2_partial()
-    cust._hits.clear()
-    cust._rate = 100
+    cust._hits.clear(); cust._items.clear()
+    cust._rate = 2                                            # the per-request limit is kept
+    node.call("partial_batch", [[g.hex(E)], ""]); node.call("partial_batch", [[g.hex(E)], ""])
+    with pytest.raises(QuorumError, match="rate limit exceeded"):
+        node.call("partial_batch", [[g.hex(E)], ""])
+    cust._hits.clear(); cust._items.clear()
+    cust._rate, cust._item_cap = 100, 1000
+    with pytest.raises(QuorumError, match="batch too large"):
+        node.call("partial_batch", [[g.hex(E)] * 51, ""])
     # policy denial applies to the whole batch, before anything is computed
     state["deny"] = True
     with pytest.raises(QuorumError, match="policy"):
@@ -529,7 +535,8 @@ def test_custodian_validates_points_and_enforces_policy_and_rate(keyset, tmp_pat
         node.gt_partial_batch([craw], b"")
     state["deny"] = False
     lines = [json.loads(l) for l in open(tmp_path / "a.log")]
-    assert any("rate limit" in l["outcome"] for l in lines) and any(l["outcome"] == "served" for l in lines)
+    assert any("item budget" in l["outcome"] for l in lines)
+    assert any(l["outcome"] == "served" for l in lines)
     assert str(shares[0].y) not in open(tmp_path / "a.log").read()
     # a caller without the 'key' permission cannot use any of the new methods
     ro = Custodian(shares[0], {"reader": TOKEN}, permissions={"reader": {"mask_read"}})
@@ -680,9 +687,8 @@ def test_authenticated_mode_in_memory_and_lying_server(tkey):
             c.execute("SELECT SUM(rate) FROM emp")
     srv.fhe_sum = real
     assert c.execute("SELECT SUM(hours) FROM emp").rows == [[530]]
-    with pytest.raises(Exception, match="no integrity protection"):
-        c.execute("SELECT DOT(rate, hours) FROM emp")
-    c.fhe_allow_unverified_dot = True
+    assert c.execute("SELECT DOT(rate, hours) FROM emp").rows == [[DOT_ALL]]    # auto -> local, tag-verified
+    c.fhe_dot_mode = "delegated"                                                 # the server's ★_ct product
     assert c.execute("SELECT DOT(rate, hours) FROM emp").rows == [[DOT_ALL]]
 
 
@@ -754,18 +760,25 @@ def test_network_authenticated_sql_and_audit_log(keyset, keyset2, net, net2, tmp
     assert hex(x)[2:] not in text and hex(shares[0].y)[2:] not in text
 
 
-def test_network_rate_limit_applies_to_fhe_reads(keyset, keyset2, tmp_path):
+def test_network_item_budget_applies_to_fhe_reads(keyset, keyset2, tmp_path):
     shares, pub, _ = keyset
     shares2, pub2, _ = keyset2
-    n = Net(shares, tmp_path, rate=4)
+    nodes = []
+    for sh in shares:
+        c = Custodian(sh, {"owner": TOKEN}, rate_per_minute=4, item_budget_per_minute=4)
+        srv = CustodianServer("127.0.0.1", 0, c)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        nodes.append((srv, RemoteCustodian("127.0.0.1", srv.address[1], TOKEN, group=pub.g)))
     try:
-        # Q2 costs 1 request per s2 custodian: fine. Reading 5 cells at once costs 5: refused.
-        key = mk(keyset, keyset2, nodes=n.remotes())
+        # Q2 comes from the s2 custodians (local nodes); reading 5 cells costs 5 items > 4: refused
+        key = mk(keyset, keyset2, nodes=[r for _s, r in nodes])
         cells = [key.encrypt(i) for i in range(5)]
-        with pytest.raises(InsufficientPartials, match="rate limit"):
+        with pytest.raises(InsufficientPartials, match="item budget"):
             key.decrypt_cells(cells)
+        assert key.decrypt_cells(cells[:2]) == [0, 1]              # within the budget: one request
     finally:
-        n.stop()
+        for srv, _r in nodes:
+            srv.shutdown(); srv.server_close()
 
 
 # ── back ends ────────────────────────────────────────────────────────────────
@@ -788,35 +801,37 @@ def _env():
     return e
 
 
-def test_cli_fhe_keygen_threshold_and_open_test(keyset, keyset2, tmp_path):
+def test_cli_one_daemon_per_host_serves_both_keys(keyset, keyset2, tmp_path):
+    """`serve --share A --share B`: ONE daemon per custodian host holds the s and s2 shares;
+    --custodian2 is omitted so the same endpoints serve key 2."""
     shares, pub, _ = keyset
     shares2, pub2, _ = keyset2
     d = tmp_path
     pub.save(str(d / "pub.json")); pub2.save(str(d / "pub2.json"))
     (d / "tokens").write_text(f"owner:{TOKEN}\n")
     os.chmod(d / "tokens", 0o600)
-    procs, specs, specs2 = [], [], []
+    procs, specs = [], []
     try:
-        for sh, out, tag in ((shares[:3], specs, "a"), (shares2[:3], specs2, "b")):
-            for s in sh:
-                f = d / f"share{tag}{s.index}.json"
-                s.save(str(f), None)
-                p = subprocess.Popen([sys.executable, "-m", "torussql.custody", "serve", "--share",
-                                      str(f), "--no-passphrase", "--rate", "5000",
-                                      "--listen", "127.0.0.1:0", "--token-file", str(d / "tokens")],
-                                     env=_env(), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                                     text=True)
-                procs.append(p)
-                out.append("127.0.0.1:" + re.search(r"on 127\.0\.0\.1:(\d+)", p.stdout.readline()).group(1))
+        for s1, s2 in zip(shares[:3], shares2[:3]):
+            f1, f2 = d / f"s{s1.index}.json", d / f"t{s2.index}.json"
+            s1.save(str(f1), None); s2.save(str(f2), None)
+            p = subprocess.Popen([sys.executable, "-m", "torussql.custody", "serve", "--share", str(f1),
+                                  "--share", str(f2), "--no-passphrase", "--item-budget", "5000",
+                                  "--listen", "127.0.0.1:0", "--token-file", str(d / "tokens"),
+                                  "--audit", str(d / f"audit{s1.index}.log")],
+                                 env=_env(), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+            procs.append(p)
+            line = p.stdout.readline()
+            assert line.count("key share") == 2
+            specs.append("127.0.0.1:" + re.search(r"on 127\.0\.0\.1:(\d+)", line).group(1))
         base = ["--public", str(d / "pub.json"), "--public2", str(d / "pub2.json"), "--token-env", "CT"]
         for sp in specs:
             base += ["--custodian", sp]
-        for sp in specs2:
-            base += ["--custodian2", sp]
-        run = lambda *a, **k: subprocess.run([sys.executable, "-m", "torussql.custody", *a],
-                                              env=_env() | {"CT": TOKEN}, capture_output=True,
-                                              text=True, timeout=300, **k)
-        r = run("fhe-keygen-threshold", *base, "--out", str(d / "fhe.json"), "--range", "5000")
+        run = lambda *a, env=None, **k: subprocess.run(
+            [sys.executable, "-m", "torussql.custody", *a], env=_env() | (env or {"CT": TOKEN}),
+            capture_output=True, text=True, timeout=300, **k)
+        fp = ["--expect-fingerprint", pub.fingerprint, "--expect-fingerprint2", pub2.fingerprint]
+        r = run("fhe-keygen-threshold", *base, *fp, "--out", str(d / "fhe.json"), "--range", "5000")
         assert r.returncode == 0, r.stderr
         assert "holds NO secret" in r.stdout
         bundle = json.loads((d / "fhe.json").read_text())
@@ -826,22 +841,153 @@ def test_cli_fhe_keygen_threshold_and_open_test(keyset, keyset2, tmp_path):
             assert hex(x)[2:] not in json.dumps(bundle)
         assert set(bundle) >= {"Q", "X2", "Q2", "mac"}
         assert run("fhe-keygen-threshold", *base, "--out", str(d / "fhe.json")).returncode != 0   # no overwrite
-        # the same key twice is refused
         same = ["--public", str(d / "pub.json"), "--public2", str(d / "pub.json"), "--token-env", "CT"]
         for sp in specs:
-            same += ["--custodian", sp, "--custodian2", sp]
+            same += ["--custodian", sp]
         assert run("fhe-keygen-threshold", *same, "--out", str(d / "x.json")).returncode != 0
-        r = run("fhe-open-test", *base, "--bundle", str(d / "fhe.json"), "--mac")
+        r = run("fhe-open-test", *base, *fp, "--bundle", str(d / "fhe.json"), "--mac")
         assert r.returncode == 0 and "DOT" in r.stdout and "MAC" in r.stdout, r.stderr
+        # a wrong pinned fingerprint is refused before anything is contacted
+        bad = ["--expect-fingerprint", "00" * 32]
+        for cmd in (("fhe-open-test", "--bundle", str(d / "fhe.json")),
+                    ("fhe-keygen-threshold", "--out", str(d / "y.json")),
+                    ("open-test",)):
+            args = base if cmd[0] != "open-test" else ["--public", str(d / "pub.json"), "--token-env", "CT",
+                                                       "--custodian", specs[0]]
+            r = run(cmd[0], *args, *bad, *cmd[1:])
+            assert r.returncode != 0 and "fingerprint" in r.stderr, (cmd, r.stderr)
+        assert run("public-show", "--public", str(d / "pub.json")).stdout.count(pub.fingerprint) == 1
+        assert run("public-show", "--public", str(d / "pub.json"), "--expect-fingerprint", "ab").returncode != 0
+        # the Python client: same endpoints for both keys (custodians2 omitted)
         key = ThresholdFheKey.load(
             str(d / "fhe.json"), pub,
-            [RemoteCustodian("127.0.0.1", int(sp.split(":")[1]), TOKEN, group=pub.g) for sp in specs],
-            pub2, [RemoteCustodian("127.0.0.1", int(sp.split(":")[1]), TOKEN, group=pub2.g) for sp in specs2])
+            [RemoteCustodian("127.0.0.1", int(sp.split(":")[1]), TOKEN, group=pub.g) for sp in specs], pub2)
         assert key.decrypt_cell(key.encrypt(41)) == 41
-        r = subprocess.run([sys.executable, "-m", "torussql.custody", "fhe-open-test", *base,
-                            "--bundle", str(d / "fhe.json")], env=_env() | {"CT": "wrong-token-0123456789abc"},
-                           capture_output=True, text=True, timeout=300)
+        assert key.decrypt_dot(fhe.dot_cells([key.encrypt(6)], [key.encrypt(7)], key.be)) == 42
+        r = run("fhe-open-test", *base, "--bundle", str(d / "fhe.json"), env={"CT": "wrong-token-0123456789abc"})
         assert r.returncode != 0 and TOKEN not in r.stdout + r.stderr
+        assert '"key_id"' in (d / "audit1.log").read_text()
     finally:
         for p in procs:
             p.terminate()
+
+
+# ── one daemon, several keys ─────────────────────────────────────────────────
+class MultiNet:
+    """n daemons (threads), each holding BOTH the s and the s2 share."""
+
+    def __init__(self, shares, shares2, tmp_path, **kw):
+        self.servers, self.custodians, self.ports = [], [], []
+        for s1, s2 in zip(shares, shares2):
+            c = Custodian([s1, s2], {"owner": TOKEN, "ops": "ops-token-0123456789abcd"},
+                          audit_path=str(tmp_path / f"m_audit{s1.index}.log"), **kw)
+            srv = CustodianServer("127.0.0.1", 0, c)
+            threading.Thread(target=srv.serve_forever, daemon=True).start()
+            self.servers.append(srv); self.custodians.append(c); self.ports.append(srv.address[1])
+        self.g = shares[0].public.g
+
+    def remotes(self, token=TOKEN):
+        return [RemoteCustodian("127.0.0.1", p, token, group=self.g) for p in self.ports]
+
+    def stop(self):
+        for s in self.servers:
+            s.shutdown(); s.server_close()
+
+
+def test_one_daemon_serves_both_keys_full_sql(keyset, keyset2, tmp_path):
+    shares, pub, _ = keyset
+    shares2, pub2, _ = keyset2
+    mn = MultiNet(shares, shares2, tmp_path)
+    s = Running()
+    try:
+        key = ThresholdFheKey.create(pub, mn.remotes(), pub2, value_range=RANGE)     # custodians2 omitted
+        with s.connect(fhe_key=key) as c:
+            run_sql_suite(c)
+        s2 = Running()
+        try:
+            with s2.connect(fhe_key=key, authenticated=True) as c:
+                run_sql_suite(c, authenticated=True)
+        finally:
+            s2.stop()
+        key_b = ThresholdFheKey.from_bundle(key.bundle(), pub, mn.remotes(), pub2)
+        assert key_b.decrypt_dot(fhe.dot_cells([key.encrypt(5)], [key.encrypt(8)], key_b.be)) == 40
+    finally:
+        s.stop(); mn.stop()
+
+
+def test_a_key_one_request_is_never_answered_with_the_key_two_share(keyset, keyset2, tmp_path):
+    shares, pub, _ = keyset
+    shares2, pub2, _ = keyset2
+    mn = MultiNet(shares, shares2, tmp_path)
+    try:
+        r = mn.remotes()[0]
+        g = pub.g
+        E = g.mul(g.G, 4242)
+        k1, k2 = pub.key_id, pub2.key_id
+        d1 = r.call("partial", [g.hex(E), "", k1])
+        d2 = r.call("partial", [g.hex(E), "", k2])
+        from torussql.custody import Partial, verify_partial
+        p1, p2 = Partial.from_json(g, d1), Partial.from_json(g, d2)
+        assert verify_partial(pub, E, p1) and verify_partial(pub2, E, p2)
+        assert not verify_partial(pub2, E, p1) and not verify_partial(pub, E, p2)     # not interchangeable
+        assert not g.eq(p1.D, p2.D)
+        # no key_id on a multi-key daemon: refused; unknown key id: refused; same for every method
+        for m, a in (("partial", [g.hex(E), ""]), ("partial_batch", [[g.hex(E)], ""]),
+                     ("g2_partial", [])):
+            with pytest.raises(QuorumError, match="must name a key_id"):
+                r.call(m, a)
+        for m, a in (("partial", [g.hex(E), "", "ff" * 16]), ("partial_batch", [[g.hex(E)], "", "ff" * 16]),
+                     ("g2_partial", ["ff" * 16]), ("partial", [g.hex(E), "", 5])):
+            with pytest.raises(QuorumError, match="no share of that key"):
+                r.call(m, a)
+        # the typed clients carry the key id: for_key() routes to the right share
+        c2 = r.for_key(pub2)
+        assert verify_partial(pub2, E, c2.partial(E, b""))
+        idx, y2 = c2.g2_partial()
+        assert cgt.verify_g2_share(pub2, idx, y2)
+        with pytest.raises(InvalidPoint):
+            cgt.verify_g2_share(pub, idx, y2)                    # key 2's G2 share is not key 1's
+        # a single-share (legacy) daemon: requests without key_id still work, a WRONG key_id is refused
+        legacy = Custodian(shares[0], {"owner": TOKEN})
+        ln = LocalNode(legacy, caller="owner")
+        assert verify_partial(pub, E, ln.partial(E, b""))
+        with pytest.raises(QuorumError, match="no share of that key"):
+            ln.for_key(pub2).partial(E, b"")
+        assert len(mn.custodians[0].info()["keys"]) == 2 and "key_id" not in mn.custodians[0].info()
+    finally:
+        mn.stop()
+
+
+def test_per_key_access_rate_limits_and_approve(keyset, keyset2, tmp_path):
+    shares, pub, _ = keyset
+    shares2, pub2, _ = keyset2
+    g = pub.g
+    E = g.mul(g.G, 99)
+    k1, k2 = pub.key_id, pub2.key_id
+    seen = []
+    c = Custodian([shares[0], shares2[0]], {"owner": TOKEN, "ops": "ops-token-0123456789abcd"},
+                  key_access={k2: {"ops"}}, rate_per_minute=3, item_budget_per_minute=10,
+                  approve={k1: lambda caller, e, ctx: seen.append(("k1", caller)) or True,
+                           k2: lambda caller, e, ctx: False})
+    own = LocalNode(c, caller="owner")
+    ops = LocalNode(c, caller="ops")
+    own.call("partial", [g.hex(E), "", k1])
+    # key access: the owner may not use key 2 at all; ops may (but key 2's own approve declines)
+    with pytest.raises(QuorumError, match="no access to that key"):
+        own.call("partial", [g.hex(E), "", k2])
+    with pytest.raises(QuorumError, match="policy"):
+        ops.call("partial", [g.hex(E), "", k2])
+    assert seen == [("k1", "owner")]                          # approve hooks are per key
+    # rate limits are per (caller, key): exhausting key 1 does not touch key 2's budget
+    own.call("partial", [g.hex(E), "", k1]); own.call("partial", [g.hex(E), "", k1])
+    with pytest.raises(QuorumError, match="rate limit exceeded"):
+        own.call("partial", [g.hex(E), "", k1])
+    for _ in range(2):
+        with pytest.raises(QuorumError, match="policy"):
+            ops.call("partial", [g.hex(E), "", k2])
+    with pytest.raises(Exception, match="key_access"):
+        Custodian([shares[0]], {"owner": TOKEN}, key_access={k2: {"owner"}})
+    with pytest.raises(Exception, match="same key"):
+        Custodian([shares[0], shares[0]], {"owner": TOKEN})
+
+

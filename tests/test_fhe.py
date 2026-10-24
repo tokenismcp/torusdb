@@ -361,10 +361,29 @@ def test_untagged_data_is_refused_by_an_authenticated_client_and_dot_needs_opt_i
     with pytest.raises(CoreIntegrity):
         auth.execute("SELECT SUM(a) FROM t")
     _, c = auth_client()
-    with pytest.raises(Exception, match="no integrity protection"):
+    want = 40 * 160 + 55 * 150 + 30 * 120 + 20 * 100
+    assert c.execute("SELECT DOT(rate, hours) FROM emp").rows == [[want]]       # auto -> local, verified
+    assert c.execute("SELECT DOT(rate, hours) FROM emp WHERE dept = 5").rows == [[40 * 160 + 55 * 150 + 20 * 100]]
+    c.fhe_dot_mode = "delegated"                                                 # explicit opt-in to the server product
+    assert c.execute("SELECT DOT(rate, hours) FROM emp").rows == [[want]]
+    c.fhe_dot_mode = "bogus"
+    with pytest.raises(Exception, match="fhe_dot_mode"):
         c.execute("SELECT DOT(rate, hours) FROM emp")
-    c.fhe_allow_unverified_dot = True
-    assert c.execute("SELECT DOT(rate, hours) FROM emp").rows == [[40 * 160 + 55 * 150 + 30 * 120 + 20 * 100]]
+
+
+def test_local_dot_catches_a_tampered_operand_and_delegated_dot_does_not():
+    srv, c = auth_client()
+    store = srv._rows["emp"]
+    store.set_cell(1, "hours", KEY.encrypt(1))                 # server swaps one operand cell for another value
+    c.fhe_dot_mode = "local"
+    with pytest.raises(CoreIntegrity):
+        c.execute("SELECT DOT(rate, hours) FROM emp")
+    c.fhe_dot_mode = "delegated"                               # the unverified path silently returns a wrong number
+    assert c.execute("SELECT DOT(rate, hours) FROM emp").rows != [[40 * 160 + 55 * 150 + 30 * 120 + 20 * 100]]
+    # local mode also verifies the tags of untouched rows and works over a wire connection
+    c.fhe_dot_mode = "local"
+    with pytest.raises(CoreIntegrity):
+        c.execute("SELECT DOT(rate, hours) FROM emp WHERE dept = 5")
 
 
 def test_authenticated_insert_is_atomic_over_the_wire(tmp_path):

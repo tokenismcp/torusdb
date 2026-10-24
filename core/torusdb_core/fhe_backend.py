@@ -59,6 +59,14 @@ class PyEcc:
     def g2_mul(self, a, k): return p_mul(a, k % N)
     def g1_is_zero(self, a): return is_inf(a)
 
+    # Secret-scalar multiplication. py_ecc is variable-time big-int arithmetic: there is NO
+    # constant-time path on this back end (these are plain multiplications, kept so callers
+    # can ask for "secret" semantics uniformly). The native back end uses mulCT.
+    constant_time = False
+
+    def g1_mul_secret(self, a, k): return p_mul(a, k % N)
+    def g2_mul_secret(self, a, k): return p_mul(a, k % N)
+
     def g1_to(self, p) -> bytes:
         if is_inf(p):
             return bytes(G1_BYTES)
@@ -114,12 +122,17 @@ class PyEcc:
 
 
 # ── native (mclbn256) ────────────────────────────────────────────────────────
+M_lib = None
+
+
 class Mcl:
     name, tag = "mcl", b"\x02"
 
     def __init__(self):
         import mclbn256.mclbn256 as M
         from mclbn256 import Fr, G1, G2, GT
+        global M_lib
+        M_lib = M.lib
         # process-wide: use alt_bn128 (the BN254 curve py_ecc and Ethereum use)
         if M.lib.mclBn_init(4, M.MCLBN_COMPILED_TIME_VAR):
             raise BackendError("cannot initialise mcl for BN_SNARK1")
@@ -146,6 +159,23 @@ class Mcl:
     def g2_add(self, a, c): return a + c
     def g2_mul(self, a, k): return a * self._fr(k)
     def g1_is_zero(self, a): return a.tostr() == b"0"
+
+    # Secret-scalar multiplication through mcl's constant-time ladder (mclBnG{1,2}_mulCT):
+    # execution time and memory access do not depend on the scalar. Use for every
+    # multiplication by a secret (key, share, nonce, plaintext, encryption randomness).
+    constant_time = True
+
+    def g1_mul_secret(self, a, k):
+        r = self._G1()
+        if M_lib.mclBnG1_mulCT(r.d, a.d, self._fr(k).s) == -1:
+            raise BackendError("mcl mulCT failed")
+        return r
+
+    def g2_mul_secret(self, a, k):
+        r = self._G2()
+        if M_lib.mclBnG2_mulCT(r.d2, a.d2, self._fr(k).s) == -1:
+            raise BackendError("mcl mulCT failed")
+        return r
 
     def g1_to(self, p) -> bytes:
         s = p.tostr().split()

@@ -33,6 +33,11 @@ class LocalCustodian:
         self._approve = approve
         self.requests = 0
 
+    def for_key(self, public) -> "LocalCustodian":
+        if public.key_id != self.share.public.key_id:
+            raise QuorumError("this custodian holds no share of that key")
+        return self
+
     def partial(self, E, context: bytes = b"") -> Partial:
         g = self.share.public.g
         if self._approve and not self._approve("local", g.hex(E), context):

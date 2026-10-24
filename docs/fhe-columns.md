@@ -123,10 +123,11 @@ custodian hosts (a second `serve` daemon per custodian for the second share file
 ```bash
 # 1. TWO dealerless DKGs on the bn254 group (docs/custody.md section 2.1): key 1 -> s, key 2 -> s2;
 #    run the daemons for both (e.g. host1:8601 serves s, host1:8602 serves s2)
+#    (or ONE daemon per host holding both shares: `serve --share s.json --share s2.json`, and omit --custodian2)
 # 2. one owner-side step: Q2 = s2*G2 from key 2's custodians, a sealed MAC secret, ONE public bundle
 python -m torussql.custody fhe-keygen-threshold --public public.json --public2 public2.json --token-env CT \
     --custodian host1:8601 --custodian host2:8601 --custodian host3:8601 \
-    --custodian2 host1:8602 --custodian2 host2:8602 --custodian2 host3:8602 --out fhe-bundle.json
+    --out fhe-bundle.json        # add --custodian2 ... only if s2 is served elsewhere
 python -m torussql.custody fhe-open-test ... --bundle fhe-bundle.json    # cells, SUM, DOT, MAC
 torussql --fhe-threshold fhe-bundle.json --custody-public public.json --custody-public2 public2.json \
          --custodian host1:8601 ... --custodian2 host1:8602 ... --custody-token-env CT -p 8533
@@ -170,8 +171,9 @@ this is a **decryption oracle for whoever holds a caller token**: any token hold
 (it cannot be tied to "this column"). Inputs are validated (canonical encoding, on-curve / subgroup membership,
 identity refused), the `approve(caller, E_hex, ctx)` hook is called for every item with its canonical encoding
 (GT elements as `"gt:" + hex`), and the **rate limit is charged per item**, so a batch is not a way around it.
-Reading n cells costs n requests: raise `serve --rate` accordingly (the default of 30 per minute is meant for
-vault unsealing). Treat tokens as decryption capabilities.
+A read of n cells is **one request of n items**: the per-request limit (`--rate`, default 30/min) is unchanged
+and a separate item budget (`--item-budget`, default 20000 items/min per caller and key) bounds the throughput;
+`--max-batch` (default 2000) caps one request. Treat tokens as decryption capabilities.
 
 **Integrity tags and the MAC secret (trade-off).** Tags need `alpha` and per-cell `gamma`, which for a plain
 `FheKey` are PRFs of `s`. With a threshold key nobody holds `s`, so a **separate random 32-byte MAC secret** is generated
@@ -184,8 +186,7 @@ MAC secret is unrelated to `s`. Without `authenticated=True` the MAC secret is n
 clear error). Rotating the MAC secret means re-tagging the data.
 
 **Limits.** Every threshold read/decryption needs a live quorum (that is the point); latency is network round trips
-plus pure-Python proof checking (a `DOT` decryption takes ~2 s: two sequential GT rounds, one per key). The custody code
-is pure Python; the exponentiations are variable-time. `DOT` has no integrity protection, same as before.
+plus pure-Python proof checking (a `DOT` decryption takes ~2 s: two sequential GT rounds, one per key). Constant-time multiplication is only a **partial mitigation**: with `mclbn256` the secret-scalar G1/G2 multiplications (`s*C1`, encryption randomness, shares, nonces) use `mulCT`; GT exponentiation (DOT decryption, the custodians' `c^(y_i)`) has no constant-time primitive and keeps exponent-split randomisation, and the pure-Python path is variable-time. A delegated `DOT` (server-side ★_ct) has no integrity protection; an authenticated connection verifies `DOT` locally (`fhe_dot_mode`).
 Refresh/reshare of either key's shares keeps `Q`, `Q2` and the bundle valid (key ids are unchanged).
 `secp256k1` custody keys cannot be used (the pairing groups are BN254).
 

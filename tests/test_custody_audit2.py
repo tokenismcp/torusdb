@@ -41,6 +41,9 @@ def key23():
 @pytest.mark.parametrize("name", ["secp256k1", "bn254"])
 def test_mul_blinded_splits_the_scalar_and_is_correct(name, monkeypatch):
     g = get_group(name)
+    if name == "bn254":                  # this test is about the pure-Python split path; the
+        g._native()                      # native mulCT path needs no split (see test_custody.py)
+        monkeypatch.setattr(g, "_nat", None)
     A = g.mul(g.G, 12345)
     k = secrets.randbelow(g.order)
     seen = []

@@ -517,8 +517,10 @@ for (const storage of ["memory", "disk"]) {
       assert.equal(ids.length, 2);
       await assert.rejects(db.insert(t, { id: 12, dept: 1, rate: 10_000_000, hours: 1 }), kind("OutOfBudget"));
       assert.equal(await db.count(t), 5);
-      // DOT has no integrity protection: refused unless explicitly accepted
-      await assert.rejects(db.dot(t, "rate", "hours", eq("id", 2), "pyecc"), /no integrity protection/);
+      // authenticated + auto = "local": verified, computed by the owner (no pairing, no server DOT call)
+      assert.equal(await db.dot(t, "rate", "hours", eq("id", 2), "pyecc"), BigInt(55 * 150));
+      assert.equal(await db.dot(t, "rate", "hours", eq("dept", 1)), 1n * 2n + 2n * 3n);
+      // the legacy flag selects "delegated" (server pairing, unverified)
       const lax = await Client.connect(srv.host, srv.port, { fheKey: key, authenticated: true, fheAllowUnverifiedDot: true, ...OPTS });
       try {
         lax.trustTable(t);
@@ -765,4 +767,60 @@ test("an old server without update_cells: fall back to update_cell once, remembe
     assert.equal(f.seen.filter((m) => m === "update_cells").length, 1);            // asked once only
     assert.equal(f.seen.filter((m) => m === "update_cell").length, 4);             // 1 + 1 + 2 tags by repetition
   } finally { db.close(); f.close(); }
+});
+
+// ── DOT modes: auto / local / delegated ──────────────────────────────────────
+T("DOT modes: local is verified, delegated is not, auto depends on authentication; bad values rejected", async () => {
+  const key = FheKey.fromHex(SECRET, 100_000);
+  for (const bad of ["", "Local", "remote", "unverified", 1]) {
+    await assert.rejects(Client.connect(mem.host, mem.port, { fheKey: key, fheDotMode: bad as any }), kind("InterfaceError"), String(bad));
+  }
+  const cn = (o: object, host = mem.host, port = mem.port) => Client.connect(host, port, { fheKey: key, ...OPTS, ...o });
+  const auth = await cn({ authenticated: true });
+  const t = uniq("dm");
+  await seed(auth, t);
+  const local = await cn({ authenticated: true, fheDotMode: "local" });
+  const deleg = await cn({ authenticated: true, fheDotMode: "delegated" });
+  const plain = await cn({});
+  const plainLocal = await cn({ fheDotMode: "local" });
+  const legacy = await cn({ authenticated: true, fheAllowUnverifiedDot: true });
+  for (const c of [local, deleg, plain, plainLocal, legacy]) c.trustTable(t);
+  try {
+    assert.equal(await auth.dot(t, "rate", "hours"), BigInt(DOT_ALL));                       // authenticated auto = local
+    assert.equal(await deleg.dot(t, "rate", "hours", eq("dept", 5), "pyecc"), BigInt(DOT_D5));
+    assert.equal(await local.dot(t, "rate", "hours", eq("dept", 5)), BigInt(DOT_D5));
+    assert.equal(await plainLocal.dot(t, "rate", "hours", eq("dept", 5)), BigInt(DOT_D5));
+    // which path ran: local never calls fhe_dot on the server, unauthenticated auto does
+    const px = await lyingProxy(mem);
+    const vl = await cn({ authenticated: true, fheDotMode: "local" }, "127.0.0.1", px.port);
+    const vp = await cn({}, "127.0.0.1", px.port);
+    vl.trustTable(t); vp.trustTable(t);
+    await vl.dot(t, "rate", "hours");
+    assert.equal(px.seen.filter((m) => m === "fhe_dot").length, 0);
+    assert.equal(await vp.dot(t, "rate", "hours", eq("id", 2), "pyecc"), BigInt(55 * 150));
+    assert.equal(px.seen.filter((m) => m === "fhe_dot").length, 1);
+    vl.close(); vp.close(); px.server.close();
+    // the server alters one operand cell (raw RPC): local detects it, delegated returns a WRONG number
+    const lie = key.encrypt(400);
+    assert.equal((await rawCall(mem.host, mem.port, "update_cell", [t, 1, "rate", { t: "x", v: b64(lie) }])).ok, null);
+    await assert.rejects(local.dot(t, "rate", "hours"), kind("IntegrityError"));
+    await assert.rejects(auth.dot(t, "rate", "hours"), kind("IntegrityError"));
+    const wrong = await deleg.dot(t, "rate", "hours", null, "pyecc");
+    assert.equal(wrong, BigInt(DOT_ALL - 55 * 150 + 400 * 150));                            // silently wrong: delegated cannot be verified
+    assert.equal(await legacy.dot(t, "rate", "hours", null, "pyecc"), wrong);                // legacy alias = delegated
+  } finally { for (const c of [auth, local, deleg, plain, plainLocal, legacy]) c.close(); }
+});
+
+T("local DOT has no range limit on the result (10^6 * 10^6), delegated does", async () => {
+  const key = FheKey.fromHex(SECRET, 1_000_000);
+  const db = await Client.connect(mem.host, mem.port, { fheKey: key, authenticated: true, ...OPTS });
+  const dl = await Client.connect(mem.host, mem.port, { fheKey: key, fheDotMode: "delegated", ...OPTS });
+  try {
+    const t = uniq("bigdot");
+    await db.createTable(t, [{ name: "a", type: "int", policy: "fhe" }, { name: "b", type: "int", policy: "fhe" }]);
+    for (const [a, b] of [[1_000_000, 1_000_000], [-1_000_000, 999_999], [7, 8]]) await db.insert(t, { a, b });
+    assert.equal(await db.dot(t, "a", "b"), 1_000_000_000_000n - 999_999_000_000n + 56n);
+    await dl.syncSchema(); dl.trustTable(t);
+    await assert.rejects(dl.dot(t, "a", "b", null, "pyecc"), kind("OutOfBudget"));
+  } finally { db.close(); dl.close(); }
 });

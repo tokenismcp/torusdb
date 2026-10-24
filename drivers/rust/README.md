@@ -181,8 +181,8 @@ db.dot_with_backend("emp", "rate", "hours", all(), Some(FheBackend::Pyecc))?; //
   `__fmac__<col>`, written right after the INSERT (the row id is only known then) inside one transaction.
   Cell reads, `sum`, `avg` and `scaled_sum` verify `tag-sum == alpha * value-sum + k * (sum gamma) * G1` in
   the exponent and fail with `Kind::Integrity` for a changed value, a dropped/duplicated/swapped row, a scaled
-  answer or untagged data. Not covered: replay of an older version of a cell. **DOT cannot be tag-checked**:
-  an authenticated connection refuses it unless `fhe_allow_unverified_dot` is set.
+  answer or untagged data. Not covered: replay of an older version of a cell.
+* **DOT modes** (`fhe_dot_mode`: `auto` | `local` | `delegated`; invalid values are an interface error). `delegated`: the server multiplies ciphertexts with its pairing (fast) but the result can NOT be integrity-checked - a lying server makes you decrypt a wrong number - and it must lie in the key's range. `local`: the owner reads both operand columns (each cell tag-verified when `authenticated`), decrypts and multiplies/sums the plaintexts itself: verified, O(n) decryptions, no range limit on the result (10^6 * 10^6 works). `auto` (default) = `delegated` unless `authenticated`, then `local`. `fhe_allow_unverified_dot` remains as an alias selecting `delegated` on an authenticated connection.
 * **Atomic tagged INSERT.** With `authenticated`, an INSERT/INSERT-many into a table with FHE columns runs in its own
   transaction (INSERT, then the row-bound tags), so a failure leaves no untagged row. Inside a transaction you opened
   yourself the error is returned and the half-written row stays in YOUR transaction: roll it back.

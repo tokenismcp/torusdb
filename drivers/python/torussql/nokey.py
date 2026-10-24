@@ -597,6 +597,7 @@ class Connection:
                  trust_server_schema: bool = False,
                  fhe_key=None,
                  fhe_allow_unverified_dot: bool = False,
+                 fhe_dot_mode: str = "auto",
                  timeout: float | None = 30.0):
         if mask_cluster is not None and (vault_path or vault_passphrase or vault_custody):
             raise ProgrammingError(
@@ -622,7 +623,8 @@ class Connection:
             self.client = NoKeyClient(RemoteNoKeyServer(self._wire),
                                       authenticated=authenticated,
                                       maskstore=mask_cluster, fhe=fhe_key,
-                                      fhe_allow_unverified_dot=fhe_allow_unverified_dot)
+                                      fhe_allow_unverified_dot=fhe_allow_unverified_dot,
+                                      fhe_dot_mode=fhe_dot_mode)
             if mask_cluster is not None:
                 if authenticated and not self.client.authenticated:
                     raise ProgrammingError(
@@ -1073,6 +1075,7 @@ def connect(host: str = "127.0.0.1", port: int = 8533, *,
             trust_server_schema: bool = False,
             fhe_key=None,
             fhe_allow_unverified_dot: bool = False,
+            fhe_dot_mode: str = "auto",
             timeout: float | None = 30.0) -> Connection:
     """Open a PEP 249 connection to a no-key TorusDB server.
 
@@ -1098,8 +1101,12 @@ def connect(host: str = "127.0.0.1", port: int = 8533, *,
         sync_schema: learn tables that exist on the server (schema only)
         fhe_key: a ``torusdb_core.fhe.FheKey`` (or None) — the owner's secret for
             ``FHE`` columns; load one with ``torusdb_core.fhe.load_key(path, passphrase)``
-        fhe_allow_unverified_dot: with ``authenticated=True``, allow ``DOT`` on FHE columns
-            (its ciphertext-product result cannot be integrity-checked)
+        fhe_dot_mode: how ``DOT`` on FHE columns runs — ``"delegated"`` (the server multiplies
+            the ciphertexts with pairings: fast, but the result cannot be integrity-checked),
+            ``"local"`` (the owner reads both operand columns, each cell verified by its tag, and
+            multiplies the plaintexts: verified, O(n) decryptions) or ``"auto"`` (default:
+            delegated without ``authenticated``, local with it)
+        fhe_allow_unverified_dot: legacy; with ``authenticated=True`` it selects ``"delegated"``
         trust_server_schema: allow INSERT/UPDATE on tables whose column policies
             were learned from the server (default: they are read-only, because a
             malicious server could relabel an encrypted column "plain"). Tables
@@ -1115,4 +1122,4 @@ def connect(host: str = "127.0.0.1", port: int = 8533, *,
                       vault_custody=vault_custody, mask_cluster=mask_cluster,
                       sync_schema=sync_schema, trust_server_schema=trust_server_schema,
                       fhe_key=fhe_key, fhe_allow_unverified_dot=fhe_allow_unverified_dot,
-                      timeout=timeout)
+                      fhe_dot_mode=fhe_dot_mode, timeout=timeout)

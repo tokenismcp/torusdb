@@ -179,10 +179,12 @@ class _OwnerOps:
         be = self.be
         r1, r2 = (secrets.randbelow(N - 1) + 1 for _ in range(2))
         vm = m % N
-        c1 = be.g1_mul(be.G1, r1)
-        c2 = be.g1_add(be.g1_mul(be.G1, vm), be.g1_mul(self.Q, r1))
-        d1 = be.g2_mul(be.G2, r2)
-        d2 = be.g2_add(be.g2_mul(be.G2, vm), be.g2_mul(self.Q2, r2))
+        # r1, r2 (encryption randomness) and vm (the plaintext) are secrets: constant-time
+        # multiplication on the native back end (mulCT); py_ecc has no constant-time path.
+        c1 = be.g1_mul_secret(be.G1, r1)
+        c2 = be.g1_add(be.g1_mul_secret(be.G1, vm), be.g1_mul_secret(self.Q, r1))
+        d1 = be.g2_mul_secret(be.G2, r2)
+        d2 = be.g2_add(be.g2_mul_secret(be.G2, vm), be.g2_mul_secret(self.Q2, r2))
         return be.g1_to(c1) + be.g1_to(c2) + be.g2_to(d1) + be.g2_to(d2)
 
     # ── integrity tags (optional, ``authenticated=True``) ─────────────────────
@@ -233,7 +235,8 @@ class _OwnerOps:
 
     def _verify_open(self, mv, mt, table, col, gam_sum, scale):
         be = self.be
-        want = be.g1_add(be.g1_mul(mv, self.alpha), be.g1_mul(be.G1, scale * gam_sum))
+        want = be.g1_add(be.g1_mul_secret(mv, self.alpha),
+                         be.g1_mul_secret(be.G1, scale * gam_sum))
         if be.g1_key(mt) != be.g1_key(want):
             raise IntegrityError(f"integrity check failed for {table}.{col}: the server's "
                                  f"aggregate does not match the authenticated cells")
@@ -334,8 +337,8 @@ class FheKey(_OwnerOps):
         self.range = value_range
         self.be = _be(backend)
         self._s2 = derive_s2(self._s)
-        self.Q = self.be.g1_mul(self.be.G1, self._s)
-        self.Q2 = self.be.g2_mul(self.be.G2, self._s2)
+        self.Q = self.be.g1_mul_secret(self.be.G1, self._s)
+        self.Q2 = self.be.g2_mul_secret(self.be.G2, self._s2)
         self._tables: dict[str, dict] = {}
 
     def __repr__(self) -> str:                      # never print the secret
@@ -356,7 +359,7 @@ class FheKey(_OwnerOps):
         return self.secret_bytes
 
     def _mul_s_many(self, points):
-        return [self.be.g1_mul(p, self._s) for p in points]
+        return [self.be.g1_mul_secret(p, self._s) for p in points]
 
     def decrypt_dot(self, blob: bytes) -> int:
         if len(blob) != DOT_BYTES:

@@ -223,8 +223,24 @@ def g2_decode(raw: bytes):
 
 
 def _g2_mul_blinded(pt, k: int):
+    """yᵢ·G2 for the secret share: mcl's constant-time ladder when the native library is
+    available (same switch as ``Group``), else split-scalar blinding (NOT constant time)."""
+    be = _G1_GROUP_NATIVE()
+    if be is not None:
+        r = be.g2_mul_secret(be.g2_from(g2_encode(pt)), k % Q)
+        return g2_decode_unchecked(be.g2_to(r))
     r = secrets.randbelow(Q - 1) + 1
     return _add(_mul(pt, (k - r) % Q), _mul(pt, r))
+
+
+def _G1_GROUP_NATIVE():
+    from .group import get_group
+    return get_group("bn254")._native()
+
+
+def g2_decode_unchecked(raw: bytes):
+    v = [int.from_bytes(raw[i:i + 32], "big") for i in range(0, G2_BYTES, 32)]
+    return (FQ2([v[0], v[1]]), FQ2([v[2], v[3]]), FQ2([1, 0]))
 
 
 def g2_partial(share: KeyShare) -> bytes:

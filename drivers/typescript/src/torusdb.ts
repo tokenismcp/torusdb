@@ -356,8 +356,14 @@ export interface ConnectOptions {
   /** The owner's key for `fhe` columns (see {@link FheKey}). Needed for INSERT/UPDATE/reads/SUM/DOT on them.
    *  With `authenticated: true`, FHE cells also carry integrity tags in a hidden `__fmac__<col>` column. */
   fheKey?: FheKey;
-  /** With `authenticated: true`, still allow DOT on FHE columns. A ciphertext product cannot be
-   *  tag-checked, so the result is NOT protected against a lying server. Default false. */
+  /** How DOT on two FHE columns is computed. "delegated": the server multiplies ciphertexts with its
+   *  pairing (fast, O(1) client work) but the result CANNOT be integrity-checked - a lying server can
+   *  make you decrypt a wrong number, and the result must lie in the key's range. "local": the owner reads
+   *  both operand columns (every cell verified against its tag when `authenticated`), decrypts and
+   *  multiplies/sums the plaintexts itself (verified, O(n) decryptions, no range limit on the result).
+   *  "auto" (default): "delegated" unless `authenticated`, in which case "local". */
+  fheDotMode?: "auto" | "local" | "delegated";
+  /** Backward-compatible alias: with `authenticated: true` and mode "auto", selects "delegated". */
   fheAllowUnverifiedDot?: boolean;
 }
 
@@ -721,7 +727,7 @@ export class Client {
   #authenticated: boolean;
   #alpha = 0n;                                   // SECRET MAC key
   #fhe: FheKey | undefined;                      // SECRET key of the FHE columns
-  #fheUnverifiedDot: boolean;
+  #fheDotMode: "local" | "delegated";
   #updateCells = true;                           // false once the server answered "unknown method" for update_cells
   #als = new AsyncLocalStorage<boolean>();
   #tail: Promise<void> = Promise.resolve();
@@ -739,7 +745,12 @@ export class Client {
     this.#authenticated = o.authenticated === true;
     if (o.fheKey !== undefined && !(o.fheKey instanceof FheKey)) throw usage("fheKey must be an FheKey");
     this.#fhe = o.fheKey;
-    this.#fheUnverifiedDot = o.fheAllowUnverifiedDot === true;
+    const mode = o.fheDotMode ?? "auto";
+    if (mode !== "auto" && mode !== "local" && mode !== "delegated") {
+      throw usage(`fheDotMode must be "auto", "local" or "delegated", got ${String(mode)}`);
+    }
+    this.#fheDotMode = mode !== "auto" ? mode
+      : this.#authenticated && o.fheAllowUnverifiedDot !== true ? "local" : "delegated";
     if (this.#authenticated) this.#alpha = 1n + (randScalar() % (N - 1n));
   }
 
@@ -1551,12 +1562,13 @@ export class Client {
   private async fheDot(lt: string, lc: string, lids: number[], rt: string, rc: string, rids: number[],
                        backend?: FheBackend): Promise<bigint> {
     const key = this.fheKey();
-    if (this.#authenticated && !this.#fheUnverifiedDot) {
-      throw usage("DOT on FHE columns has no integrity protection (a ciphertext product cannot be " +
-        "tag-checked); pass fheAllowUnverifiedDot: true to accept an unverified result");
-    }
     if (backend !== undefined && backend !== "pyecc" && backend !== "mcl") throw usage("backend must be 'pyecc' or 'mcl'");
     if (lids.length === 0) return 0n;
+    if (this.#fheDotMode === "local") {
+      // verified: every operand cell is read (tag-checked when authenticated), the owner multiplies
+      const a = await this.fheReveal(lt, lc, lids), b = await this.fheReveal(rt, rc, rids);
+      return a.reduce((acc, x, k) => acc + x * b[k], 0n);
+    }
     // the server's recommended size for the requested back end (unspecified = its default is "auto":
     // be conservative and size for pyecc), never above its published cap
     const lim = this.serverInfo.limits?.fhe;

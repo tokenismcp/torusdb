@@ -180,7 +180,12 @@ def _parser() -> argparse.ArgumentParser:
     ap.add_argument("--custodian", action="append", metavar="HOST:PORT",
                     help="custodian daemon serving s (repeat); used with --fhe-threshold")
     ap.add_argument("--custodian2", action="append", metavar="HOST:PORT",
-                    help="custodian daemon serving s2 (repeat); needed for DOT")
+                    help="custodian daemons serving s2 (repeat); default: the same daemons as "
+                         "--custodian (one daemon holding both shares)")
+    ap.add_argument("--custody-expect-fingerprint", metavar="FP",
+                    help="pin the fingerprint of --custody-public (see `custody public-show`)")
+    ap.add_argument("--custody-expect-fingerprint2", metavar="FP",
+                    help="pin the fingerprint of --custody-public2")
     ap.add_argument("--custody-token-env", metavar="VAR",
                     help="env var with the custodian caller token")
     ap.add_argument("--custody-tls", action="store_true")
@@ -204,6 +209,8 @@ def _threshold_key(a):
     if not tok:
         raise ValueError(f"${a.custody_token_env} is not set")
     pub, pub2 = PublicKey.load(a.custody_public), PublicKey.load(a.custody_public2)
+    pub.check_fingerprint(a.custody_expect_fingerprint)
+    pub2.check_fingerprint(a.custody_expect_fingerprint2)
 
     def nodes(specs, p):
         out = []
@@ -212,8 +219,9 @@ def _threshold_key(a):
             out.append(RemoteCustodian(host.strip("[]"), int(port), tok, group=p.g,
                                        tls=a.custody_tls, cafile=a.custody_cafile))
         return out
+    from torusdb_core.fhe_threshold import SAME
     return ThresholdFheKey.load(a.fhe_threshold, pub, nodes(a.custodian, pub), pub2,
-                                nodes(a.custodian2, pub2) if a.custodian2 else None)
+                                nodes(a.custodian2, pub2) if a.custodian2 else SAME)
 
 
 def main(argv=None) -> int:

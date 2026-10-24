@@ -48,6 +48,7 @@ _GT_CONTEXT = b"torussql/fhe/gt-decrypt/v1"
 _MAC_CONTEXT = b"torussql/fhe/mac-secret/v1\x00"
 _G1_CHUNK = 500
 BUNDLE_KIND = "torussql-fhe-threshold"
+SAME = object()          # custodians2 default: the same endpoints as key 1 (one daemon, two shares)
 
 
 def _custody():
@@ -68,13 +69,15 @@ class ThresholdFheKey(_OwnerOps):
     G2 shares. Either way it is verified: G2 subgroup membership and the pairing
     equation ``e(Q, G2) = e(G1, Q2)`` — a wrong ``Q2`` can never be used."""
 
-    def __init__(self, public, custodians, public2, custodians2=None, *, Q2: bytes | None = None,
+    def __init__(self, public, custodians, public2, custodians2=SAME, *, Q2: bytes | None = None,
                  mac: dict | None = None, value_range: int = DEFAULT_RANGE, backend=None,
                  context: bytes = b"", timeout: float = 20.0):
         """``public``/``custodians``: custody key 1 (the secret ``s``). ``public2``/``custodians2``:
         custody key 2 (the independent secret ``s2``, run by the same custodian hosts).
-        ``custodians2=None`` is allowed when ``Q2`` is given: such a key can encrypt and read
-        cells / SUMs but ``DOT`` raises (no quorum for ``s2``)."""
+        Default (``SAME``): key 2 is served by the SAME endpoints as key 1 — one daemon per
+        host holding both shares, each request naming its ``key_id``. Pass other custodians
+        for a separate deployment. ``custodians2=None`` is allowed when ``Q2`` is given: such a
+        key can encrypt and read cells / SUMs but ``DOT`` raises (no quorum for ``s2``)."""
         C = _custody()
         for p_ in (public, public2):
             if p_.group != "bn254":
@@ -84,6 +87,8 @@ class ThresholdFheKey(_OwnerOps):
         if public.key_id == public2.key_id or g.eq(public.X, public2.X):
             raise FheError("the second secret must be an independent key (same key twice)")
         self.quorum = self._mk_quorum(C, public, custodians, timeout)
+        if custodians2 is SAME:
+            custodians2 = self.quorum.custodians
         self.quorum2 = (self._mk_quorum(C, public2, custodians2, timeout)
                         if custodians2 is not None else None)
         self.public, self.public2 = public, public2
@@ -105,11 +110,14 @@ class ThresholdFheKey(_OwnerOps):
 
     @staticmethod
     def _mk_quorum(C, public, custodians, timeout):
+        """Every request carries the key id it is for (``for_key``), so a daemon serving both
+        shares can never answer a key-1 request with the key-2 share."""
         if isinstance(custodians, C.Quorum):
             if custodians.public.key_id != public.key_id:
                 raise FheError("the quorum belongs to a different custody key")
             return custodians
-        return C.Quorum(public, list(custodians), timeout=timeout)
+        nodes = [c.for_key(public) if hasattr(c, "for_key") else c for c in custodians]
+        return C.Quorum(public, nodes, timeout=timeout)
 
     # — public bundle ————————————————————————————————————————————————————————
     def _checked_q2(self, public, public2, raw: bytes):
@@ -157,7 +165,7 @@ class ThresholdFheKey(_OwnerOps):
         _atomic(path, json.dumps(self.bundle(), indent=1).encode(), 0o644)
 
     @classmethod
-    def from_bundle(cls, bundle: dict, public, custodians, public2, custodians2=None,
+    def from_bundle(cls, bundle: dict, public, custodians, public2, custodians2=SAME,
                     **kw) -> "ThresholdFheKey":
         if not isinstance(bundle, dict) or bundle.get("kind") != BUNDLE_KIND:
             raise FheError("not a threshold FHE bundle")
@@ -184,13 +192,13 @@ class ThresholdFheKey(_OwnerOps):
         return cls(public, custodians, public2, custodians2, Q2=q2, mac=bundle.get("mac"), **kw)
 
     @classmethod
-    def load(cls, path: str, public, custodians, public2, custodians2=None, **kw) -> "ThresholdFheKey":
+    def load(cls, path: str, public, custodians, public2, custodians2=SAME, **kw) -> "ThresholdFheKey":
         with open(path, "rb") as f:
             return cls.from_bundle(json.loads(f.read()), public, custodians, public2,
                                    custodians2, **kw)
 
     @classmethod
-    def create(cls, public, custodians, public2, custodians2, *, with_mac: bool = True,
+    def create(cls, public, custodians, public2, custodians2=SAME, *, with_mac: bool = True,
                **kw) -> "ThresholdFheKey":
         """Ceremony step after the two DKGs: derive Q2 from key 2's custodians and seal a MAC
         secret under key 1's envelope."""

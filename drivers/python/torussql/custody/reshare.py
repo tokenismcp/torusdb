@@ -43,13 +43,15 @@ class ReshareSpec:
             raise CustodyError(f"resharing needs exactly {self.old.k} distinct current holders")
         laurent.Params(self.new_k, self.new_n, self.old.g.order)      # validates
 
-    def params(self, old_ids_digest: str = "") -> dict:
-        """Specification signed into every reshare broadcast: old key and epoch,
-        dealing quorum, new k/n and the old committee's identity-list digest."""
+    def params(self, old_ids_digest: str = "", new_ids_digest: str = "") -> dict:
+        """Specification signed into every reshare broadcast: old key and epoch, dealing
+        quorum, new k/n and the identity-list digests of BOTH committees. Binding the NEW
+        committee's list means a dealing made for one set of recipients cannot be replayed
+        to another (a dealer signs who the new holders are)."""
         return {"group": self.old.group, "old_key_id": self.old.key_id,
                 "old_epoch": self.old.epoch, "old_pub": self.old.digest,
                 "quorum": sorted(self.quorum), "new_k": self.new_k,
-                "new_n": self.new_n, "old_ids": old_ids_digest}
+                "new_n": self.new_n, "old_ids": old_ids_digest, "new_ids": new_ids_digest}
 
     @property
     def new_params(self) -> laurent.Params:

@@ -192,9 +192,18 @@ def cmd_share_check(a):
     print(f"share {ks.index}/{ks.public.n} (quorum {ks.public.k}) epoch {ks.epoch} key {ks.public.key_id}: OK")
 
 
+def _load_pub(path: str, expect: str | None) -> PublicKey:
+    """Load a public key file and, if a fingerprint was pinned, refuse a mismatch."""
+    pub = PublicKey.load(path)
+    pub.check_fingerprint(expect)
+    return pub
+
+
 def cmd_public_show(a):
-    pub = PublicKey.load(a.public)
+    pub = _load_pub(a.public, a.expect_fingerprint)
     print(json.dumps({k: v for k, v in pub.to_json().items() if k != "commitments"}, indent=1))
+    print(f"fingerprint: {pub.fingerprint}\nCOMPARE IT OUT OF BAND (or pin it with "
+          f"--expect-fingerprint) before trusting this file.")
 
 
 def _read_tokens(path: str):
@@ -229,11 +238,19 @@ def cmd_serve(a):
     from .net import Limits
     from .shares import MaskShareStore
     share_pass = _pass(a, "Share/store passphrase: ")
-    ks = KeyShare.load(a.share, share_pass) if a.share else None
+    shares = [KeyShare.load(f, share_pass) for f in (a.share or [])]
+    ks = shares[0] if len(shares) == 1 else None
+    access = {}
+    for spec in a.key_access or []:               # KEY_ID:caller,caller
+        kid, _, names = spec.partition(":")
+        access[kid] = set(filter(None, names.split(",")))
     masks = MaskShareStore(a.mask_store, share_pass) if a.mask_store else None
     tokens, perms = _read_tokens(a.token_file)
-    cust = Custodian(ks, tokens, permissions=perms, masks=masks, audit_path=a.audit,
-                     rate_per_minute=a.rate,
+    cust = Custodian(shares or None, tokens, permissions=perms, masks=masks, audit_path=a.audit,
+                     rate_per_minute=a.rate, item_budget_per_minute=a.item_budget or None,
+                     max_batch=a.max_batch, audit_keep=a.audit_keep,
+                     audit_max_bytes=int(a.audit_max_mb * 1024 * 1024),
+                     key_access=access or None,
                      limits=Limits(min_aggregate_rows=a.min_aggregate_rows,
                                    reveal_rows_per_minute=a.reveal_quota))
     ctx = None
@@ -248,18 +265,21 @@ def cmd_serve(a):
     if host not in ("127.0.0.1", "localhost", "::1") and not a.tls and not a.insecure_no_tls:
         raise SystemExit("refusing a non-loopback listen without --tls (tokens are bearer secrets)")
     srv = CustodianServer(host, port, cust, ssl_ctx=ctx)
-    what = ([f"key share {ks.index}/{ks.public.n} epoch {ks.epoch} key {ks.public.key_id}"] if ks else []) \
-        + (["mask store"] if masks else [])
+    what = [f"key share {s.index}/{s.public.n} epoch {s.epoch} key {s.public.key_id}"
+            for s in shares] + (["mask store"] if masks else [])
     print(f"custodian [{', '.join(what)}] on {srv.address[0]}:{srv.address[1]}", flush=True)
 
-    def reload(*_):                      # SIGHUP: pick up a refreshed share file
-        if not a.share:
-            return
-        try:
-            cust.replace_share(KeyShare.load(a.share, share_pass))
-            print(f"reloaded share, epoch {cust.info()['epoch']}", flush=True)
-        except Exception as exc:                               # noqa: BLE001
-            print(f"reload failed: {exc}", flush=True)
+    def reload(*_):                      # SIGHUP: pick up refreshed share files
+        for f in a.share or []:
+            try:
+                new = KeyShare.load(f, share_pass)
+                cur = cust._shares.get(new.public.key_id)
+                if cur is not None and new.epoch == cur.epoch:
+                    continue                                   # unchanged
+                cust.replace_share(new)
+                print(f"reloaded {f}: key {new.public.key_id} epoch {new.epoch}", flush=True)
+            except Exception as exc:                           # noqa: BLE001
+                print(f"reload of {f} failed: {exc}", flush=True)
     if hasattr(signal, "SIGHUP"):
         signal.signal(signal.SIGHUP, reload)
     signal.signal(signal.SIGTERM, lambda *_: threading.Thread(target=srv.shutdown, daemon=True).start())
@@ -327,7 +347,7 @@ def cmd_mask_reshare(a):
 
 
 def cmd_open_test(a):
-    pub = PublicKey.load(a.public)
+    pub = _load_pub(a.public, a.expect_fingerprint)
     tok = os.environ.get(a.token_env or "")
     if not tok:
         raise SystemExit("set the caller token in the environment variable named by --token-env "
@@ -357,6 +377,13 @@ def _fhe_custodians(a, pub: PublicKey, specs=None):
     return custs
 
 
+def _custodians2(a, pub2: PublicKey):
+    """Key 2's custodians: the given --custodian2 endpoints, or (default) the SAME daemons as
+    key 1 — one daemon per host serving both shares, requests naming their key_id."""
+    from torusdb_core.fhe_threshold import SAME
+    return _fhe_custodians(a, pub2, a.custodian2) if a.custodian2 else SAME
+
+
 def _fhe_selftest(key, dot: bool) -> None:
     from torusdb_core import fhe
     cells = [key.encrypt(v) for v in (7, -3)]
@@ -371,16 +398,16 @@ def cmd_fhe_keygen_threshold(a):
     """After the bn254 DKG: Q2 from the custodians (pairing-verified), a MAC secret sealed
     under the threshold envelope, and one PUBLIC bundle file. No secret is written."""
     from torusdb_core.fhe_threshold import ThresholdFheKey
-    pub, pub2 = PublicKey.load(a.public), PublicKey.load(a.public2)
+    pub = _load_pub(a.public, a.expect_fingerprint)
+    pub2 = _load_pub(a.public2, a.expect_fingerprint2)
     if pub.group != "bn254" or pub2.group != "bn254":
         raise SystemExit("an FHE key needs 'bn254' custody keys (run the DKGs with --group bn254)")
     if pub.key_id == pub2.key_id:
         raise SystemExit("--public and --public2 must be two DIFFERENT keys (two separate DKGs)")
     if os.path.exists(a.out):
         raise SystemExit(f"{a.out} already exists")
-    key = ThresholdFheKey.create(pub, _fhe_custodians(a, pub), pub2,
-                                 _fhe_custodians(a, pub2, a.custodian2), with_mac=not a.no_mac,
-                                 value_range=a.range)
+    key = ThresholdFheKey.create(pub, _fhe_custodians(a, pub), pub2, _custodians2(a, pub2),
+                                 with_mac=not a.no_mac, value_range=a.range)
     _fhe_selftest(key, dot=False)
     key.save_bundle(a.out)
     print(f"threshold FHE bundle written to {a.out} (range +-{a.range}, key {pub.key_id}, "
@@ -393,9 +420,9 @@ def cmd_fhe_keygen_threshold(a):
 
 def cmd_fhe_open_test(a):
     from torusdb_core.fhe_threshold import ThresholdFheKey
-    pub, pub2 = PublicKey.load(a.public), PublicKey.load(a.public2)
-    key = ThresholdFheKey.load(a.bundle, pub, _fhe_custodians(a, pub), pub2,
-                               _fhe_custodians(a, pub2, a.custodian2))
+    pub = _load_pub(a.public, a.expect_fingerprint)
+    pub2 = _load_pub(a.public2, a.expect_fingerprint2)
+    key = ThresholdFheKey.load(a.bundle, pub, _fhe_custodians(a, pub), pub2, _custodians2(a, pub2))
     _fhe_selftest(key, dot=not a.skip_dot)
     if a.mac:
         key.alpha
@@ -409,23 +436,31 @@ def _spec(a, old: PublicKey) -> ReshareSpec:
 
 
 def cmd_reshare_start(a):
-    old = PublicKey.load(a.public)
+    old = _load_pub(a.public, a.expect_fingerprint)
     ks = KeyShare.load(a.share, _pass(a, "Share passphrase: "))
     g, new_pubs, _ = _load_ids(a.new_ids)
+    _g0, old_pubs, _ = _load_ids(a.old_ids)
     idn = Identity.load(a.identity, _pass(a, "Identity passphrase: "))
+    if idn.index not in old_pubs or not g.eq(old_pubs[idn.index], idn.public):
+        raise SystemExit("this identity is not in the --old-ids list under that index")
     spec = _spec(a, old)
     files = export_dealing(idn, "reshare", spec.session, reshare_deal(spec, ks), new_pubs, a.out,
-                           spec.params())
+                           spec.params(ids_digest(g, old_pubs), ids_digest(g, new_pubs)))
     print(f"wrote {len(files)} files to {a.out}")
 
 
 def cmd_reshare_finish(a):
-    old = PublicKey.load(a.public)
+    old = _load_pub(a.public, a.expect_fingerprint)
     spec = _spec(a, old)
     g, old_pubs, _ = _load_ids(a.old_ids)
+    _g1, new_pubs, _ = _load_ids(a.new_ids)
     idn = Identity.load(a.identity, _pass(a, "Identity passphrase: "))
+    if idn.index not in new_pubs or not g.eq(new_pubs[idn.index], idn.public):
+        raise SystemExit("this identity is not in the --new-ids list under that index")
+    if len(new_pubs) != spec.new_n:
+        raise SystemExit(f"--new-ids lists {len(new_pubs)} participants but --new-n is {spec.new_n}")
     bc, sh = import_dealings(idn, "reshare", spec.session, a.inbox, old_pubs, sorted(spec.quorum),
-                             spec.params())
+                             spec.params(ids_digest(g, old_pubs), ids_digest(g, new_pubs)))
     ks, new = reshare_finish(spec, idn.index, bc, sh)
     ks.save(a.out, _pass(a, "New share passphrase: ", confirm=True))
     new.save(a.public_out)
@@ -462,8 +497,21 @@ def main(argv=None):
     p.add_argument("--n", type=int, required=True); p.add_argument("--group", default="secp256k1")
     p.add_argument("--out", required=True)
     p = add("share-check", cmd_share_check); p.add_argument("--share", required=True)
+    FP = "expected fingerprint of the public key file (from `public-show`, compared out of band)"
     p = add("public-show", cmd_public_show); p.add_argument("--public", required=True)
-    p = add("serve", cmd_serve); p.add_argument("--share", help="key share file (optional)")
+    p.add_argument("--expect-fingerprint", help=FP)
+    p = add("serve", cmd_serve)
+    p.add_argument("--share", action="append",
+                   help="key share file (repeat to serve SEVERAL keys from one daemon; every "
+                        "request then names its key_id)")
+    p.add_argument("--key-access", action="append", metavar="KEY_ID:caller,caller",
+                   help="restrict a key to the named callers (default: every caller with 'key')")
+    p.add_argument("--item-budget", type=int, default=20_000,
+                   help="items (points / GT elements) answered per caller and key per minute "
+                        "(0 = unlimited; default 20000)")
+    p.add_argument("--max-batch", type=int, default=2000, help="max items in one batch request")
+    p.add_argument("--audit-keep", type=int, default=7, help="rotated audit files to keep")
+    p.add_argument("--audit-max-mb", type=float, default=64, help="rotate the audit log at this size")
     p.add_argument("--mask-store", help="mask share store file (enables the mask service)")
     p.add_argument("--min-aggregate-rows", type=int, default=1)
     p.add_argument("--reveal-quota", type=int, default=None,
@@ -473,6 +521,7 @@ def main(argv=None):
     p.add_argument("--tls", action="store_true"); p.add_argument("--cert"); p.add_argument("--key")
     p.add_argument("--cafile"); p.add_argument("--insecure-no-tls", action="store_true")
     p = add("open-test", cmd_open_test); p.add_argument("--public", required=True)
+    p.add_argument("--expect-fingerprint", help=FP)
     p.add_argument("--custodian", action="append", required=True, metavar="HOST:PORT")
     p.add_argument("--token-env", required=True, metavar="VAR",
                    help="environment variable holding the caller token")
@@ -488,8 +537,11 @@ def main(argv=None):
                        help="custodian daemon serving the share of s (repeat)")
         p.add_argument("--public2", required=True,
                        help="custody public key of the INDEPENDENT second secret s2 (bn254)")
-        p.add_argument("--custodian2", action="append", required=True, metavar="HOST:PORT",
-                       help="custodian daemon serving the share of s2 (repeat)")
+        p.add_argument("--custodian2", action="append", metavar="HOST:PORT",
+                       help="custodian daemons serving the share of s2 (repeat); default: the "
+                            "same daemons as --custodian (one daemon holding both shares)")
+        p.add_argument("--expect-fingerprint", help=FP)
+        p.add_argument("--expect-fingerprint2", help=FP + " (second key)")
         p.add_argument("--token-env", required=True, metavar="VAR",
                        help="environment variable holding the caller token")
         p.add_argument("--tls", action="store_true"); p.add_argument("--cafile")
@@ -509,13 +561,18 @@ def main(argv=None):
     for name, fn in (("reshare-start", cmd_reshare_start), ("reshare-finish", cmd_reshare_finish)):
         p = add(name, fn)
         p.add_argument("--public", required=True); p.add_argument("--quorum", required=True)
+        p.add_argument("--expect-fingerprint", help=FP)
         p.add_argument("--new-k", type=int, required=True); p.add_argument("--new-n", type=int, required=True)
         p.add_argument("--session", required=True); p.add_argument("--identity", required=True)
         if name == "reshare-start":
             p.add_argument("--share", required=True); p.add_argument("--new-ids", required=True)
+            p.add_argument("--old-ids", required=True,
+                           help="identity list of the CURRENT committee (bound into the signed dealing)")
             p.add_argument("--out", required=True)
         else:
             p.add_argument("--old-ids", required=True); p.add_argument("--inbox", required=True)
+            p.add_argument("--new-ids", required=True,
+                           help="identity list of the NEW committee (bound into the signed dealings)")
             p.add_argument("--out", required=True); p.add_argument("--public-out", required=True)
     for name, fn in (("mask-init", cmd_mask_init), ("mask-status", cmd_mask_status),
                      ("mask-repair", cmd_mask_repair), ("mask-gc", cmd_mask_gc),
