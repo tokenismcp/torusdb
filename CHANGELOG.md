@@ -19,6 +19,15 @@ cryptographic self-audit, and the open repository made self-contained.
   from a separate MAC secret sealed under the threshold envelope. New custodian methods `partial_batch`,
   `gt_partial_batch`, `g2_partial`; CLI `fhe-keygen-threshold`, `fhe-open-test`, `torussql --fhe-threshold`.
 
+### Security — independent red-team of FHE columns (late 0.5.0)
+
+- Threshold FHE keys: the second key now lives in G2 (a published `s2·G1` would have exposed every plaintext);
+  bundle v3, fingerprint pinning, cost-weighted custodian budgets. **Bundles/cells made with the earlier threshold
+  format are public — regenerate and re-encrypt.**
+- Authenticated tags carry a per-write nonce (no affine mixing of versions); exact per-component GT subgroup checks;
+  randomised discrete-log search; key range cap; write-time G2 subgroup proof; validation before the global lock;
+  distinct ids; server-chosen pairing back end; thread-safe native init. Details: `docs/fhe-review-log.md`.
+
 ### Added — batch writes and negotiated limits (late 0.5.0)
 
 - RPC `update_cells`: an atomic batch of cell updates in one round trip (used for FHE integrity tags

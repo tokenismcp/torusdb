@@ -85,6 +85,9 @@ receives and asserts it is uniform / mask-free), `fuzz/` (parser and wire fuzzin
 
 ## 7. Known open items (we know; please still confirm severity)
 
+*FHE columns have a detailed internal review log with fixed and residual findings: `fhe-review-log.md`. Please start there.*
+
+
 * `Π_mult` offers no server offload and needs owner-held plaintext operands (F-3).
 * Integrity is opt-in and does not cover the *set* of rows (a server can omit/duplicate
   rows of a MAC-authenticated table consistently with the row-id list it returns) (F-4).

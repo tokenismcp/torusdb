@@ -59,6 +59,7 @@ reference and the list of what is *not* supported:
 | `proto/` | Wire protocol v2 spec |
 | `drivers/python/torussql/cli.py` | `torussql` — interactive shell (`psql` for TorusDB) |
 | `docs/audit-scope.md` | Brief for an independent security reviewer |
+| `docs/fhe-review-log.md` | Internal review findings of the FHE columns (fixed / residual) |
 | `docs/fhe-columns.md` | `FHE` columns: server-side SUM/DOT on ciphertexts, no key at the server |
 | `docs/ec-fhe-and-no-key.md` | Why the server never evaluates under a key |
 | `docs/replication.md` | Hot standbys, promotion |
