@@ -2,7 +2,8 @@
 """FHE columns: server-side ``SUM`` and ``DOT`` on ciphertexts, with NO key at the server.
 
 A BGN-style scheme over the BN254 pairing groups (G1, G2, GT), implemented on
-``py_ecc`` only — nothing here depends on the proprietary engine.
+``py_ecc`` (portable) with an optional native ``mclbn256`` back end — nothing here depends
+on the proprietary engine.
 
     secret  s          public  Q = s·P (G1),  Q2 = s·G2 (G2)         e = pairing(G2, G1)
 
@@ -22,8 +23,8 @@ test (see ``tests/test_fhe.py``); security rests on SXDH in BN254 (≈100-bit).
 
 Limits: plaintexts are integers; results must lie in ``[-range, range]`` (the discrete log
 is a baby-step/giant-step search, memory ≈ √range table entries); ciphertexts are 512 bytes;
-the server does ~4 pairings per DOT row (pure-Python ``py_ecc`` ≈ 0.1–0.2 s each — use it
-for small tables or install a native backend); no integrity — a lying server can return a
+the server does 4 pairings per DOT row (native back end ≈ 1 ms/row, pure-Python fallback
+≈ 0.2 s/row — see ``fhe_backend``); no integrity — a lying server can return a
 wrong ciphertext (MAC columns are future work); no WHERE/ORDER/GROUP on FHE columns.
 """
 from __future__ import annotations
@@ -32,16 +33,11 @@ import math
 import secrets
 from typing import Iterable
 
-from py_ecc.optimized_bn128 import (
-    FQ, FQ2, FQ12, G1, G2, Z1, Z2, add, b, b2, curve_order, is_inf, is_on_curve,
-    final_exponentiate, multiply, neg, normalize, pairing,
-)
+from . import fhe_backend as _fb
+from .fhe_backend import G1_BYTES, G2_BYTES, GT_BYTES, N
 
-N = curve_order
-CELL_BYTES = 4 * 32 + 2 * 64 + 2 * 128 - 4 * 32          # see _enc_cell: 2 G1 + 2 G2 = 384
-G1_BYTES, G2_BYTES, GT_BYTES = 64, 128, 384
 SUM_BYTES = 2 * G1_BYTES                                  # (ΣC1, ΣC2)
-DOT_BYTES = 4 * GT_BYTES                                  # (c00, c01, c10, c11)
+DOT_BYTES = 1 + 4 * GT_BYTES                              # backend tag + (c00, c01, c10, c11)
 CELL_BYTES = 2 * G1_BYTES + 2 * G2_BYTES                  # C1 C2 | D1 D2  = 384
 DEFAULT_RANGE = 1_000_000
 
@@ -50,116 +46,78 @@ class FheError(ValueError):
     pass
 
 
-# ── (de)serialisation: affine big-endian field elements, all-zero = infinity ──
-def _i32(x: int) -> bytes:
-    return int(x).to_bytes(32, "big")
+def _be(backend=None):
+    if backend is None:
+        return _fb.default()
+    return _fb.get(backend) if isinstance(backend, str) else backend
 
 
-def g1_to_bytes(p) -> bytes:
-    if is_inf(p):
-        return bytes(G1_BYTES)
-    x, y = normalize(p)
-    return _i32(x.n) + _i32(y.n)
+def available_backends() -> list[str]:
+    return _fb.available()
 
 
-def g1_from_bytes(raw: bytes):
-    if len(raw) != G1_BYTES:
-        raise FheError("bad G1 point length")
-    if raw == bytes(G1_BYTES):
-        return Z1
-    x, y = int.from_bytes(raw[:32], "big"), int.from_bytes(raw[32:], "big")
-    from py_ecc.fields import optimized_bn128_FQ as _F
-    if x >= _F.field_modulus or y >= _F.field_modulus:
-        raise FheError("G1 coordinate out of range")
-    p = (FQ(x), FQ(y), FQ(1))
-    if not is_on_curve(p, b):
-        raise FheError("G1 point is not on the curve")
-    return p
-
-
-def g2_to_bytes(p) -> bytes:
-    if is_inf(p):
-        return bytes(G2_BYTES)
-    x, y = normalize(p)
-    return b"".join(_i32(c) for c in (*x.coeffs, *y.coeffs))
-
-
-def g2_from_bytes(raw: bytes):
-    if len(raw) != G2_BYTES:
-        raise FheError("bad G2 point length")
-    if raw == bytes(G2_BYTES):
-        return Z2
-    v = [int.from_bytes(raw[i:i + 32], "big") for i in range(0, 128, 32)]
-    from py_ecc.fields import optimized_bn128_FQ as _F
-    if any(c >= _F.field_modulus for c in v):
-        raise FheError("G2 coordinate out of range")
-    p = (FQ2([v[0], v[1]]), FQ2([v[2], v[3]]), FQ2([1, 0]))
-    if not is_on_curve(p, b2):
-        raise FheError("G2 point is not on the curve")
-    return p
-
-
-def gt_to_bytes(g) -> bytes:
-    return b"".join(_i32(c.n if hasattr(c, "n") else c) for c in g.coeffs)
-
-
-def gt_from_bytes(raw: bytes):
-    if len(raw) != GT_BYTES:
-        raise FheError("bad GT element length")
-    return FQ12([int.from_bytes(raw[i:i + 32], "big") for i in range(0, GT_BYTES, 32)])
-
-
-def parse_cell(raw: bytes):
-    """-> (C1, C2, D1, D2). Validates length and curve membership."""
+def parse_cell(raw: bytes, backend=None):
+    """-> (C1, C2, D1, D2) as points of ``backend``. Validates length and the points."""
+    be = _be(backend)
     if not isinstance(raw, (bytes, bytearray)) or len(raw) != CELL_BYTES:
         raise FheError(f"an FHE cell is exactly {CELL_BYTES} bytes")
     r = bytes(raw)
-    return (g1_from_bytes(r[:64]), g1_from_bytes(r[64:128]),
-            g2_from_bytes(r[128:256]), g2_from_bytes(r[256:384]))
+    try:
+        return (be.g1_from(r[:64]), be.g1_from(r[64:128]),
+                be.g2_from(r[128:256]), be.g2_from(r[256:384]))
+    except _fb.BackendError as exc:
+        raise FheError(str(exc)) from None
 
 
 # ── server-side evaluation (public data only) ────────────────────────────────
-def sum_cells(cells: Iterable[bytes]) -> bytes:
-    """Σ of the G1 halves → 128 bytes (ΣC1, ΣC2)."""
-    c1, c2 = Z1, Z1
+def sum_cells(cells: Iterable[bytes], backend=None) -> bytes:
+    """Σ of the G1 halves → 128 bytes (ΣC1, ΣC2). Back-end independent output."""
+    be = _be(backend)
+    c1, c2 = be.g1_zero(), be.g1_zero()
     for raw in cells:
-        a, b_, _d1, _d2 = parse_cell(raw)
-        c1, c2 = add(c1, a), add(c2, b_)
-    return g1_to_bytes(c1) + g1_to_bytes(c2)
+        a, b_, _d1, _d2 = parse_cell(raw, be)
+        c1, c2 = be.g1_add(c1, a), be.g1_add(c2, b_)
+    return be.g1_to(c1) + be.g1_to(c2)
 
 
-def dot_cells(left: Iterable[bytes], right: Iterable[bytes]) -> bytes:
-    """Σ aᵢ·bᵢ as a GT ciphertext (4 × 384 bytes): pairs the G2 half of ``left[i]``
-    with the G1 half of ``right[i]``."""
-    # Miller loops are multiplied *before* the (expensive) final exponentiation, so the
-    # cost is 4 Miller loops per row plus 4 final exponentiations in total.
+def dot_cells(left: Iterable[bytes], right: Iterable[bytes], backend=None) -> bytes:
+    """Σ aᵢ·bᵢ as a GT ciphertext: ``tag ‖ c00 ‖ c01 ‖ c10 ‖ c11`` (4 × 384 bytes), pairing
+    the G2 half of ``left[i]`` with the G1 half of ``right[i]``. Miller loops are multiplied
+    before one final exponentiation per component."""
+    be = _be(backend)
     acc = [None, None, None, None]
     for la, rb in zip(left, right):
-        _a1, _a2, d1, d2 = parse_cell(la)
-        c1, c2, _b1, _b2 = parse_cell(rb)
+        _a1, _a2, d1, d2 = parse_cell(la, be)
+        c1, c2, _b1, _b2 = parse_cell(rb, be)
         for k, (q, p_) in enumerate(((d1, c1), (d1, c2), (d2, c1), (d2, c2))):
-            m = pairing(q, p_, final_exponentiate=False) if not (is_inf(q) or is_inf(p_)) else None
-            if m is not None:
-                acc[k] = m if acc[k] is None else acc[k] * m
-    one = pairing(G2, G1) ** 0
-    return b"".join(gt_to_bytes(final_exponentiate(x) if x is not None else one) for x in acc)
+            if be.g1_is_zero(p_) or q is None:
+                continue
+            m = be.miller(q, p_)
+            acc[k] = m if acc[k] is None else be.gt_mul(acc[k], m)
+    one = be.gt_one()
+    return be.tag + b"".join(be.gt_to(be.final(x) if x is not None else one) for x in acc)
 
 
-def add_sums(a: bytes, b: bytes) -> bytes:
+def add_sums(a: bytes, b: bytes, backend=None) -> bytes:
     """Combine two partial SUM ciphertexts (public operation)."""
     if len(a) != SUM_BYTES or len(b) != SUM_BYTES:
         raise FheError("bad SUM ciphertext")
-    return (g1_to_bytes(add(g1_from_bytes(a[:64]), g1_from_bytes(b[:64])))
-            + g1_to_bytes(add(g1_from_bytes(a[64:]), g1_from_bytes(b[64:]))))
+    be = _be(backend)
+    try:
+        return (be.g1_to(be.g1_add(be.g1_from(a[:64]), be.g1_from(b[:64])))
+                + be.g1_to(be.g1_add(be.g1_from(a[64:]), be.g1_from(b[64:]))))
+    except _fb.BackendError as exc:
+        raise FheError(str(exc)) from None
 
 
 def mul_dots(a: bytes, b: bytes) -> bytes:
-    """Combine two partial DOT ciphertexts (public operation)."""
-    if len(a) != DOT_BYTES or len(b) != DOT_BYTES:
-        raise FheError("bad DOT ciphertext")
-    return b"".join(
-        gt_to_bytes(gt_from_bytes(a[i * GT_BYTES:(i + 1) * GT_BYTES])
-                    * gt_from_bytes(b[i * GT_BYTES:(i + 1) * GT_BYTES]))
+    """Combine two partial DOT ciphertexts made by the same back end."""
+    if len(a) != DOT_BYTES or len(b) != DOT_BYTES or a[:1] != b[:1]:
+        raise FheError("bad or mismatched DOT ciphertexts")
+    be = _fb.by_tag(a[:1])
+    return a[:1] + b"".join(
+        be.gt_to(be.gt_mul(be.gt_from(a[1 + i * GT_BYTES:1 + (i + 1) * GT_BYTES]),
+                           be.gt_from(b[1 + i * GT_BYTES:1 + (i + 1) * GT_BYTES])))
         for i in range(4))
 
 
@@ -167,30 +125,33 @@ def mul_dots(a: bytes, b: bytes) -> bytes:
 class FheKey:
     """The secret scalar ``s`` and the derived public key. ``s`` never leaves the owner."""
 
-    def __init__(self, s: int | None = None, value_range: int = DEFAULT_RANGE):
+    def __init__(self, s: int | None = None, value_range: int = DEFAULT_RANGE, backend=None):
         self._s = s if s is not None else secrets.randbelow(N - 1) + 1
         if not 0 < self._s < N:
             raise FheError("secret out of range")
         self.range = value_range
-        self.Q = multiply(G1, self._s)
-        self.Q2 = multiply(G2, self._s)
-        self._g1_table: dict[bytes, int] | None = None
-        self._gt_table: dict[bytes, int] | None = None
-        self._gt = None
+        self.be = _be(backend)
+        self.Q = self.be.g1_mul(self.be.G1, self._s)
+        self.Q2 = self.be.g2_mul(self.be.G2, self._s)
+        self._tables: dict[str, dict] = {}
+
+    @property
+    def backend(self) -> str:
+        return self.be.name
 
     def __repr__(self) -> str:                      # never print the secret
-        return f"<FheKey range={self.range} public={g1_to_bytes(self.Q)[:6].hex()}…>"
+        return f"<FheKey range={self.range} backend={self.be.name}>"
 
     def __reduce__(self):
         raise TypeError("FheKey holds a secret and cannot be pickled or copied")
 
     @property
     def secret_bytes(self) -> bytes:
-        return _i32(self._s)
+        return int(self._s).to_bytes(32, "big")
 
     @staticmethod
-    def from_secret_bytes(raw: bytes, value_range: int = DEFAULT_RANGE) -> "FheKey":
-        return FheKey(int.from_bytes(raw, "big"), value_range)
+    def from_secret_bytes(raw: bytes, value_range: int = DEFAULT_RANGE, backend=None) -> "FheKey":
+        return FheKey(int.from_bytes(raw, "big"), value_range, backend)
 
     # encryption needs only public data
     def encrypt(self, v: int) -> bytes:
@@ -198,71 +159,89 @@ class FheKey:
             raise FheError("FHE columns hold integers")
         if abs(v) > self.range:
             raise FheError(f"|value| must be <= the key's range ({self.range})")
+        be = self.be
         r1, r2 = (secrets.randbelow(N - 1) + 1 for _ in range(2))
         vm = v % N
-        c1 = multiply(G1, r1)
-        c2 = add(multiply(G1, vm), multiply(self.Q, r1))
-        d1 = multiply(G2, r2)
-        d2 = add(multiply(G2, vm), multiply(self.Q2, r2))
-        return g1_to_bytes(c1) + g1_to_bytes(c2) + g2_to_bytes(d1) + g2_to_bytes(d2)
+        c1 = be.g1_mul(be.G1, r1)
+        c2 = be.g1_add(be.g1_mul(be.G1, vm), be.g1_mul(self.Q, r1))
+        d1 = be.g2_mul(be.G2, r2)
+        d2 = be.g2_add(be.g2_mul(be.G2, vm), be.g2_mul(self.Q2, r2))
+        return be.g1_to(c1) + be.g1_to(c2) + be.g2_to(d1) + be.g2_to(d2)
 
-    # decryption: bounded discrete logs
+    # decryption: bounded discrete logs (baby-step / giant-step)
     def _g1_dlog(self, M) -> int:
+        be = self.be
         m = math.isqrt(self.range * 2 + 1) + 1
-        if self._g1_table is None or self._g1_table.get(b"m") != m:
-            tab = {}
-            cur = Z1
+        tab = self._tables.get("g1")
+        if tab is None or tab["m"] != m:
+            t, cur = {}, be.g1_zero()
             for j in range(m + 1):
-                tab[g1_to_bytes(cur)] = j
-                cur = add(cur, G1)
-            tab[b"m"] = m
-            self._g1_table = tab
-        step = multiply(G1, m)
-        cur = add(M, multiply(G1, self.range))              # shift so the answer is in [0, 2·range]
+                t.setdefault(be.g1_key(cur), j)
+                cur = be.g1_add(cur, be.G1)
+            tab = self._tables["g1"] = {"m": m, "t": t}
+        step = be.g1_neg(be.g1_mul(be.G1, m))
+        cur = be.g1_add(M, be.g1_mul(be.G1, self.range))       # shift so the answer is in [0, 2·range]
         for i in range(m + 1):
-            j = self._g1_table.get(g1_to_bytes(cur))
-            if j is not None and j != b"m":
+            j = tab["t"].get(be.g1_key(cur))
+            if j is not None:
                 return i * m + j - self.range
-            cur = add(cur, neg(step))
+            cur = be.g1_add(cur, step)
         raise FheError("result is outside the key's value range (or the ciphertext is invalid)")
+
+    def _point_pair(self, blob: bytes):
+        try:
+            return self.be.g1_from(blob[:64]), self.be.g1_from(blob[64:128])
+        except _fb.BackendError as exc:
+            raise FheError(str(exc)) from None
 
     def decrypt_sum(self, blob: bytes) -> int:
         if len(blob) != SUM_BYTES:
             raise FheError("bad SUM ciphertext")
-        c1, c2 = g1_from_bytes(blob[:64]), g1_from_bytes(blob[64:])
-        return self._g1_dlog(add(c2, neg(multiply(c1, self._s))))
+        be = self.be
+        c1, c2 = self._point_pair(blob)
+        return self._g1_dlog(be.g1_add(c2, be.g1_neg(be.g1_mul(c1, self._s))))
 
     def decrypt_cell(self, raw: bytes) -> int:
-        c1, c2, _d1, _d2 = parse_cell(raw)
-        return self._g1_dlog(add(c2, neg(multiply(c1, self._s))))
+        be = self.be
+        c1, c2, _d1, _d2 = parse_cell(raw, be)
+        return self._g1_dlog(be.g1_add(c2, be.g1_neg(be.g1_mul(c1, self._s))))
 
-    def _gt_dlog(self, M) -> int:
+    def _gt_dlog(self, be, M) -> int:
         m = math.isqrt(self.range * 2 + 1) + 1
-        if self._gt_table is None or self._gt_table.get(b"m") != m:
-            g = pairing(G2, G1)
-            tab, cur = {}, g ** 0
+        tab = self._tables.get("gt:" + be.name)
+        g = be.gt_gen()
+        if tab is None or tab["m"] != m:
+            t, cur = {}, be.gt_one()
             for j in range(m + 1):
-                tab[gt_to_bytes(cur)] = j
-                cur = cur * g
-            tab[b"m"] = m
-            self._gt_table, self._gt = tab, g
-        g = self._gt
-        giant = g ** ((N - m) % N)                           # g^(-m)
-        cur = M * (g ** (self.range % N))
+                t.setdefault(be.gt_key(cur), j)
+                cur = be.gt_mul(cur, g)
+            tab = self._tables["gt:" + be.name] = {"m": m, "t": t}
+        giant = be.gt_pow(g, N - m)                              # g^(-m)
+        cur = be.gt_mul(M, be.gt_pow(g, self.range))
         for i in range(m + 1):
-            j = self._gt_table.get(gt_to_bytes(cur))
-            if j is not None and j != b"m":
+            j = tab["t"].get(be.gt_key(cur))
+            if j is not None:
                 return i * m + j - self.range
-            cur = cur * giant
+            cur = be.gt_mul(cur, giant)
         raise FheError("result is outside the key's value range (or the ciphertext is invalid)")
 
     def decrypt_dot(self, blob: bytes) -> int:
         if len(blob) != DOT_BYTES:
             raise FheError("bad DOT ciphertext")
-        c00, c01, c10, c11 = (gt_from_bytes(blob[i * GT_BYTES:(i + 1) * GT_BYTES]) for i in range(4))
+        try:
+            be = _fb.by_tag(blob[:1])
+        except _fb.BackendError:
+            raise FheError("this DOT result was computed with a back end that is not "
+                           "available here — install mclbn256 or ask for pyecc") from None
+        try:
+            c00, c01, c10, c11 = (be.gt_from(blob[1 + i * GT_BYTES:1 + (i + 1) * GT_BYTES])
+                                  for i in range(4))
+        except _fb.BackendError as exc:
+            raise FheError(str(exc)) from None
         s = self._s
-        M = c11 * (c01 ** ((N - s) % N)) * (c10 ** ((N - s) % N)) * (c00 ** (s * s % N))
-        return self._gt_dlog(M)
+        M = be.gt_mul(be.gt_mul(c11, be.gt_pow(c01, N - s)),
+                      be.gt_mul(be.gt_pow(c10, N - s), be.gt_pow(c00, s * s)))
+        return self._gt_dlog(be, M)
 
 
 # ── key files: sealed with a passphrase, never written in the clear by accident ──

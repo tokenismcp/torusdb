@@ -23,6 +23,7 @@ dependencies = ["torussql-parser==0.5.0"]       # pure Python
 
 [project.optional-dependencies]
 fhe = ["py_ecc>=6.0.0,<9.0.0"]                  # FHE columns (pairing arithmetic)
+fhe-native = ["py_ecc>=6.0.0,<9.0.0", "mclbn256>=1.3"]   # ... ~150x faster (native pairings)
 
 [project.urls]
 Homepage = "https://torusdb.io"

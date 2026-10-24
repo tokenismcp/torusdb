@@ -60,6 +60,7 @@ jobs:
       - uses: actions/setup-python@v5
         with: { python-version: "${{ matrix.python }}" }
       - run: pip install pytest "py_ecc>=6,<9"
+      - run: pip install mclbn256 || echo "native FHE back end unavailable on this platform"
       - name: tests
         run: pytest -q -p no:cacheprovider
 

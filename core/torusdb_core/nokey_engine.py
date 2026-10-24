@@ -165,10 +165,10 @@ class NoKeyServer:
         return fhe.sum_cells(self._rows[table].cells(col, idxs))
 
     def fhe_dot(self, ltable: str, lcol: str, lids: list[int],
-                rtable: str, rcol: str, rids: list[int]) -> bytes:
+                rtable: str, rcol: str, rids: list[int], backend: str | None = None) -> bytes:
         from . import fhe
         return fhe.dot_cells(self._rows[ltable].cells(lcol, lids),
-                             self._rows[rtable].cells(rcol, rids))
+                             self._rows[rtable].cells(rcol, rids), backend)
 
     # — selection over the PLAINTEXT predicate (encrypted cols never tested) —
     def matching_rowids(self, table: str, where) -> list[int]:
@@ -837,7 +837,8 @@ class NoKeyClient:
 
     # — FHE columns —
     _FHE_SUM_CHUNK = 2000
-    _FHE_DOT_CHUNK = 100               # ~0.2 s per row in pure Python: keep calls well under the timeout
+    _FHE_DOT_CHUNK_NATIVE = 2000
+    _FHE_DOT_CHUNK = 100               # pure Python ≈0.2 s per row: keep calls well under the timeout; native ≈1 ms
 
     def _fhe_key(self):
         if self.fhe is None:
@@ -872,9 +873,10 @@ class NoKeyClient:
         if not lids:
             return 0
         total = None
-        for i in range(0, len(lids), self._FHE_DOT_CHUNK):
-            part = self.server.fhe_dot(lt, lc, lids[i:i + self._FHE_DOT_CHUNK],
-                                       rt, rc, rids[i:i + self._FHE_DOT_CHUNK])
+        chunk = self._FHE_DOT_CHUNK_NATIVE if key.backend == "mcl" else self._FHE_DOT_CHUNK
+        for i in range(0, len(lids), chunk):
+            part = self.server.fhe_dot(lt, lc, lids[i:i + chunk],
+                                       rt, rc, rids[i:i + chunk], key.backend)
             total = part if total is None else fhe.mul_dots(total, part)
         return key.decrypt_dot(total)
 

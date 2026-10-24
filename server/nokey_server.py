@@ -132,7 +132,8 @@ class ServerConfig:
     auth_deadline: float = 10.0       # seconds an unauthenticated peer may stay connected
     pre_auth_frame: int = 8192        # largest frame accepted before authentication
     fhe_max_sum_rows: int = 5000      # rows per fhe_sum call
-    fhe_max_dot_rows: int = 300       # rows per fhe_dot call (pairings are slow)
+    fhe_max_dot_rows: int = 300       # rows per fhe_dot call with the pure-Python back end
+    fhe_max_dot_rows_native: int = 6000   # ... with the native (mcl) back end
     tx_ring: int = 100_000            # committed transaction ids remembered
     storage: str = "memory"           # "memory" | "disk" (heap files in <db>.data/)
     cache_rows: int = 50_000          # disk storage: decoded rows cached per table
@@ -1258,17 +1259,28 @@ class Engine:
         cells = self.srv._rows[table].cells(col, ids)         # copied under the lock ...
         return lambda: _b64e(repl_fhe().sum_cells(cells))       # ... computed outside it
 
-    def _rpc_fhe_dot(self, lt, lc, lids, rt, rc, rids):
+    def _rpc_fhe_dot(self, lt, lc, lids, rt, rc, rids, backend=None):
         self._fhe_col(lt, lc)
         self._fhe_col(rt, rc)
         a, b = self._check_ids(lt, lids), self._check_ids(rt, rids)
         if len(a) != len(b):
             raise BadRequest("fhe_dot needs equally long id lists")
-        if len(a) > self.cfg.fhe_max_dot_rows:
-            raise BadRequest(f"fhe_dot takes at most {self.cfg.fhe_max_dot_rows} rows per call")
+        if backend is not None and backend not in ("pyecc", "mcl"):
+            raise BadRequest("backend must be 'pyecc' or 'mcl'")
+        from torusdb_core import fhe_backend
+        try:
+            be = fhe_backend.get(backend) if backend else fhe_backend.default()
+        except ValueError as exc:
+            raise BadRequest(f"FHE back end unavailable on this server: {exc}") from None
+        cap = (self.cfg.fhe_max_dot_rows_native if be.name == "mcl"
+               else self.cfg.fhe_max_dot_rows)
+        if len(a) > cap:
+            raise BadRequest(f"fhe_dot takes at most {cap} rows per call with the "
+                             f"{be.name} back end")
         left = self.srv._rows[lt].cells(lc, a)
         right = self.srv._rows[rt].cells(rc, b)
-        return lambda: _b64e(repl_fhe().dot_cells(left, right))
+        backend = be.name
+        return lambda: _b64e(repl_fhe().dot_cells(left, right, backend))
 
     # — Π_mult (combine opened operands; no key) —
     def _rpc_mult_combine_batch(self, openings):

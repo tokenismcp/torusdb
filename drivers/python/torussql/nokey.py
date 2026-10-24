@@ -274,8 +274,9 @@ class RemoteNoKeyServer:
     def fhe_sum(self, table, col, idxs):
         return _b64d(self._c.call("fhe_sum", [table, col, idxs]))
 
-    def fhe_dot(self, lt, lc, lids, rt, rc, rids):
-        return _b64d(self._c.call("fhe_dot", [lt, lc, lids, rt, rc, rids]))
+    def fhe_dot(self, lt, lc, lids, rt, rc, rids, backend=None):
+        args = [lt, lc, lids, rt, rc, rids] + ([backend] if backend else [])
+        return _b64d(self._c.call("fhe_dot", args))
 
     def create_index(self, table, col):
         self._c.call("create_index", [table, col])

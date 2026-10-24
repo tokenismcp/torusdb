@@ -18,7 +18,9 @@ cryptographic self-audit, and the open repository made self-contained.
   server; the owner holds only an `FheKey`. Independent per-half randomness removes the
   public-key value oracle of shared-randomness paired ciphertexts. `docs/fhe-columns.md`.
 - `torussql --fhe-keygen/--fhe-key`, `connect(fhe_key=…)`, RPCs `fhe_sum` / `fhe_dot`.
-- Experimental: no integrity, slow pure-Python pairings, Python driver only.
+- Native pairing back end (`mclbn256`, optional `fhe-native` extra): ≈150× faster; the pure-Python
+  `py_ecc` back end remains the portable fallback. Cells interoperate; DOT blobs carry a back-end tag.
+- Experimental: no integrity, Python driver only.
 
 ### Added — scheduling, synchronous replication, atomic IF [NOT] EXISTS (late 0.5.0)
 

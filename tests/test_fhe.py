@@ -11,6 +11,7 @@ from py_ecc.optimized_bn128 import G1, add, multiply, neg, pairing
 from test_ops import Running
 
 KEY = fhe.FheKey(value_range=50_000)
+HAVE_MCL = "mcl" in fhe.available_backends()
 
 
 def test_scheme_roundtrip_sum_and_dot_with_signs():
@@ -39,12 +40,13 @@ def test_out_of_range_results_raise_instead_of_returning_garbage():
 def test_no_value_oracle_for_the_evaluator():
     """With the public key alone nobody can test 'does this cell encrypt v?'
     (the test that breaks shared-randomness paired ciphertexts)."""
+    from py_ecc.optimized_bn128 import G2 as PG2
     ct = KEY.encrypt(1234)
-    c1, c2, d1, d2 = fhe.parse_cell(ct)
+    c1, c2, d1, d2 = fhe.parse_cell(ct, "pyecc")
+    Q = fhe._fb.get("pyecc").g1_mul(fhe._fb.get("pyecc").G1, KEY._s)
     for v in (1234, 1, 0):
-        lhs = pairing(fhe.G2 if hasattr(fhe, "G2") else __import__("py_ecc.optimized_bn128", fromlist=["G2"]).G2,
-                      add(c2, neg(multiply(G1, v))))
-        assert lhs != pairing(d1, KEY.Q)
+        lhs = pairing(PG2, add(c2, neg(multiply(G1, v))))
+        assert lhs != pairing(d1, Q)
     # encryption is randomised: equal plaintexts give unrelated ciphertexts
     assert KEY.encrypt(5) != KEY.encrypt(5)
 
@@ -154,7 +156,7 @@ def test_over_the_wire_disk_storage_and_a_second_client_with_the_same_key(tmp_pa
             with pytest.raises(Exception, match="not an FHE column"):
                 call("update_cell", ["emp", 0, "id", {"t": "x", "v": "AAAA"}])
             with pytest.raises(Exception, match="at most"):
-                call("fhe_dot", ["emp", "rate", [0] * 301, "emp", "hours", [0] * 301])
+                call("fhe_dot", ["emp", "rate", [0] * 301, "emp", "hours", [0] * 301, "pyecc"])
     finally:
         s.stop()
 
@@ -181,3 +183,67 @@ def test_fhe_cells_survive_snapshot_restart_and_replication(tmp_path):
     finally:
         if r:
             r.stop()
+
+
+# ── back ends: pure Python and native mcl must agree and interoperate ────────
+needs_mcl = pytest.mark.skipif(not HAVE_MCL, reason="mclbn256 not installed")
+
+
+@needs_mcl
+@pytest.mark.parametrize("enc_be,eval_be,dec_be", [
+    ("pyecc", "mcl", "mcl"), ("mcl", "pyecc", "pyecc"), ("mcl", "mcl", "pyecc"), ("pyecc", "pyecc", "mcl")])
+def test_backends_interoperate_on_cells_sums_and_dots(enc_be, eval_be, dec_be):
+    s = KEY._s
+    enc = fhe.FheKey(s, 50_000, backend=enc_be)
+    dec = fhe.FheKey(s, 50_000, backend=dec_be)
+    xs, ys = [3, -5, 7, 100], [2, 4, -6, 9]
+    A, B = [enc.encrypt(x) for x in xs], [enc.encrypt(y) for y in ys]
+    assert enc.Q is not None and [dec.decrypt_cell(c) for c in A] == xs      # points are library-independent
+    assert dec.decrypt_sum(fhe.sum_cells(A, eval_be)) == sum(xs)
+    blob = fhe.dot_cells(A, B, eval_be)
+    # a DOT blob is decoded by the back end that made it, whichever back end the key prefers
+    assert dec.decrypt_dot(blob) == sum(a * b for a, b in zip(xs, ys))
+    assert blob[:1] == {"pyecc": b"\x01", "mcl": b"\x02"}[eval_be]
+    part = fhe.mul_dots(fhe.dot_cells(A[:2], B[:2], eval_be), fhe.dot_cells(A[2:], B[2:], eval_be))
+    assert dec.decrypt_dot(part) == sum(a * b for a, b in zip(xs, ys))
+
+
+@needs_mcl
+def test_mcl_rejects_invalid_points_and_subgroup_cheats():
+    ct = bytearray(KEY.encrypt(5))
+    for off in (3, 70, 140, 270):                       # corrupt a coordinate in each point
+        bad = bytearray(ct); bad[off] ^= 0x55
+        with pytest.raises(fhe.FheError):
+            fhe.parse_cell(bytes(bad), "mcl")
+
+
+@needs_mcl
+def test_native_backend_is_orders_of_magnitude_faster():
+    import time
+    k = fhe.FheKey(value_range=10_000, backend="mcl")
+    cts = [k.encrypt(i) for i in range(40)]
+    t = time.perf_counter()
+    blob = fhe.dot_cells(cts[:20], cts[20:], "mcl")
+    assert time.perf_counter() - t < 2.0                 # pure Python needs ~4 s for 20 rows
+    assert k.decrypt_dot(blob) == sum(a * b for a, b in zip(range(20), range(20, 40)))
+
+
+@needs_mcl
+def test_server_uses_the_native_backend_and_a_pure_client_can_still_decrypt(tmp_path):
+    s = Running(db=str(tmp_path / "db"))
+    try:
+        for backend in ("mcl", "pyecc"):
+            key = fhe.FheKey(KEY._s, 50_000, backend=backend)
+            with s.connect(fhe_key=key) as c:
+                c.execute(f"CREATE TABLE IF NOT EXISTS emp (id INT PLAIN, rate INT FHE, hours INT FHE)")
+                if backend == "mcl":
+                    c.execute("INSERT INTO emp (id, rate, hours) VALUES (1, 40, 160)")
+                    c.execute("INSERT INTO emp (id, rate, hours) VALUES (2, 55, 150)")
+                assert c.execute("SELECT SUM(rate), DOT(rate, hours) FROM emp").rows == [[95, 14650]]
+        with s.connect(fhe_key=fhe.FheKey(KEY._s, 50_000, backend="mcl")) as c:
+            with pytest.raises(Exception, match="backend must be"):
+                c._wire.call("fhe_dot", ["emp", "rate", [0], "emp", "hours", [0], "bogus"])
+            with pytest.raises(Exception, match="at most"):
+                c._wire.call("fhe_dot", ["emp", "rate", [0] * 6001, "emp", "hours", [0] * 6001, "mcl"])
+    finally:
+        s.stop()
