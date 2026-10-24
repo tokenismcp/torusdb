@@ -6,22 +6,26 @@ the BN254 pairing groups (G1, G2, GT), implemented on
 ``py_ecc`` (portable) with an optional native ``mclbn256`` back end — nothing here depends
 on the proprietary engine.
 
-    secret  s          public  Q = s·P (G1),  Q2 = s·G2 (G2)         e = pairing(G2, G1)
+    secrets s, s2      public  Q = s·P (G1),  Q2 = s2·G2 (G2)        e = pairing(G2, G1)
+                       (s2 is a SECOND secret, derived from s — never publish Q2 = s·G2, see below)
 
     encrypt(v)  =  G1 half  (C1, C2) = (r1·P,  v·P  + r1·Q )        independent
-                   G2 half  (D1, D2) = (r2·G2, v·G2 + r2·Q2)        randomness r1 ≠ r2
+                   G2 half  (D1, D2) = (r2·G2, v·G2 + r2·Q2)        randomness r1 ≠ r2, secret s ≠ s2
 
 * **SUM** (server): add the G1 halves of the chosen cells. Owner: ``ΣC2 − s·ΣC1 = (Σv)·P``,
   then a bounded discrete log.
 * **DOT** (server): the ciphertext×ciphertext product ★_ct (pairing, NOT a scalar multiplication):
   for each row pair the G2 half of cell a with the G1 half of cell b:
   ``c00=e(D1,C1′) c01=e(D1,C2′) c10=e(D2,C1′) c11=e(D2,C2′)`` and multiply the four GT
-  values over all rows. Owner: ``c11·c01^−s·c10^−s·c00^(s²) = e(P,G2)^(Σ a·b)``.
+  values over all rows. Owner: ``c11·c01^−s2·c10^−s·c00^(s·s2) = e(P,G2)^(Σ a·b)``.
 
-The two halves of a cell use *independent* randomness. With a shared ``r`` (as in some
-paired-ciphertext layouts) anyone holding the public key can test whether a cell encrypts a
-guessed value: ``e(C2 − v·P, G2) == e(Q, D1)``. Independent randomness removes that
-test (see ``tests/test_fhe.py``); security rests on SXDH in BN254 (≈100-bit).
+Value-oracle defences (both are required; ``tests/test_fhe.py`` checks every pairing identity
+between the public keys and a cell):
+* the two halves use *independent* randomness — with a shared ``r`` anyone holding the public key
+  can test a guessed value: ``e(C2 − v·P, G2) == e(Q, D1)``;
+* the G2 half uses an independent *secret* ``s2`` (``Q2 = s2·G2``) — with ``Q2 = s·G2`` the test
+  ``e(G2, C2 − v·P) == e(Q2, C1)`` still works even with independent randomness.
+Security then rests on SXDH in BN254 (≈100-bit).
 
 Limits: plaintexts are integers; results must lie in ``[-range, range]`` (the discrete log
 is a baby-step/giant-step search, memory ≈ √range table entries); cells are 384 bytes;
@@ -137,6 +141,15 @@ def mul_dots(a: bytes, b: bytes) -> bytes:
 
 
 # ── the owner's side ─────────────────────────────────────────────────────────
+def derive_s2(s: int) -> int:
+    """The G2-side secret. It MUST differ from ``s``: with ``Q = s·P`` and ``Q2 = s·G2`` both
+    public, anyone can test a guessed value v with ``e(G2, C2 − v·P) == e(Q2, C1)`` even though
+    the two halves use independent randomness. ``s2`` is derived (not stored) so key files hold
+    only ``s``; a threshold key shares ``s2`` as a second secret instead."""
+    h = hashlib.sha512(b"torussql/fhe/v2/g2-secret\x00" + int(s).to_bytes(32, "big")).digest()
+    return int.from_bytes(h, "big") % (N - 1) + 1
+
+
 class _OwnerOps:
     """Everything the owner does that needs only PUBLIC data (encryption), a MAC secret
     (integrity tags) and *some way to compute s·P* — supplied by the subclass:
@@ -320,8 +333,9 @@ class FheKey(_OwnerOps):
             raise FheError("secret out of range")
         self.range = value_range
         self.be = _be(backend)
+        self._s2 = derive_s2(self._s)
         self.Q = self.be.g1_mul(self.be.G1, self._s)
-        self.Q2 = self.be.g2_mul(self.be.G2, self._s)
+        self.Q2 = self.be.g2_mul(self.be.G2, self._s2)
         self._tables: dict[str, dict] = {}
 
     def __repr__(self) -> str:                      # never print the secret
@@ -363,9 +377,9 @@ class FheKey(_OwnerOps):
         for x in (c00, be.gt_mul(c01, c10)):
             if not be.gt_in_subgroup(x):
                 raise FheError("invalid DOT ciphertext: component outside the GT subgroup")
-        s = self._s
-        M = be.gt_mul(be.gt_mul(c11, be.gt_pow(c01, N - s)),
-                      be.gt_mul(be.gt_pow(c10, N - s), be.gt_pow(c00, s * s)))
+        s, s2 = self._s, self._s2
+        M = be.gt_mul(be.gt_mul(c11, be.gt_pow(c01, N - s2)),
+                      be.gt_mul(be.gt_pow(c10, N - s), be.gt_pow(c00, s * s2)))
         return self._gt_dlog(be, M)
 
 

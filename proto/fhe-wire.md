@@ -19,7 +19,11 @@ re-verified by `tests/test_fhe.py::test_published_vectors`). Prose: `../docs/fhe
 * **GT element**: 384 bytes = 12 big-endian 32-byte coefficients `c0…c11` of the py_ecc polynomial
   basis `Σ cm·w^m` with `w^12 = 18·w^6 − 82` (so `i = w^6 − 9`).
 
-## Scheme (secret `s ∈ [1, n)`, public `Q = s·G1`, `Q2 = s·G2`; plaintext `v ∈ Z`, |v| ≤ range)
+## Scheme (secrets `s, s2 ∈ [1, n)`, public `Q = s·G1`, `Q2 = s2·G2`; plaintext `v ∈ Z`, |v| ≤ range)
+
+`s2` is a **second secret**: a local key derives `s2 = int(SHA-512("torussql/fhe/v2/g2-secret\0" ‖ s as 32 big-endian bytes)) mod (n−1) + 1`;
+a threshold key shares it as an independent secret. **Never use `Q2 = s·G2`**: with `Q = s·G1` and `Q2 = s·G2` both public,
+`e(G2, C2 − v·G1) == e(Q2, C1)` confirms a guessed value `v` (a dictionary oracle) even though `r1 ≠ r2`.
 ```
 Enc(v):  r1, r2 ←$ [1, n)
          C1 = r1·G1        C2 = v·G1 + r1·Q          (G1 half)
@@ -35,7 +39,7 @@ cell    = C1 ‖ C2 ‖ D1 ‖ D2                                       384 byte
   `c11 = Π e(D2(a_i), C2(b_i))` (e: G2 × G1 → GT). Tag `0x01` = py_ecc optimal-ate, `0x02` = native mcl
   optimal-ate; the two pairings differ by a fixed exponent, so each has its own GT generator
   `g = e(G1, G2)` (published in `fhe-vectors.json` → `gt_generators`).
-  Decrypt: `M = c11 · c01^(−s) · c10^(−s) · c00^(s²) = g^(Σ a_i·b_i)` then a bounded discrete log w.r.t. `g`.
+  Decrypt: `M = c11 · c01^(−s2) · c10^(−s) · c00^(s·s2) = g^(Σ a_i·b_i)` then a bounded discrete log w.r.t. `g`.
   Partial blobs of the same tag combine by component-wise GT multiplication.
 * Integrity tags (optional, `authenticated`): hidden column `__fmac__<col>` holds `Enc_scalar(α·v + γ)`
   (same cell layout, scalar mod n, no range limit). `α = PRF("alpha") or 1`, `γ = PRF("gamma", table, col, rowid)`,

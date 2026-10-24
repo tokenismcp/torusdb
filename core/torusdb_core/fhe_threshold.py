@@ -11,13 +11,17 @@ combine in the exponent".
 =====================  ==============================================================
 owner operation        how it is done without ``s``
 =====================  ==============================================================
-encrypt                public data only: ``Q = s·G1`` (= the custody public key ``X``) and
-                       ``Q2 = s·G2`` (assembled from the custodians' G2 shares, pairing-
-                       checked ``e(Q, G2) = e(G1, Q2)``, stored in the public bundle)
+encrypt                public data only: ``Q = s·G1`` (= custody key 1's public key ``X1``) and
+                       ``Q2 = s2·G2`` where ``s2`` is a SECOND, independent threshold secret
+                       (custody key 2, public ``X2 = s2·G1``). ``Q2`` is assembled from key 2's
+                       G2 shares and pairing-checked ``e(X2, G2) = e(G1, Q2)``; ``Q2 = s·G2`` is
+                       refused (it would give a dictionary oracle on every cell)
 decrypt cell / SUM     ``s·C1`` = threshold G1 decryption (DLEQ-proved ``yᵢ·E``, one round)
-decrypt DOT            ``M = c11·c01^-s·c10^-s·c00^(s²)`` by threshold GT exponentiation
-                       (Chaum-Pedersen proved ``c^yᵢ``, ``custody/gt.py``); ``s²`` is two
-                       SEQUENTIAL rounds (``u = c00^s`` then ``u^s``), never ``s*s``
+decrypt DOT            ``M = c11·c01^-s2·c10^-s·c00^(s·s2)`` by threshold GT exponentiation
+                       (Chaum-Pedersen proved ``c^yᵢ``, ``custody/gt.py``): round 1 on key 1
+                       (``c00^s``, ``c10^s``), round 2 on key 2 (``c01^s2`` and ``(c00^s)^s2``).
+                       ``s·s2`` is never computed anywhere; the two sequential rounds are the
+                       product in the exponent
 integrity tags         α and γ derive from a SEPARATE 32-byte MAC secret that lives in the
                        public bundle sealed under the threshold vault envelope and is opened
                        (lazily, only if ``authenticated=True`` is used) by a quorum
@@ -64,42 +68,69 @@ class ThresholdFheKey(_OwnerOps):
     G2 shares. Either way it is verified: G2 subgroup membership and the pairing
     equation ``e(Q, G2) = e(G1, Q2)`` — a wrong ``Q2`` can never be used."""
 
-    def __init__(self, public, custodians, *, Q2: bytes | None = None, mac: dict | None = None,
-                 value_range: int = DEFAULT_RANGE, backend=None, context: bytes = b"",
-                 timeout: float = 20.0):
+    def __init__(self, public, custodians, public2, custodians2=None, *, Q2: bytes | None = None,
+                 mac: dict | None = None, value_range: int = DEFAULT_RANGE, backend=None,
+                 context: bytes = b"", timeout: float = 20.0):
+        """``public``/``custodians``: custody key 1 (the secret ``s``). ``public2``/``custodians2``:
+        custody key 2 (the independent secret ``s2``, run by the same custodian hosts).
+        ``custodians2=None`` is allowed when ``Q2`` is given: such a key can encrypt and read
+        cells / SUMs but ``DOT`` raises (no quorum for ``s2``)."""
         C = _custody()
-        if public.group != "bn254":
-            raise FheError("an FHE threshold key needs a 'bn254' custody key "
-                           f"(this one is {public.group!r})")
-        if isinstance(custodians, C.Quorum):
-            if custodians.public.key_id != public.key_id:
-                raise FheError("the quorum belongs to a different custody key")
-            self.quorum = custodians
-        else:
-            self.quorum = C.Quorum(public, list(custodians), timeout=timeout)
-        self.public = public
+        for p_ in (public, public2):
+            if p_.group != "bn254":
+                raise FheError("an FHE threshold key needs 'bn254' custody keys "
+                               f"(this one is {p_.group!r})")
+        g = public.g
+        if public.key_id == public2.key_id or g.eq(public.X, public2.X):
+            raise FheError("the second secret must be an independent key (same key twice)")
+        self.quorum = self._mk_quorum(C, public, custodians, timeout)
+        self.quorum2 = (self._mk_quorum(C, public2, custodians2, timeout)
+                        if custodians2 is not None else None)
+        self.public, self.public2 = public, public2
         self.range = value_range
         self.be = _fhe._be(backend)
         self._tables: dict = {}
         self._ctx = bytes(context)
-        g = public.g
         self.Q = self.be.g1_from(g.encode(public.X))
-        raw_q2 = bytes(Q2) if Q2 is not None else self.quorum.shared_g2()
-        self.Q2 = self._checked_q2(public, raw_q2)
+        if Q2 is None:
+            if self.quorum2 is None:
+                raise FheError("Q2 is needed (a bundle) when there is no quorum for the second secret")
+            Q2 = self.quorum2.shared_g2()
+        raw_q2 = bytes(Q2)
+        self.Q2 = self._checked_q2(public, public2, raw_q2)
         self._q2_raw = raw_q2
         self._mac = dict(mac) if mac else None
         self._mac_secret_cache: bytes | None = None
         self._mac_lock = threading.Lock()
 
+    @staticmethod
+    def _mk_quorum(C, public, custodians, timeout):
+        if isinstance(custodians, C.Quorum):
+            if custodians.public.key_id != public.key_id:
+                raise FheError("the quorum belongs to a different custody key")
+            return custodians
+        return C.Quorum(public, list(custodians), timeout=timeout)
+
     # — public bundle ————————————————————————————————————————————————————————
-    def _checked_q2(self, public, raw: bytes):
+    def _checked_q2(self, public, public2, raw: bytes):
+        """Q2 must be s2·G2 (e(X2, G2) = e(G1, Q2), subgroup) and must NOT be s·G2."""
         C = _custody()
         from torussql.custody import gt as _gt
         try:
-            _gt.check_q2(public.X, raw)           # subgroup + e(X, G2) = e(G1, Q2)  (py_ecc)
-            return self.be.g2_from(raw)
+            _gt.check_q2(public.X, raw)
+        except C.CustodyError:
+            pass
+        else:
+            raise FheError("Q2 equals s·G2 (the first secret): that gives a dictionary oracle on "
+                           "every ciphertext — the G2 half needs an independent secret")
+        try:
+            _gt.check_q2(public2.X, raw)
         except (C.CustodyError, _fb.BackendError) as exc:
-            raise FheError(f"the G2 public key does not match the custody key: {exc}") from None
+            raise FheError(f"the G2 public key does not match the second custody key: {exc}") from None
+        try:
+            return self.be.g2_from(raw)
+        except _fb.BackendError as exc:
+            raise FheError(f"bad G2 public key: {exc}") from None
 
     @staticmethod
     def new_mac(public) -> dict:
@@ -116,8 +147,9 @@ class ThresholdFheKey(_OwnerOps):
     def bundle(self) -> dict:
         """Everything PUBLIC the owner needs, JSON-serialisable (no secret of any kind)."""
         g = self.public.g
-        return {"v": 1, "kind": BUNDLE_KIND, "key_id": self.public.key_id,
-                "range": self.range, "Q": g.hex(self.public.X), "Q2": self._q2_raw.hex(),
+        return {"v": 2, "kind": BUNDLE_KIND, "key_id": self.public.key_id,
+                "key_id2": self.public2.key_id, "range": self.range,
+                "Q": g.hex(self.public.X), "X2": g.hex(self.public2.X), "Q2": self._q2_raw.hex(),
                 **({"mac": self._mac} if self._mac else {})}
 
     def save_bundle(self, path: str) -> None:
@@ -125,35 +157,49 @@ class ThresholdFheKey(_OwnerOps):
         _atomic(path, json.dumps(self.bundle(), indent=1).encode(), 0o644)
 
     @classmethod
-    def from_bundle(cls, bundle: dict, public, custodians, **kw) -> "ThresholdFheKey":
-        if not isinstance(bundle, dict) or bundle.get("kind") != BUNDLE_KIND or bundle.get("v") != 1:
+    def from_bundle(cls, bundle: dict, public, custodians, public2, custodians2=None,
+                    **kw) -> "ThresholdFheKey":
+        if not isinstance(bundle, dict) or bundle.get("kind") != BUNDLE_KIND:
             raise FheError("not a threshold FHE bundle")
-        if bundle.get("key_id") != public.key_id:
-            raise FheError("this bundle belongs to a different custody key")
+        if bundle.get("v") == 1:
+            raise FheError("this is a version-1 threshold FHE bundle (Q2 = s·G2, which leaks a "
+                           "dictionary oracle on every cell); it is no longer accepted — create a "
+                           "new key with a second secret (fhe-keygen-threshold --public2 ...) and "
+                           "re-encrypt the data")
+        if bundle.get("v") != 2:
+            raise FheError("unsupported threshold FHE bundle version")
+        if bundle.get("key_id") != public.key_id or bundle.get("key_id2") != public2.key_id:
+            raise FheError("this bundle belongs to different custody keys")
         g = public.g
         try:
             if not g.eq(g.from_hex(bundle["Q"]), public.X):
                 raise FheError("bundle Q does not equal the custody public key")
+            if not g.eq(g.from_hex(bundle["X2"]), public2.X):
+                raise FheError("bundle X2 does not equal the second custody public key")
             q2 = bytes.fromhex(bundle["Q2"])
             rng = int(bundle["range"])
         except (KeyError, ValueError, TypeError) as exc:
             raise FheError(f"malformed threshold FHE bundle ({type(exc).__name__})") from None
         kw.setdefault("value_range", rng)
-        return cls(public, custodians, Q2=q2, mac=bundle.get("mac"), **kw)
+        return cls(public, custodians, public2, custodians2, Q2=q2, mac=bundle.get("mac"), **kw)
 
     @classmethod
-    def load(cls, path: str, public, custodians, **kw) -> "ThresholdFheKey":
+    def load(cls, path: str, public, custodians, public2, custodians2=None, **kw) -> "ThresholdFheKey":
         with open(path, "rb") as f:
-            return cls.from_bundle(json.loads(f.read()), public, custodians, **kw)
+            return cls.from_bundle(json.loads(f.read()), public, custodians, public2,
+                                   custodians2, **kw)
 
     @classmethod
-    def create(cls, public, custodians, *, with_mac: bool = True, **kw) -> "ThresholdFheKey":
-        """Ceremony step after the DKG: derive Q2 from the custodians and seal a MAC secret."""
-        return cls(public, custodians, mac=cls.new_mac(public) if with_mac else None, **kw)
+    def create(cls, public, custodians, public2, custodians2, *, with_mac: bool = True,
+               **kw) -> "ThresholdFheKey":
+        """Ceremony step after the two DKGs: derive Q2 from key 2's custodians and seal a MAC
+        secret under key 1's envelope."""
+        return cls(public, custodians, public2, custodians2,
+                   mac=cls.new_mac(public) if with_mac else None, **kw)
 
     def __repr__(self) -> str:                      # never print tokens / secrets
         return (f"<ThresholdFheKey {self.public.k}-of-{self.public.n} range={self.range} "
-                f"backend={self.be.name} key={self.public.key_id}>")
+                f"backend={self.be.name} keys={self.public.key_id}+{self.public2.key_id}>")
 
     def __reduce__(self):
         raise TypeError("ThresholdFheKey holds custodian credentials and cannot be pickled")
@@ -209,14 +255,17 @@ class ThresholdFheKey(_OwnerOps):
         except _fb.BackendError:
             raise FheError("this DOT result was computed with a back end that is not "
                            "available here — install mclbn256 or ask for pyecc") from None
+        if self.quorum2 is None:
+            raise FheError("DOT needs the second secret s2: this key has no custodian quorum for it")
         raw = [bytes(blob[1 + i * GT_BYTES:1 + (i + 1) * GT_BYTES]) for i in range(4)]
         c00, c01, c10, c11 = raw
         try:
             for r in raw:
                 _gt.gt_check(r)                  # a hostile server cannot make us query foreign elements
-            # round 1: c00^s, c01^s, c10^s      round 2: (c00^s)^s = c00^(s²)
-            t00, t01, t10 = self.quorum.shared_gt_powers([c00, c01, c10], _GT_CONTEXT)
-            (u00,) = self.quorum.shared_gt_powers([t00], _GT_CONTEXT)
+            # M = c11 · c01^-s2 · c10^-s · c00^(s·s2); neither s·s2 nor any product of secrets is
+            # formed. Round 1 (key 1): c00^s, c10^s.  Round 2 (key 2): c01^s2 and (c00^s)^s2.
+            t00, t10 = self.quorum.shared_gt_powers([c00, c10], _GT_CONTEXT)
+            t01, u00 = self.quorum2.shared_gt_powers([c01, t00], _GT_CONTEXT)
             M = (_gt.gt_decode(c11) * (_gt.gt_decode(t01) ** (N - 1))
                  * (_gt.gt_decode(t10) ** (N - 1)) * _gt.gt_decode(u00))   # inverse in μ_N = ^(N-1)
             Mbe = be.gt_from(_gt.gt_encode(M))

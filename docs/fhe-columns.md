@@ -51,16 +51,20 @@ conn = torussql.connect(host, fhe_key=key, authenticated=True)   # authenticated
 
 ## Scheme (EC-FHE on the BN254 pairing groups; implemented in `torusdb_core/fhe.py`)
 
-`s` secret; public `Q = sP`, `Q2 = sG2`. Encrypting `v`: G1 half `(r₁P, vP + r₁Q)` and G2
+Two secrets `s` and `s2` (a local key derives `s2` from `s`; a threshold key shares it separately);
+public `Q = sP`, `Q2 = s2·G2`. Encrypting `v`: G1 half `(r₁P, vP + r₁Q)` and G2
 half `(r₂G2, vG2 + r₂Q2)` with **independent** `r₁, r₂`. SUM adds the G1 halves; DOT pairs the
 G2 half of one cell with the G1 half of the other and multiplies the four pairings over all
 rows (Miller loops are multiplied before one final exponentiation). The owner recovers
 `Σv` or `Σab` with a baby-step/giant-step discrete log bounded by the key's range.
 
-*Why independent randomness:* a layout that shares `r` between the halves lets anyone with the
-public key test whether a cell encrypts a guessed value (`e(C₂ − vP, G2) = e(Q, D₁)`), i.e. a
-dictionary attack by the server. We reproduced that test against a shared-randomness paired
-ciphertext and verified it finds nothing here (`tests/test_fhe.py`).
+*Why independent randomness and a second secret:* a layout that shares `r` between the halves lets
+anyone with the public key test whether a cell encrypts a guessed value
+(`e(C₂ − vP, G2) = e(Q, D₁)`), i.e. a dictionary attack. Independent randomness alone is *not*
+enough: with `Q = sP` and `Q2 = s·G2` both public, `e(G2, C₂ − vP) = e(Q2, C₁)` still confirms a
+guess. Using an independent `s2` for the G2 half closes both. `tests/test_fhe.py` tries every
+pairing identity between a cell and the public keys, with a positive control showing the weak
+variants are broken.
 
 ## Limits — read before relying on it
 
@@ -107,32 +111,42 @@ ciphertext and verified it finds nothing here (`tests/test_fhe.py`).
 
 ## Threshold custody of the FHE key (`ThresholdFheKey`)
 
-The secret `s` can live **only** as a k-of-n sharing among custodians (the Laurent-series
-sharing of `torussql.custody`, group `bn254`, dealerless DKG). No server, custodian or owner
-process holds `s`, and `s` is never reassembled (the tests run every operation with
-`laurent.reconstruct` patched to raise).
+The FHE secrets can live **only** as k-of-n sharings among custodians (the Laurent-series sharing of
+`torussql.custody`, group `bn254`, dealerless DKG). No server, custodian or owner process holds
+`s` or `s2`, and neither is ever reassembled (the tests run every operation with `laurent.reconstruct`
+patched to raise). The scheme has **two independent secrets**: `s` (`Q = s*G1`, used for the G1 half and cell/SUM
+decryption) and `s2` (`Q2 = s2*G2`, the G2 half). `Q2 = s*G2` is forbidden — with both public keys known it
+lets anyone test a guessed value (`e(G2, C2 - v*G1) = e(Q2, C1)`). A local `FheKey` derives `s2` from `s`; a
+threshold key cannot (nobody knows `s`), so `s2` is a **second threshold key**: run a second DKG on the same
+custodian hosts (a second `serve` daemon per custodian for the second share file) and give both public keys.
 
 ```bash
-# 1. dealerless DKG on the bn254 group (docs/custody.md section 2.1), then run the daemons
-python -m torussql.custody keygen-local --k 3 --n 5 --group bn254 --out keys/   # dev only; use identity-new/dkg-* in production
-# 2. one owner-side step: Q2 from the custodians, a sealed MAC secret, ONE public bundle (no secret)
-python -m torussql.custody fhe-keygen-threshold --public public.json --token-env CT \
-    --custodian host1:8601 --custodian host2:8601 --custodian host3:8601 --out fhe-bundle.json
-python -m torussql.custody fhe-open-test --public public.json --bundle fhe-bundle.json ...  # cells, SUM, DOT, MAC
-torussql --fhe-threshold fhe-bundle.json --custody-public public.json --custodian host1:8601 ... \
-         --custody-token-env CT -p 8533
+# 1. TWO dealerless DKGs on the bn254 group (docs/custody.md section 2.1): key 1 -> s, key 2 -> s2;
+#    run the daemons for both (e.g. host1:8601 serves s, host1:8602 serves s2)
+# 2. one owner-side step: Q2 = s2*G2 from key 2's custodians, a sealed MAC secret, ONE public bundle
+python -m torussql.custody fhe-keygen-threshold --public public.json --public2 public2.json --token-env CT \
+    --custodian host1:8601 --custodian host2:8601 --custodian host3:8601 \
+    --custodian2 host1:8602 --custodian2 host2:8602 --custodian2 host3:8602 --out fhe-bundle.json
+python -m torussql.custody fhe-open-test ... --bundle fhe-bundle.json    # cells, SUM, DOT, MAC
+torussql --fhe-threshold fhe-bundle.json --custody-public public.json --custody-public2 public2.json \
+         --custodian host1:8601 ... --custodian2 host1:8602 ... --custody-token-env CT -p 8533
 ```
 ```python
 from torusdb_core.fhe_threshold import ThresholdFheKey
-key = ThresholdFheKey.load("fhe-bundle.json", PublicKey.load("public.json"), remote_custodians)
+key = ThresholdFheKey.load("fhe-bundle.json", PublicKey.load("public.json"), custodians1,
+                           PublicKey.load("public2.json"), custodians2)
 conn = torussql.connect(host, fhe_key=key, authenticated=True)     # the same surface as FheKey
 ```
+Bundle format version 2 (`Q = X1`, `X2`, `Q2`, `key_id`, `key_id2`, optional sealed `mac`). Version-1
+bundles (which assumed `Q2 = s*G2`) are rejected with an explicit error; such data must be re-encrypted under a
+new key. A key may be loaded without `custodians2` (only the bundle's `Q2`): it encrypts and reads cells/SUMs,
+but `DOT` raises "needs the second secret".
 
-| owner operation | without `s` |
+| owner operation | without `s`, `s2` |
 |---|---|
-| encrypt | needs only `Q = s*G1` (= the custody public key `X`) and `Q2 = s*G2`. `Q2` is assembled from the custodians' G2 shares `y_i*G2` (each checked by the pairing `e(Y_i, G2) = e(G1, Y2_i)` plus a G2 subgroup test) and re-checked against `Q` by `e(Q, G2) = e(G1, Q2)`; a wrong `Q2` is refused at load. It is stored in the public bundle. |
-| decrypt a cell / `SUM` / `k*SUM` | the existing threshold decryption: the owner sends `E = C1` to the custodians, each answers `y_i*E` with a DLEQ proof against its verification key, the client combines `s*C1 = sum(lambda_i * y_i*E)`. Batched: a `SELECT` of n cells is one round (n points per custodian request). |
-| decrypt `DOT` | `M = c11 * c01^-s * c10^-s * c00^(s^2)` by **threshold exponentiation in GT**: custodian i returns `c^(y_i)` with a Chaum-Pedersen proof, the client combines `c^s = prod(D_i^lambda_i)`. `s^2` is **two sequential rounds** (`u = c00^s`, then `u^s`); `s*s` is never computed. |
+| encrypt | needs only `Q = X1` and `Q2`. `Q2` is assembled from the second key's G2 shares `y_i*G2` (each checked by the pairing `e(Y_i, G2) = e(G1, Y2_i)` plus a G2 subgroup test), re-checked by `e(X2, G2) = e(G1, Q2)`, and refused if it also equals `s*G2`. It is stored in the public bundle and re-verified at every load. |
+| decrypt a cell / `SUM` / `k*SUM` | the existing threshold decryption on key 1: the owner sends `E = C1`, each custodian answers `y_i*E` with a DLEQ proof, the client combines `s*C1 = sum(lambda_i * y_i*E)`. Batched: a `SELECT` of n cells is one round. |
+| decrypt `DOT` | `M = c11 * c01^-s2 * c10^-s * c00^(s*s2)` by **threshold exponentiation in GT**: custodian i returns `c^(y_i)` with a Chaum-Pedersen proof, the client combines `c^s = prod(D_i^lambda_i)`. Round 1 (key 1): `c00^s`, `c10^s`. Round 2 (key 2): `c01^s2` and `(c00^s)^s2`. `s*s2` is never computed — the second round's input is `c00^s`. |
 | integrity tags | see the MAC trade-off below. |
 
 **Soundness of the GT proof** (`torussql/custody/gt.py`). Statement: `Y_i = y_i*G1` is custodian i's public
@@ -150,7 +164,7 @@ The challenge also binds the key id, epoch and a per-use context, so a transcrip
 Exponentiation by the secret `y_i` is split-scalar blinded like the G1 code, which is *not* constant-time.
 
 **What the custodians learn.** A custodian sees the ciphertext elements it is asked to exponentiate
-(`E`, `c`) and, for `s^2`, the intermediate `c00^s` — exactly the information the data owner would
+(`E`, `c`) and, for `DOT`, the intermediate `c00^s` (sent to the s2 custodians) — exactly the information the data owner would
 have, no more; it does not see other custodians' shares, plaintexts or results beyond that. Like the vault envelope
 this is a **decryption oracle for whoever holds a caller token**: any token holder can have *any* ciphertext opened
 (it cannot be tied to "this column"). Inputs are validated (canonical encoding, on-curve / subgroup membership,
@@ -161,7 +175,7 @@ vault unsealing). Treat tokens as decryption capabilities.
 
 **Integrity tags and the MAC secret (trade-off).** Tags need `alpha` and per-cell `gamma`, which for a plain
 `FheKey` are PRFs of `s`. With a threshold key nobody holds `s`, so a **separate random 32-byte MAC secret** is generated
-at `fhe-keygen-threshold`, sealed under the threshold envelope (`wrap_key`/`unwrap_key`, authenticated, bound to the key id
+at `fhe-keygen-threshold`, sealed under key 1's threshold envelope (`wrap_key`/`unwrap_key`, authenticated, bound to the key id
 and purpose) and stored in the public bundle. It is opened by a quorum **lazily and only when `authenticated=True` is
 used**; the owner process then holds it in memory. Consequence: that process (and anyone who compromises it) can
 forge tags — i.e. defeat integrity checking against a lying server — but **can not decrypt anything**, because the
@@ -170,9 +184,9 @@ MAC secret is unrelated to `s`. Without `authenticated=True` the MAC secret is n
 clear error). Rotating the MAC secret means re-tagging the data.
 
 **Limits.** Every threshold read/decryption needs a live quorum (that is the point); latency is network round trips
-plus pure-Python proof checking (a `DOT` decryption of a 3-of-5 quorum takes ~2 s: two GT rounds). The custody code
+plus pure-Python proof checking (a `DOT` decryption takes ~2 s: two sequential GT rounds, one per key). The custody code
 is pure Python; the exponentiations are variable-time. `DOT` has no integrity protection, same as before.
-Refresh/reshare of the custody shares keeps `Q`, `Q2` and the bundle valid (the key id is unchanged).
+Refresh/reshare of either key's shares keeps `Q`, `Q2` and the bundle valid (key ids are unchanged).
 `secp256k1` custody keys cannot be used (the pairing groups are BN254).
 
 ## Wire / storage format

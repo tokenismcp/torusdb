@@ -37,18 +37,28 @@ def test_out_of_range_results_raise_instead_of_returning_garbage():
         big.encrypt(101)
 
 
-def test_no_value_oracle_for_the_evaluator():
-    """With the public key alone nobody can test 'does this cell encrypt v?'
-    (the test that breaks shared-randomness paired ciphertexts)."""
+def test_no_value_oracle_even_for_someone_holding_both_public_keys():
+    """Try every pairing identity between the cell and the PUBLIC keys Q (G1) and Q2 (G2)."""
     from py_ecc.optimized_bn128 import G2 as PG2
-    ct = KEY.encrypt(1234)
+    be = fhe._fb.get("pyecc")
+    key = fhe.FheKey(KEY._s, 50_000, backend="pyecc")
+    ct = key.encrypt(1234)
     c1, c2, d1, d2 = fhe.parse_cell(ct, "pyecc")
-    Q = fhe._fb.get("pyecc").g1_mul(fhe._fb.get("pyecc").G1, KEY._s)
-    for v in (1234, 1, 0):
-        lhs = pairing(PG2, add(c2, neg(multiply(G1, v))))
-        assert lhs != pairing(d1, Q)
-    # encryption is randomised: equal plaintexts give unrelated ciphertexts
-    assert KEY.encrypt(5) != KEY.encrypt(5)
+    Q, Q2 = key.Q, key.Q2
+    assert Q2 != be.g2_mul(be.G2, key._s)                 # the G2 key is NOT s·G2
+
+    def identities(v):
+        a1 = pairing(PG2, add(c2, neg(multiply(G1, v))))              # e(G2, C2 − vP)
+        a2 = pairing(add(d2, neg(multiply(PG2, v))), G1)              # e(D2 − vG2, P)
+        return [a1 == pairing(Q2, c1), a1 == pairing(d1, Q),
+                a2 == pairing(d1, Q), a2 == pairing(Q2, c1),
+                pairing(d1, c2) == pairing(d2, c1) if v == 0 else False]
+    for v in (1234, 1, 0, 7):
+        assert not any(identities(v)), v
+    # positive control: with the WEAK key Q2 = s·G2 the same test does confirm the true value
+    weak_Q2 = multiply(PG2, key._s)
+    assert pairing(PG2, add(c2, neg(multiply(G1, 1234)))) == pairing(weak_Q2, c1)
+    assert key.encrypt(5) != key.encrypt(5)               # randomised
 
 
 def test_malformed_ciphertexts_are_rejected():

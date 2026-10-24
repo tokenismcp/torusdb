@@ -175,8 +175,12 @@ def _parser() -> argparse.ArgumentParser:
                          "fhe-keygen-threshold`; s lives only as custodian shares "
                          "(needs --custody-public, --custodian, --custody-token-env)")
     ap.add_argument("--custody-public", metavar="PATH", help="custody public key (bn254)")
+    ap.add_argument("--custody-public2", metavar="PATH",
+                    help="custody public key of the second secret s2 (bn254)")
     ap.add_argument("--custodian", action="append", metavar="HOST:PORT",
-                    help="custodian daemon (repeat); used with --fhe-threshold")
+                    help="custodian daemon serving s (repeat); used with --fhe-threshold")
+    ap.add_argument("--custodian2", action="append", metavar="HOST:PORT",
+                    help="custodian daemon serving s2 (repeat); needed for DOT")
     ap.add_argument("--custody-token-env", metavar="VAR",
                     help="env var with the custodian caller token")
     ap.add_argument("--custody-tls", action="store_true")
@@ -193,19 +197,23 @@ def _threshold_key(a):
     from torusdb_core.fhe_threshold import ThresholdFheKey
     from torussql.custody import PublicKey
     from torussql.custody.net import RemoteCustodian
-    if not (a.custody_public and a.custodian and a.custody_token_env):
-        raise ValueError("--fhe-threshold needs --custody-public, --custodian and "
-                         "--custody-token-env")
+    if not (a.custody_public and a.custody_public2 and a.custodian and a.custody_token_env):
+        raise ValueError("--fhe-threshold needs --custody-public, --custody-public2, "
+                         "--custodian and --custody-token-env")
     tok = os.environ.get(a.custody_token_env)
     if not tok:
         raise ValueError(f"${a.custody_token_env} is not set")
-    pub = PublicKey.load(a.custody_public)
-    nodes = []
-    for spec in a.custodian:
-        host, _, port = spec.rpartition(":")
-        nodes.append(RemoteCustodian(host.strip("[]"), int(port), tok, group=pub.g,
-                                     tls=a.custody_tls, cafile=a.custody_cafile))
-    return ThresholdFheKey.load(a.fhe_threshold, pub, nodes)
+    pub, pub2 = PublicKey.load(a.custody_public), PublicKey.load(a.custody_public2)
+
+    def nodes(specs, p):
+        out = []
+        for spec in specs:
+            host, _, port = spec.rpartition(":")
+            out.append(RemoteCustodian(host.strip("[]"), int(port), tok, group=p.g,
+                                       tls=a.custody_tls, cafile=a.custody_cafile))
+        return out
+    return ThresholdFheKey.load(a.fhe_threshold, pub, nodes(a.custodian, pub), pub2,
+                                nodes(a.custodian2, pub2) if a.custodian2 else None)
 
 
 def main(argv=None) -> int:

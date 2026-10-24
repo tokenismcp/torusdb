@@ -77,6 +77,17 @@ fn vectors_every_cell_sum_scaled_sum_and_dot_blob_decrypts() {
 }
 
 #[test]
+fn vectors_s2_derivation_q_g1_and_q2_g2() {
+    let v = vec_json();
+    let key = vec_key();
+    assert_eq!(fhe_internals::hex(&key.s2_bytes()), v["s2"].as_str().unwrap());
+    let (q1, q2) = key.public_key().unwrap();
+    assert_eq!(fhe_internals::hex(&q1), v["q_g1"].as_str().unwrap());
+    assert_eq!(fhe_internals::hex(&q2), v["q2_g2"].as_str().unwrap());
+    assert_ne!(v["s2"], v["secret"]);
+}
+
+#[test]
 fn vectors_gt_generators_are_the_published_constants_and_have_order_n() {
     let v = vec_json();
     let g = &v["gt_generators"];
@@ -786,6 +797,7 @@ fn cross_implementation_cells_written_by_rust_are_read_by_python_and_vice_versa(
             q(format!("SELECT 3 * SUM(rate), -2 * SUM(hours) FROM {t}")),
             q(format!("SELECT DOT(rate, hours) FROM {t} WHERE dept = 5")),
             ["indep", t, "rate"],
+            ["oracle", t, "rate", [40, 55, 30, 20]],
             // Python writes, Rust reads below
             ["exec", format!("INSERT INTO {t} (id, dept, rate, hours) VALUES (5, 5, -9, 11)")],
             ["exec", format!("UPDATE {t} SET rate = 77 WHERE id = 3")],
@@ -796,6 +808,8 @@ fn cross_implementation_cells_written_by_rust_are_read_by_python_and_vice_versa(
         assert_eq!(res[2], json!([[435, -1060]]));
         assert_eq!(res[3], json!([[DOT_D5]]));
         assert_eq!(res[4], json!([true, true, true, true])); // r1 != r2 in every cell we wrote
+        assert_eq!(res[5], json!([false, false, false, false])); // e(G2, C2 - v*G1) == e(Q2, C1) never holds: no value oracle
+        assert_eq!(res[6], json!([true, true, true, true])); // control: with the broken Q2 = s*G2 it WOULD hold
         assert_eq!(db.select(t, &["id", "rate", "hours"], id_is(5)).unwrap(), vec![vec![ci(5), ci(-9), ci(11)]]);
         assert_eq!(int(db.sum(t, "rate", all()).unwrap()), 40 + 55 + 77 + 20 - 9);
         assert_eq!(int(db.scaled_sum(t, "hours", 2, all()).unwrap()), 2 * (160 + 150 + 120 + 100 + 11));

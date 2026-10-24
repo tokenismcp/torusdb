@@ -37,6 +37,21 @@ def main():
             elif kind == "loadkey":                      # a key file written by the TypeScript driver
                 k = fhe.load_key(sql, op[2])
                 out.append([k.secret_bytes.hex(), k.range])
+            elif kind == "oracle":                       # the public-key pair identity must NOT reveal a guessed value
+                from py_ecc.optimized_bn128 import G1, G2, add, multiply, neg, pairing
+                import base64
+                table, col, vals = sql, op[2], op[3]
+                ids = conn._wire.call("matching_rowids", [table, None])
+                cells = conn._wire.call("plain_cells", [table, col, ids])
+                res, ctrl = [], []
+                for w, v in zip(cells, vals):
+                    c1, c2, d1, d2 = fhe.parse_cell(base64.b64decode(w["v"]), "pyecc")
+                    lhs = pairing(G2, add(c2, neg(multiply(G1, v))))
+                    res.append(lhs == pairing(key.Q2, c1))
+                    # control: the BROKEN public key Q2 = s*G2 would make the identity hold (test has teeth)
+                    ctrl.append(lhs == pairing(multiply(G2, key._s), c1))
+                out.append(res)
+                out.append(ctrl)
             elif kind == "indep":                        # r1 != r2 in every cell: e(D1,G1) != e(G2,C1)
                 from py_ecc.optimized_bn128 import G1, G2, pairing
                 table, col = sql, op[2]

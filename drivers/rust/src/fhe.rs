@@ -9,7 +9,7 @@
 //! it with high resolution. The server only ever sees ciphertexts.
 
 use crate::error::{Error, Kind};
-use crate::hash::{hmac_sha256, hmac_sha512, scrypt};
+use crate::hash::{hmac_sha256, hmac_sha512, scrypt, sha512};
 use num_bigint::{BigInt, BigUint};
 use num_integer::Integer;
 use num_traits::{One, Zero};
@@ -950,6 +950,7 @@ fn check_range(range: u64) -> Result<u64> {
 // ── the key ──────────────────────────────────────────────────────────────────
 struct KeyInner {
     s: BigUint,
+    s2: BigUint, // second secret: Q2 = s2*G2 (NEVER s*G2, that is a value oracle)
     secret: [u8; 32],
     range: u64,
     q_tab: OnceLock<Table<Fp>>,
@@ -976,8 +977,13 @@ impl FheKey {
         }
         let range = check_range(range)?;
         let secret = be32(&s);
+        // s2 = int(SHA-512("torussql/fhe/v2/g2-secret\0" || s as 32 big-endian bytes)) mod (n-1) + 1
+        let mut seed = b"torussql/fhe/v2/g2-secret\0".to_vec();
+        seed.extend_from_slice(&secret);
+        let s2 = BigUint::from_bytes_be(&sha512(&seed)) % (group_order() - 1u32) + 1u32;
         Ok(FheKey(Arc::new(KeyInner {
             s,
+            s2,
             secret,
             range,
             q_tab: OnceLock::new(),
@@ -1080,6 +1086,17 @@ impl FheKey {
         Ok(())
     }
 
+    /// The public key: `(q_g1 = s*G1 (64 bytes), q2_g2 = s2*G2 (128 bytes))`.
+    pub fn public_key(&self) -> Result<(Vec<u8>, Vec<u8>)> {
+        let q1 = c1().to_affine(&c1().mul_fixed(g1_base(), &self.0.s)?);
+        let q2 = c2().to_affine(&c2().mul_fixed(g2_base(), &self.0.s2)?);
+        Ok((g1_to(&q1), g2_to(&q2)))
+    }
+    /// The second secret `s2` as 32 big-endian bytes (for known-answer tests).
+    pub fn s2_bytes(&self) -> [u8; 32] {
+        be32(&self.0.s2)
+    }
+
     /// Plaintexts and results must lie in `[-range, range]`.
     pub fn range(&self) -> u64 {
         self.0.range
@@ -1099,7 +1116,7 @@ impl FheKey {
     }
     fn q2_tab(&self) -> Result<&Table<Fp2>> {
         if self.0.q2_tab.get().is_none() {
-            let q = c2().to_affine(&c2().mul_fixed(g2_base(), &self.0.s)?).unwrap();
+            let q = c2().to_affine(&c2().mul_fixed(g2_base(), &self.0.s2)?).unwrap();
             let _ = self.0.q2_tab.set(c2().fixed_table(&q));
         }
         Ok(self.0.q2_tab.get().unwrap())
@@ -1169,10 +1186,10 @@ impl FheKey {
         g1_dlog(&self.opened(cell)?, self.0.range)
     }
 
-    /// Decrypt a DOT blob: `M = c11 * c01^-s * c10^-s * c00^(s^2) = g^(sum a_i b_i)`, then a bounded
-    /// dlog. The four components are the server's (untrusted) answer: the two raised to
-    /// secret-dependent powers are first checked to lie in GT (order n), which closes the
-    /// small-subgroup oracle a hostile server could otherwise use against `s`.
+    /// Decrypt a DOT blob: `M = c11 * c01^-s2 * c10^-s * c00^(s*s2) = g^(sum a_i b_i)`, then a bounded
+    /// dlog. The four components are the server's (untrusted) answer: those raised to secret-dependent
+    /// powers (all but c11) are first checked to lie in GT (order n), which closes the small-subgroup
+    /// oracle a hostile server could otherwise use against `s` and `s2`.
     pub fn decrypt_dot(&self, blob: &[u8]) -> Result<i64> {
         if blob.len() != FHE_DOT_BYTES {
             return Err(proto("bad DOT ciphertext"));
@@ -1184,12 +1201,13 @@ impl FheKey {
         let comp = |i: usize| Fp12::from_bytes(&blob[1 + i * FHE_GT_BYTES..1 + (i + 1) * FHE_GT_BYTES]);
         let (c00, c01, c10, c11) = (comp(0)?, comp(1)?, comp(2)?, comp(3)?);
         let n = group_order();
-        let c0110 = c01.mul(&c10);
-        if c00.pow(n) != Fp12::one() || c0110.pow(n) != Fp12::one() {
-            return Err(proto("DOT result is not an element of the target group (hostile or damaged server answer)"));
+        for c in [&c00, &c01, &c10] {
+            if c.pow(n) != Fp12::one() {
+                return Err(proto("DOT result is not an element of the target group (hostile or damaged server answer)"));
+            }
         }
-        let s = &self.0.s;
-        let mm = c11.mul(&Fp12::pow2(&c0110, &(n - s), &c00, &((s * s) % n)));
+        let (s, s2) = (&self.0.s, &self.0.s2);
+        let mm = c11.mul(&Fp12::pow2(&c01, &(n - s2), &c10, &(n - s))).mul(&c00.pow(&((s * s2) % n)));
         gt_dlog(&mm, tag, self.0.range)
     }
 

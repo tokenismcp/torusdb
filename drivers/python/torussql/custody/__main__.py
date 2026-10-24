@@ -10,8 +10,9 @@ Typical production flow (one command per custodian host):
                        dealerless key generation (exchange the files in ``--out``)
   serve                run the custodian daemon holding one share
   open-test            prove a quorum can open a fresh envelope
-  fhe-keygen-threshold turn a bn254 key into an FHE-column key: derive the G2 public key
-                       from the custodians, seal a MAC secret, write the PUBLIC bundle
+  fhe-keygen-threshold turn TWO independent bn254 keys (s and s2; two DKGs on the same
+                       custodian hosts) into an FHE-column key: derive Q2 = s2*G2 from the
+                       second key's custodians, seal a MAC secret, write the PUBLIC bundle
   fhe-open-test        encrypt/decrypt (cell, SUM, DOT, MAC) through a quorum with a bundle
   reshare-start / reshare-finish
                        proactive refresh / change k, n / replace a custodian
@@ -343,13 +344,13 @@ def cmd_open_test(a):
     sys.exit(0 if got == K else 1)
 
 
-def _fhe_custodians(a, pub: PublicKey):
+def _fhe_custodians(a, pub: PublicKey, specs=None):
     tok = os.environ.get(a.token_env or "")
     if not tok:
         raise SystemExit("set the caller token in the environment variable named by --token-env "
                          "(tokens are never accepted on the command line)")
     custs = []
-    for spec in a.custodian:
+    for spec in (a.custodian if specs is None else specs):
         host, port = _hostport(spec)
         custs.append(RemoteCustodian(host, port, tok, group=pub.g, tls=a.tls, cafile=a.cafile,
                                      tls_insecure=a.tls_insecure, allow_insecure=a.allow_insecure))
@@ -370,17 +371,20 @@ def cmd_fhe_keygen_threshold(a):
     """After the bn254 DKG: Q2 from the custodians (pairing-verified), a MAC secret sealed
     under the threshold envelope, and one PUBLIC bundle file. No secret is written."""
     from torusdb_core.fhe_threshold import ThresholdFheKey
-    pub = PublicKey.load(a.public)
-    if pub.group != "bn254":
-        raise SystemExit("an FHE key needs a 'bn254' custody key (run the DKG with --group bn254)")
+    pub, pub2 = PublicKey.load(a.public), PublicKey.load(a.public2)
+    if pub.group != "bn254" or pub2.group != "bn254":
+        raise SystemExit("an FHE key needs 'bn254' custody keys (run the DKGs with --group bn254)")
+    if pub.key_id == pub2.key_id:
+        raise SystemExit("--public and --public2 must be two DIFFERENT keys (two separate DKGs)")
     if os.path.exists(a.out):
         raise SystemExit(f"{a.out} already exists")
-    key = ThresholdFheKey.create(pub, _fhe_custodians(a, pub), with_mac=not a.no_mac,
+    key = ThresholdFheKey.create(pub, _fhe_custodians(a, pub), pub2,
+                                 _fhe_custodians(a, pub2, a.custodian2), with_mac=not a.no_mac,
                                  value_range=a.range)
     _fhe_selftest(key, dot=False)
     key.save_bundle(a.out)
     print(f"threshold FHE bundle written to {a.out} (range +-{a.range}, key {pub.key_id}, "
-          f"quorum {pub.k}-of-{pub.n}); it holds NO secret: s exists only as custodian shares")
+          f"quorum {pub.k}-of-{pub.n}); it holds NO secret: s and s2 exist only as custodian shares")
     print("cell/SUM self-test through the quorum: OK")
     if not a.no_mac:
         print("NOTE: an owner process using authenticated=True holds the opened "
@@ -389,8 +393,9 @@ def cmd_fhe_keygen_threshold(a):
 
 def cmd_fhe_open_test(a):
     from torusdb_core.fhe_threshold import ThresholdFheKey
-    pub = PublicKey.load(a.public)
-    key = ThresholdFheKey.load(a.bundle, pub, _fhe_custodians(a, pub))
+    pub, pub2 = PublicKey.load(a.public), PublicKey.load(a.public2)
+    key = ThresholdFheKey.load(a.bundle, pub, _fhe_custodians(a, pub), pub2,
+                               _fhe_custodians(a, pub2, a.custodian2))
     _fhe_selftest(key, dot=not a.skip_dot)
     if a.mac:
         key.alpha
@@ -478,8 +483,13 @@ def main(argv=None):
     for name, fn in (("fhe-keygen-threshold", cmd_fhe_keygen_threshold),
                      ("fhe-open-test", cmd_fhe_open_test)):
         p = add(name, fn)
-        p.add_argument("--public", required=True, help="custody public key (group bn254)")
-        p.add_argument("--custodian", action="append", required=True, metavar="HOST:PORT")
+        p.add_argument("--public", required=True, help="custody public key of the secret s (bn254)")
+        p.add_argument("--custodian", action="append", required=True, metavar="HOST:PORT",
+                       help="custodian daemon serving the share of s (repeat)")
+        p.add_argument("--public2", required=True,
+                       help="custody public key of the INDEPENDENT second secret s2 (bn254)")
+        p.add_argument("--custodian2", action="append", required=True, metavar="HOST:PORT",
+                       help="custodian daemon serving the share of s2 (repeat)")
         p.add_argument("--token-env", required=True, metavar="VAR",
                        help="environment variable holding the caller token")
         p.add_argument("--tls", action="store_true"); p.add_argument("--cafile")

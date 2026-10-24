@@ -206,7 +206,8 @@ class Quorum:
         return out
 
     def shared_g2(self) -> bytes:
-        """``Q2 = x*G2`` assembled from the custodians' pairing-verified G2 shares (the
+        """``Q2 = x*G2`` (x = the secret THIS quorum serves; for FHE columns the second
+        secret s2) assembled from the custodians' pairing-verified G2 shares (the
         result is also checked against the public key ``X`` by a pairing)."""
         from . import gt as _gt
         pub = self.public

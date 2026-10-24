@@ -182,7 +182,8 @@ A `bn254` custody key can be the secret of `FHE` columns (`docs/fhe-columns.md`,
 FHE key"). Custodians gain three key-service methods, all under the existing `key` permission and the same
 `approve` / rate-limit / audit machinery: `partial_batch` (many G1 points per request, rate charged per
 item), `gt_partial_batch` (GT exponentiation with a Chaum-Pedersen proof, for `DOT`) and `g2_partial` (the
-G2 share used once to publish `Q2`). `python -m torussql.custody fhe-keygen-threshold` / `fhe-open-test`
+G2 share used once to publish `Q2 = s2*G2`; the FHE scheme needs TWO independent bn254 keys, `s` and `s2`,
+from two DKGs on the same hosts, each served by its own daemon). `python -m torussql.custody fhe-keygen-threshold` / `fhe-open-test`
 are the ceremony and check commands.
 
 ## 3. What it protects — and what it does not

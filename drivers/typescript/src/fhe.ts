@@ -8,7 +8,7 @@
 // NOT constant-time: BigInt arithmetic leaks timing. Do not expose decryption to an attacker who
 // can measure it with high resolution (the server only ever sees ciphertexts).
 
-import { createHmac, randomBytes, scryptSync } from "crypto";
+import { createHash, createHmac, randomBytes, scryptSync } from "crypto";
 import * as fs from "fs";
 import * as path from "path";
 import * as util from "util";
@@ -641,6 +641,7 @@ function toBigInt(v: bigint | number, what: string): bigint {
  */
 export class FheKey {
   #s: bigint;
+  #s2: bigint;                       // second secret: Q2 = s2*G2 (NEVER s*G2, that is a value oracle)
   #secret: Buffer;
   #range: number;
   #qTab?: Array<Array<Aff<bigint>>>;
@@ -652,6 +653,8 @@ export class FheKey {
     if (!(s > 0n && s < N)) throw usage("FHE secret out of range [1, n)");
     this.#s = s;
     this.#secret = be32(s);
+    // s2 = int(SHA-512("torussql/fhe/v2/g2-secret\0" || s as 32 big-endian bytes)) mod (n-1) + 1
+    this.#s2 = (BigInt("0x" + createHash("sha512").update(Buffer.concat([Buffer.from("torussql/fhe/v2/g2-secret\0"), this.#secret])).digest("hex")) % (N - 1n)) + 1n;
     this.#range = checkRange(range);
   }
 
@@ -723,6 +726,16 @@ export class FheKey {
     try { fs.renameSync(tmp, file); } catch (e) { fs.rmSync(tmp, { force: true }); throw e; }
   }
 
+  /** The public key: `q_g1 = s*G1` (64 bytes) and `q2_g2 = s2*G2` (128 bytes), as published in the vectors. */
+  publicKey(): { q_g1: Buffer; q2_g2: Buffer } {
+    return {
+      q_g1: g1To(C1.toAffine(C1.mulFixed(g1Base(), this.#s))),
+      q2_g2: g2To(C2.toAffine(C2.mulFixed(g2Base(), this.#s2))),
+    };
+  }
+  /** The second secret `s2` as 32 big-endian bytes (for known-answer tests). */
+  s2Bytes(): Buffer { return be32(this.#s2); }
+
   /** Plaintexts and results must lie in [-range, range]. */
   get range(): number { return this.#range; }
   /** The secret as 32 big-endian bytes (a copy). */
@@ -733,7 +746,7 @@ export class FheKey {
 
   // ── encryption (public data only) ──
   private qTab() { return (this.#qTab ??= C1.fixedTable(C1.toAffine(C1.mulFixed(g1Base(), this.#s))!)); }
-  private q2Tab() { return (this.#q2Tab ??= C2.fixedTable(C2.toAffine(C2.mulFixed(g2Base(), this.#s))!)); }
+  private q2Tab() { return (this.#q2Tab ??= C2.fixedTable(C2.toAffine(C2.mulFixed(g2Base(), this.#s2))!)); }
 
   /** Encrypt an integer with |v| <= range: a 384-byte cell. r1 and r2 are independent random scalars. */
   encrypt(v: bigint | number): Buffer {
@@ -780,21 +793,22 @@ export class FheKey {
     return g1Dlog(this.opened(cell, 0), this.#range);
   }
 
-  /** Decrypt a DOT blob: `M = c11 * c01^-s * c10^-s * c00^(s^2) = g^(sum a_i b_i)`, then a bounded dlog.
-   *  The four components are the server's (untrusted) answer: the two that are raised to
-   *  secret-dependent powers are first checked to lie in GT (order n), which closes the
-   *  small-subgroup oracle a hostile server could otherwise use against `s`. */
+  /** Decrypt a DOT blob: `M = c11 * c01^-s2 * c10^-s * c00^(s*s2) = g^(sum a_i b_i)`, then a bounded dlog.
+   *  The four components are the server's (untrusted) answer: those raised to secret-dependent
+   *  powers (all but c11) are first checked to lie in GT (order n), which closes the small-subgroup
+   *  oracle a hostile server could otherwise use against `s` and `s2`. */
   decryptDot(blob: Uint8Array): number {
     if (blob.length !== FHE_DOT_BYTES) throw proto("bad DOT ciphertext");
     const tag = blob[0];
     if (tag !== 1 && tag !== 2) throw proto("unknown DOT back-end tag");
     const c00 = fp12From(blob, 1), c01 = fp12From(blob, 385), c10 = fp12From(blob, 769), c11 = fp12From(blob, 1153);
-    const c0110 = fp12Mul(c01, c10);
-    if (!fp12Eq(fp12Pow(c00, N), FP12_ONE) || !fp12Eq(fp12Pow(c0110, N), FP12_ONE)) {
-      throw proto("DOT result is not an element of the target group (hostile or damaged server answer)");
+    for (const c of [c00, c01, c10]) {
+      if (!fp12Eq(fp12Pow(c, N), FP12_ONE)) {
+        throw proto("DOT result is not an element of the target group (hostile or damaged server answer)");
+      }
     }
-    const s = this.#s;
-    const M = fp12Mul(c11, fp12Pow2(c0110, N - s, c00, (s * s) % N));
+    const s = this.#s, s2 = this.#s2;
+    const M = fp12Mul(fp12Mul(c11, fp12Pow2(c01, N - s2, c10, N - s)), fp12Pow(c00, (s * s2) % N));
     return gtDlog(M, tag, this.#range);
   }
 

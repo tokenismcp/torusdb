@@ -39,6 +39,18 @@ test("vectors: every cell, SUM, scaled SUM and DOT blob of proto/fhe-vectors.jso
   assert.throws(() => mulDots(hex(VEC.dot_blob_pyecc), hex(VEC.dot_blob_mcl)), kind("ProtocolError"));
 });
 
+test("vectors: s2 derivation, Q = s*G1 and Q2 = s2*G2 (and Q2 is NOT s*G2)", () => {
+  const key = FheKey.fromHex(VEC.secret, VEC.range);
+  assert.equal(key.s2Bytes().toString("hex"), VEC.s2);
+  const pk = key.publicKey();
+  assert.equal(pk.q_g1.toString("hex"), VEC.q_g1);
+  assert.equal(pk.q2_g2.toString("hex"), VEC.q2_g2);
+  assert.notEqual(VEC.s2, VEC.secret);
+  // Q2 = s*G2 would be the broken scheme: it must differ from the published Q2
+  const bad = I.C2.toAffine(I.C2.mul(I.C2.fromAff(I.G2_AFF), BigInt("0x" + VEC.secret)))!;
+  assert.notEqual(Buffer.concat([bad.x[0], bad.x[1], bad.y[0], bad.y[1]].map((c) => Buffer.from(c.toString(16).padStart(64, "0"), "hex"))).toString("hex"), VEC.q2_g2);
+});
+
 test("vectors: GT generators are the published constants and have order n; G2 generator is on the twist", () => {
   assert.equal(I.fp12To(I.GT_GEN[1]).toString("hex"), VEC.gt_generators.pyecc_tag01);
   assert.equal(I.fp12To(I.GT_GEN[2]).toString("hex"), VEC.gt_generators.mcl_tag02);
@@ -623,6 +635,7 @@ T("cross-implementation: cells written by TypeScript are read by Python, and vic
           ["query", `SELECT 3 * SUM(rate), -2 * SUM(hours) FROM ${t}`],
           ["query", `SELECT DOT(rate, hours) FROM ${t} WHERE dept = 5`],
           ["indep", t, "rate"],
+          ["oracle", t, "rate", ROWS.map((r) => r[2])],
           // Python writes, TypeScript reads below
           ["exec", `INSERT INTO ${t} (id, dept, rate, hours) VALUES (5, 5, -9, 11)`],
           ["exec", `UPDATE ${t} SET rate = 77 WHERE id = 3`],
@@ -633,6 +646,8 @@ T("cross-implementation: cells written by TypeScript are read by Python, and vic
       assert.deepEqual(res[2], [[435, -1060]]);
       assert.deepEqual(res[3], [[DOT_D5]]);
       assert.deepEqual(res[4], new Array(4).fill(true));                      // r1 != r2 in every cell we wrote
+      assert.deepEqual(res[5], new Array(4).fill(false));                    // e(G2, C2 - v*G1) == e(Q2, C1) never holds: no value oracle
+      assert.deepEqual(res[6], new Array(4).fill(true));                     // control: with the broken Q2 = s*G2 it WOULD hold
       assert.deepEqual((await db.select(t, ["id", "rate", "hours"], eq("id", 5)))[0], { id: 5n, rate: -9n, hours: 11n });
       assert.equal(await db.sum(t, "rate"), BigInt(40 + 55 + 77 + 20 - 9));
       assert.equal(await db.scaledSum(t, "hours", 2), BigInt(2 * (160 + 150 + 120 + 100 + 11)));
