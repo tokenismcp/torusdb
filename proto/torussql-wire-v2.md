@@ -39,7 +39,9 @@ Row ids are non-negative integers, never reused.
 
 ## 4. Session
 
-1. `hello []` (no authentication required) → `{protocol, server, auth_required,
+1. `hello []` (no authentication required; since 0.5 the reply also carries `persistent` and `limits` =
+   `{max_items, fhe: {max_sum_rows, max_dot_rows{pyecc,mcl}, recommended_dot_rows{pyecc,mcl}, backends[], default_backend}}`
+   so clients can size their requests; absent on older servers) → `{protocol, server, auth_required,
    max_frame, persistent}`. A client must refuse `protocol` greater than it
    knows. A v1 server answers `hello` with an "unknown method"/`_rpc_hello`
    error; treat as protocol 1 (no auth, no transactions, no batch RPCs).
@@ -65,6 +67,7 @@ Row ids are non-negative integers, never reused.
 | `insert` | `[table, {col: value…}]` | rowid | rw |
 | `insert_many` | `[table, [{col: value…}…]]` | `[rowid…]` (atomic) | rw |
 | `update_cell` | `[table, id, col, value]` | `null` | rw |
+| `update_cells` | `[table, [[id, col, value], …]]` (≤ `limits.max_items`) | applied count; **atomic** — one bad item rolls the whole batch back | rw |
 | `delete_rows` | `[table, [ids]]` | count | rw |
 | `tx_begin` / `tx_commit` / `tx_rollback` | `[]` | `null` | rw |
 | `drop` | `[table]` | `null` | admin |

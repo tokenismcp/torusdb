@@ -82,7 +82,7 @@ READ_RPCS = frozenset({
     "blinded_per_row_scaled", "mult_combine_batch", "fhe_sum", "fhe_dot",
 })
 WRITE_RPCS = frozenset({
-    "create", "insert", "insert_many", "update_cell", "delete_rows",
+    "create", "insert", "insert_many", "update_cell", "update_cells", "delete_rows",
     "create_index", "drop_index",
     "tx_begin", "tx_commit", "tx_rollback", "tx_status",
 })
@@ -91,7 +91,8 @@ ADMIN_RPCS = frozenset({"drop", "stats", "checkpoint", "backup", "promote", "rep
                         "repl_snapshot_done"})
 PUBLIC_RPCS = frozenset({"hello", "ping", "auth"})
 MUTATIONS = frozenset({"create", "insert", "insert_many", "drop",
-                       "update_cell", "delete_rows", "create_index", "drop_index"})
+                       "update_cell", "update_cells", "delete_rows", "create_index",
+                       "drop_index"})
 ROLE_RPCS = {
     "ro": READ_RPCS,
     "rw": READ_RPCS | WRITE_RPCS,
@@ -594,7 +595,8 @@ class Engine:
             return {"protocol": PROTOCOL_VERSION, "server": SERVER_VERSION,
                     "auth_required": self._tokens is not None,
                     "max_frame": self.cfg.max_frame,
-                    "persistent": bool(self._path)}
+                    "persistent": bool(self._path),
+                    "limits": self._limits()}
         if method == "auth":
             if len(args) != 1:
                 raise BadRequest("auth takes one argument")
@@ -946,6 +948,19 @@ class Engine:
                 self.stats.bump("checkpoint_failures")
                 log.exception("checkpoint failed (data remains safe in the journal)")
 
+    def _limits(self) -> dict:
+        """What a client needs to size its requests (published in ``hello``)."""
+        import importlib.util
+        have_native = importlib.util.find_spec("mclbn256") is not None
+        return {"max_items": self.cfg.max_items,
+                "fhe": {"max_sum_rows": self.cfg.fhe_max_sum_rows,
+                        "max_dot_rows": {"pyecc": self.cfg.fhe_max_dot_rows,
+                                         "mcl": self.cfg.fhe_max_dot_rows_native},
+                        # sizes that finish well inside a 30 s client timeout
+                        "recommended_dot_rows": {"pyecc": 50, "mcl": 2000},
+                        "backends": ["pyecc"] + (["mcl"] if have_native else []),
+                        "default_backend": os.environ.get("TORUSDB_FHE_BACKEND", "auto")}}
+
     def _call(self, method: str, args: list):
         try:
             return getattr(self, f"_rpc_{method}")(*args)
@@ -998,6 +1013,29 @@ class Engine:
                         srv._rows[table].rewind(n0, mark)
                     raise
                 return rids, lambda: srv._rows[table].rewind(n0, mark)
+            if method == "update_cells":                 # atomic batch of cell updates
+                table, items = args
+                if (not isinstance(items, list) or len(items) > self.cfg.max_items
+                        or any(not isinstance(it, list) or len(it) != 3 for it in items)):
+                    raise BadRequest(f"update_cells takes [table, [[row, column, value], …]] "
+                                     f"with at most {self.cfg.max_items} items")
+                undos: list = []
+                try:
+                    for idx, col, wire_value in items:
+                        self._row(table, idx)
+                        if self._overlay is not None:
+                            self._overlay.note_update(table, srv._rows[table], idx)
+                        self._rpc_update_cell(table, idx, col, wire_value)
+                        undos.append(self._last_undo)
+                except BaseException:
+                    for u in reversed(undos):
+                        u()
+                    raise
+
+                def undo_all(undos=undos):
+                    for u in reversed(undos):
+                        u()
+                return len(items), undo_all
             if method == "update_cell":
                 table, idx, col, wire_value = args
                 self._row(table, idx)

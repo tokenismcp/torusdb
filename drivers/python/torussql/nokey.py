@@ -271,6 +271,12 @@ class RemoteNoKeyServer:
     def drop(self, table):
         self._c.call("drop", [table])
 
+    def update_cells(self, table, items):
+        return self._c.call("update_cells", [table, [[i, c, w.wv(v)] for i, c, v in items]])
+
+    def limits(self):
+        return dict(self._c.server_info.get("limits") or {})
+
     def fhe_sum(self, table, col, idxs, k=1):
         return _b64d(self._c.call("fhe_sum", [table, col, idxs] + ([k] if k != 1 else [])))
 

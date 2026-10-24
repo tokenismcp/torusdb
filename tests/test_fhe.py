@@ -367,13 +367,13 @@ def test_authenticated_insert_is_atomic_over_the_wire(tmp_path):
             assert c.execute("SELECT SUM(v) FROM t").rows == [[60]]
             assert c.execute("SELECT 2 * SUM(v) FROM t WHERE id > 1").rows == [[100]]
             # the tag write fails midway -> the row must not exist at all
-            real = c.client.server.update_cell
+            real_b, real_1 = c.client.server.update_cells, c.client.server.update_cell
             def boom(*a, **k):
                 raise RuntimeError("network died")
-            c.client.server.update_cell = boom
+            c.client.server.update_cells = c.client.server.update_cell = boom
             with pytest.raises(Exception):
                 c.execute("INSERT INTO t (id, v) VALUES (4, 40)")
-            c.client.server.update_cell = real
+            c.client.server.update_cells, c.client.server.update_cell = real_b, real_1
             assert c._wire.call("table_info", ["t"])["rows"] == 3
             assert c.execute("SELECT SUM(v) FROM t").rows == [[60]]
         # a server that tampers on disk is caught by a fresh authenticated client
@@ -435,3 +435,51 @@ def test_dot_decryption_refuses_components_outside_the_gt_subgroup(backend):
     small = fhe.FheKey(KEY._s, 10, backend="pyecc")
     with pytest.raises(fhe.FheError):
         small.decrypt_sum(fhe.sum_cells([KEY.encrypt(10), KEY.encrypt(10)], "pyecc"))
+
+
+# ── batch writes and negotiated limits ───────────────────────────────────────
+def test_update_cells_is_atomic_batched_and_hello_publishes_limits(tmp_path):
+    s = Running(db=str(tmp_path / "db"))
+    try:
+        with s.connect(fhe_key=KEY, authenticated=True) as c:
+            lim = c.server_info["limits"]
+            assert lim["max_items"] > 0 and lim["fhe"]["max_sum_rows"] > 0
+            assert lim["fhe"]["max_dot_rows"]["pyecc"] < lim["fhe"]["max_dot_rows"]["mcl"]
+            assert "pyecc" in lim["fhe"]["backends"] and lim["fhe"]["recommended_dot_rows"]["pyecc"] <= 100
+            c.execute("CREATE TABLE t (id INT PLAIN, v INT FHE)")
+            calls = []
+            real = c._wire.call
+            c._wire.call = lambda m, a: (calls.append(m), real(m, a))[1]
+            c.cursor().executemany("INSERT INTO t (id, v) VALUES (%s, %s)", [(i, i) for i in range(30)])
+            assert calls.count("update_cells") == 1 and "update_cell" not in calls   # ONE tag round trip, not 30
+            c._wire.call = real
+            assert c.execute("SELECT SUM(v) FROM t").rows == [[sum(range(30))]]
+            # atomic: a bad item rolls the whole batch back
+            before = c._wire.call("plain_cells", ["t", "v", [0, 1]])
+            good = {"t": "x", "v": __import__("base64").b64encode(KEY.encrypt(7)).decode()}
+            with pytest.raises(Exception, match="FHE"):
+                c._wire.call("update_cells", ["t", [[0, "v", good], [1, "v", {"t": "i", "v": "5"}]]])
+            assert c._wire.call("plain_cells", ["t", "v", [0, 1]]) == before
+            with pytest.raises(Exception, match="takes"):
+                c._wire.call("update_cells", ["t", [[0, "v"]]])
+    finally:
+        s.stop()
+
+
+def test_engine_sizes_requests_from_the_servers_limits(tmp_path):
+    s = Running(db=str(tmp_path / "db"))
+    try:
+        with s.connect(fhe_key=KEY) as c:
+            c.execute("CREATE TABLE t (id INT PLAIN, v INT FHE)")
+            c.cursor().executemany("INSERT INTO t (id, v) VALUES (%s, %s)", [(i, i) for i in range(12)])
+            c.client.server.limits = lambda: {"fhe": {"max_sum_rows": 5, "max_dot_rows": {"pyecc": 4, "mcl": 4},
+                                                       "recommended_dot_rows": {"pyecc": 3, "mcl": 3}}}
+            sizes = []
+            real = c._wire.call
+            c._wire.call = lambda m, a: (sizes.append((m, len(a[2]))) if m.startswith("fhe_") else None, real(m, a))[1]
+            assert c.execute("SELECT SUM(v) FROM t").rows == [[66]]
+            assert c.execute("SELECT DOT(v, v) FROM t").rows == [[sum(i * i for i in range(12))]]
+            assert max(n for m, n in sizes if m == "fhe_sum") <= 5
+            assert max(n for m, n in sizes if m == "fhe_dot") <= 3
+    finally:
+        s.stop()

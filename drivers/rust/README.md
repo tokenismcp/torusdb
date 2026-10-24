@@ -186,6 +186,7 @@ db.dot_with_backend("emp", "rate", "hours", all(), Some(FheBackend::Pyecc))?; //
 * **Atomic tagged INSERT.** With `authenticated`, an INSERT/INSERT-many into a table with FHE columns runs in its own
   transaction (INSERT, then the row-bound tags), so a failure leaves no untagged row. Inside a transaction you opened
   yourself the error is returned and the half-written row stays in YOUR transaction: roll it back.
+* **Batched writes and server limits.** Tag writes after an authenticated INSERT and the value+tag writes of an FHE UPDATE go out in one atomic `update_cells` RPC per <= 2000 items (inside the same transaction); a server without it answers "unknown method" and the driver falls back to `update_cell` once and remembers. `fhe_sum` / `fhe_dot` / `update_cells` chunk sizes follow `hello.limits` (`max_sum_rows`, `recommended_dot_rows` of the requested back end - pyecc when unspecified - capped by `max_dot_rows`, `max_items`); older servers get the conservative defaults.
 * **Hostile DOT answers.** Before the secret is used as an exponent, `c00` and `c01*c10` of a DOT blob are checked
   to lie in the target group (order n); otherwise a hostile server could probe `s` modulo small prime factors of
   `p^12 - 1` through the success or failure of decryption.

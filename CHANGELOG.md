@@ -19,6 +19,13 @@ cryptographic self-audit, and the open repository made self-contained.
   from a separate MAC secret sealed under the threshold envelope. New custodian methods `partial_batch`,
   `gt_partial_batch`, `g2_partial`; CLI `fhe-keygen-threshold`, `fhe-open-test`, `torussql --fhe-threshold`.
 
+### Added — batch writes and negotiated limits (late 0.5.0)
+
+- RPC `update_cells`: an atomic batch of cell updates in one round trip (used for FHE integrity tags
+  and multi-row UPDATEs); `hello.limits` tells clients the per-request caps (FHE chunk sizes etc.).
+- Threshold (k-of-n) custody of the FHE key, FHE columns in the TypeScript and Rust drivers,
+  GT-subgroup checks before DOT decryption, strict value range on decryption.
+
 ### Added — FHE integrity tags, `k * SUM` (late 0.5.0)
 
 - `authenticated=True` now also protects FHE cells, `SUM`, `AVG` and `k * SUM(col)` with row-bound

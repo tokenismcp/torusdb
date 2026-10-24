@@ -140,6 +140,15 @@ class NoKeyServer:
     def update_cell(self, table: str, idx: int, col: str, value) -> None:
         self._rows[table].set_cell(idx, col, value)
 
+    def update_cells(self, table: str, items: list) -> int:
+        """Batch of ``(row, column, value)`` updates (atomic over the wire)."""
+        for idx, col, value in items:
+            self._rows[table].set_cell(idx, col, value)
+        return len(items)
+
+    def limits(self) -> dict:
+        return {}                                  # in-process: nothing to negotiate
+
     def delete_rows(self, table: str, idxs: list[int]) -> int:
         return len(self._rows[table].kill(idxs))
 
@@ -383,6 +392,7 @@ class NoKeyClient:
     # secret key of the FHE columns (torusdb_core.fhe.FheKey); None = no FHE columns
     fhe: Any = None
     fhe_allow_unverified_dot: bool = False
+    _batch_ok: bool = True                     # does the server know update_cells?
     # Tables whose column policies were learned from the (untrusted) server
     # rather than created/vaulted by this owner. A malicious server could relabel
     # an encrypted column "plain" and receive plaintext, so writes to such
@@ -526,11 +536,29 @@ class NoKeyClient:
         if not fcols:
             return
         key = self._fhe_key()
+        items = []
         for rowid, q in rows:
             given = dict(zip(q.columns, q.values))
             for c in fcols:
                 v = self._fhe_int(_literal_to_value(given[c], self._coltype[(table, c)]), c)
-                self.server.update_cell(table, rowid, _fmac_col(c), key.tag(v, table, c, rowid))
+                items.append((rowid, _fmac_col(c), key.tag(v, table, c, rowid)))
+        self._write_cells(table, items)
+
+    def _write_cells(self, table: str, items: list) -> None:
+        """One round trip for a batch of cell updates (falls back to one call per cell for
+        servers that predate ``update_cells``)."""
+        for i in range(0, len(items), 2000):
+            part = items[i:i + 2000]
+            if hasattr(self.server, "update_cells") and self._batch_ok:
+                try:
+                    self.server.update_cells(table, part)
+                    continue
+                except Exception as exc:                   # noqa: BLE001
+                    if "unknown method" not in str(exc):
+                        raise
+                    self._batch_ok = False
+            for rowid, col, v in part:
+                self.server.update_cell(table, rowid, col, v)
 
     def needs_transaction(self, sql: str) -> bool:
         """True when executing ``sql`` takes more than one server write that must be atomic
@@ -583,11 +611,11 @@ class NoKeyClient:
         # new masks are persisted (under a new version) BEFORE any cell changes
         extras = self.maskstore.stage_update(table, items) if items else []
         extra_by_row = {i: e for (i, _m), e in zip(items, extras)}
+        batch = []
         for i, _masks, cells in per_row:
-            for col, v in cells:
-                self.server.update_cell(table, i, col, v)
-            for col, v in extra_by_row.get(i, {}).items():
-                self.server.update_cell(table, i, col, v)
+            batch += [(i, col, v) for col, v in cells]
+            batch += [(i, col, v) for col, v in extra_by_row.get(i, {}).items()]
+        self._write_cells(table, batch)
         if items:
             self.maskstore.commit_update(table, items, extras)
         return len(idxs)
@@ -912,14 +940,22 @@ class NoKeyClient:
             raise ExecError(f"FHE column {col!r} holds integers only")
         return value
 
+    def _fhe_limits(self) -> dict:
+        """What the server said it accepts per request (``hello.limits.fhe``), if anything."""
+        try:
+            return dict((self.server.limits() or {}).get("fhe") or {})
+        except Exception:                                   # noqa: BLE001
+            return {}
+
     def _fhe_sum(self, table: str, col: str, idxs: list[int], k: int = 1) -> int:
         from . import fhe
         key = self._fhe_key()
         if not idxs:
             return 0
         total = tags = None
-        for i in range(0, len(idxs), self._FHE_SUM_CHUNK):
-            part_ids = idxs[i:i + self._FHE_SUM_CHUNK]
+        step = min(self._FHE_SUM_CHUNK, int(self._fhe_limits().get("max_sum_rows") or 10**9))
+        for i in range(0, len(idxs), step):
+            part_ids = idxs[i:i + step]
             part = self.server.fhe_sum(table, col, part_ids, k)
             total = part if total is None else fhe.add_sums(total, part)
             if self.authenticated:
@@ -945,7 +981,10 @@ class NoKeyClient:
         if not lids:
             return 0
         total = None
-        chunk = self._FHE_DOT_CHUNK_NATIVE if key.backend == "mcl" else self._FHE_DOT_CHUNK
+        lim = self._fhe_limits()
+        chunk = int((lim.get("recommended_dot_rows") or {}).get(key.backend)
+                    or (self._FHE_DOT_CHUNK_NATIVE if key.backend == "mcl" else self._FHE_DOT_CHUNK))
+        chunk = max(1, min(chunk, int((lim.get("max_dot_rows") or {}).get(key.backend) or chunk)))
         for i in range(0, len(lids), chunk):
             part = self.server.fhe_dot(lt, lc, lids[i:i + chunk],
                                        rt, rc, rids[i:i + chunk], key.backend)

@@ -249,8 +249,9 @@ function rawCall(host: string, port: number, m: string, a: unknown[]): Promise<a
 
 /** A proxy in front of `up` that rewrites `fhe_sum` requests (a lying server: modes scale, drop, dup,
  *  swapcol) or kills the connection when an integrity tag is written (mode killtag). */
-async function lyingProxy(up: RunningServer): Promise<{ server: net.Server; port: number; mode: { value: string } }> {
+async function lyingProxy(up: RunningServer): Promise<{ server: net.Server; port: number; mode: { value: string }; seen: string[] }> {
   const mode = { value: "none" };
+  const seen: string[] = [];
   const server = net.createServer((cli) => {
     const upc = net.createConnection({ host: up.host, port: up.port });
     let buf = Buffer.alloc(0);
@@ -260,6 +261,7 @@ async function lyingProxy(up: RunningServer): Promise<{ server: net.Server; port
         const n = buf.readUInt32BE(0);
         const req = JSON.parse(buf.subarray(4, 4 + n).toString());
         buf = buf.subarray(4 + n);
+        seen.push(req.m);
         if (req.m === "fhe_sum" && !String(req.a[1]).startsWith("__fmac__")) {
           const ids: number[] = req.a[2];
           if (mode.value === "scale") req.a[3] = (req.a[3] ?? 1) * 2;
@@ -267,7 +269,9 @@ async function lyingProxy(up: RunningServer): Promise<{ server: net.Server; port
           if (mode.value === "dup") req.a[2] = [...ids, ids[0]];
           if (mode.value === "swapcol") req.a[1] = "hours";
         }
-        if (mode.value === "killtag" && req.m === "update_cell" && String(req.a[2]).startsWith("__fmac__")) {
+        const tagWrite = (req.m === "update_cell" && String(req.a[2]).startsWith("__fmac__")) ||
+          (req.m === "update_cells" && req.a[1].some((it: any[]) => String(it[1]).startsWith("__fmac__")));
+        if (mode.value === "killtag" && tagWrite) {
           cli.destroy(); upc.destroy();                                  // the tag write never arrives
           return;
         }
@@ -280,7 +284,7 @@ async function lyingProxy(up: RunningServer): Promise<{ server: net.Server; port
     cli.on("error", () => undefined); upc.on("error", () => undefined);
   });
   await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
-  return { server, port: (server.address() as net.AddressInfo).port, mode };
+  return { server, port: (server.address() as net.AddressInfo).port, mode, seen };
 }
 const b64 = (b: Uint8Array) => Buffer.from(b).toString("base64");
 
@@ -648,4 +652,102 @@ T("cross-implementation: sealed key files interoperate with Python's save_key / 
   FheKey.fromHex(SECRET, 777).save(tsFile, "hunter2");
   const out = runPeer(mem.host, mem.port, { key: SECRET, ops: [["loadkey", tsFile, "hunter2"]] });
   assert.deepEqual(out, [[SECRET, 777]]);
+});
+
+// ── batched cell writes (update_cells) and server-published limits ───────────
+T("authenticated FHE writes use ONE update_cells call per batch; update_cells is atomic", async () => {
+  const key = FheKey.fromHex(SECRET, 100_000);
+  const px = await lyingProxy(mem);
+  const db = await Client.connect("127.0.0.1", px.port, { fheKey: key, authenticated: true, ...OPTS });
+  try {
+    const t = uniq("batch");
+    await seed(db, t, ROWS);
+    assert.equal(px.seen.filter((m) => m === "update_cell").length, 0);
+    assert.equal(px.seen.filter((m) => m === "update_cells").length, 4);          // one per single-row INSERT
+    let before = px.seen.length;
+    await db.insertMany(t, Array.from({ length: 6 }, (_, i) => ({ id: 10 + i, dept: 1, rate: i, hours: i })));
+    let calls = px.seen.slice(before);
+    assert.equal(calls.filter((m) => m === "update_cells").length, 1);            // 6 rows x 2 tags = 12 cells, one RPC
+    assert.equal(calls.includes("update_cell"), false);
+    before = px.seen.length;
+    assert.equal(await db.update(t, { rate: 7 }, eq("dept", 1)), 6);
+    calls = px.seen.slice(before);
+    assert.equal(calls.filter((m) => m === "update_cells").length, 1);            // 6 rows x (value + tag)
+    assert.equal(calls.includes("update_cell"), false);
+    assert.equal(await db.sum(t, "rate", eq("dept", 1)), 42n);                    // all tags verify
+    // atomicity on the server: the second item is invalid, so the first is rolled back too
+    const c1 = (await rawCall(mem.host, mem.port, "plain_cells", [t, "rate", [0]])).ok[0];
+    const r = await rawCall(mem.host, mem.port, "update_cells", [t, [[0, "rate", { t: "x", v: b64(key.encrypt(999)) }], [1, "rate", { t: "x", v: b64(Buffer.alloc(5)) }]]]);
+    assert.match(r.err, /FHE|ciphertext/);
+    assert.deepEqual((await rawCall(mem.host, mem.port, "plain_cells", [t, "rate", [0]])).ok[0], c1);
+    const ok = await rawCall(mem.host, mem.port, "update_cells", [t, [[0, "rate", c1]]]);
+    assert.equal(ok.ok, 1);
+  } finally { db.close(); px.server.close(); }
+});
+
+import { fake, HELLO } from "./fake";
+
+const FAKE_SCHEMA = [["id", "int", "plain"], ["v", "int", "fhe"]];
+function fheFake(hello: any, extra: (m: string, a: any[]) => any = () => undefined) {
+  const key = FheKey.fromHex(SECRET, 100_000);
+  const one = key.encrypt(1);
+  return fake((m, a) => {
+    const x = extra(m, a);
+    if (x !== undefined) return x;
+    switch (m) {
+      case "hello": return hello;
+      case "tables": return { ok: ["t"] };
+      case "schema": return { ok: FAKE_SCHEMA };
+      case "matching_rowids": return { ok: Array.from({ length: 20 }, (_, i) => i) };
+      case "fhe_sum": return { ok: sumCells((a[2] as number[]).map(() => one)).toString("base64") };
+      case "fhe_dot": { const d = Buffer.from(VEC.dot_blob_pyecc, "hex"); if (a[6] === "mcl") d[0] = 2; return { ok: d.toString("base64") }; }
+      case "update_cells": return { ok: (a[1] as unknown[]).length };
+      case "insert_many": return { ok: (a[1] as unknown[]).map((_, i) => i) };
+      case "insert": return { ok: 0 };
+      case "tx_begin": case "tx_commit": return { ok: null };
+      default: return { ok: null };
+    }
+  });
+}
+const helloWith = (limits?: unknown) => ({ ok: { ...HELLO.ok, ...(limits ? { limits } : {}) } });
+const LIMITS = { max_items: 3, fhe: { max_sum_rows: 7, max_dot_rows: { pyecc: 5, mcl: 6 },
+  recommended_dot_rows: { pyecc: 3, mcl: 4 }, backends: ["pyecc"], default_backend: "auto" } };
+
+test("hello.limits shrinks fhe_sum / fhe_dot / update_cells chunks; without limits the defaults apply", async () => {
+  const key = FheKey.fromHex(SECRET, 100_000);
+  for (const withLimits of [true, false]) {
+    const f = await fheFake(helloWith(withLimits ? LIMITS : undefined));
+    const plain = await Client.connect("127.0.0.1", f.port, { fheKey: key });
+    const db = await Client.connect("127.0.0.1", f.port, { fheKey: key, authenticated: true });
+    try {
+      plain.trustTable("t"); db.trustTable("t");
+      const count = (m: string) => f.seen.filter((x) => x === m).length;
+      assert.equal(await plain.sum("t", "v"), 20n);
+      assert.equal(count("fhe_sum"), withLimits ? 3 : 1);                           // 20 ids in chunks of 7 | one call
+      assert.equal(await plain.dot("t", "v", "v"), BigInt(844 * (withLimits ? 7 : 1)));   // default back end: pyecc sizing (3 | 50)
+      let sizes = f.bodies.filter((b) => b.includes('"fhe_dot"')).map((b) => JSON.parse(b).a[2].length);
+      assert.deepEqual(sizes, withLimits ? [3, 3, 3, 3, 3, 3, 2] : [20]);
+      await plain.dot("t", "v", "v", null, "mcl").catch(() => undefined);           // mcl: recommended 4 (cap 6)
+      sizes = f.bodies.filter((b) => b.includes('"fhe_dot"') && b.includes('"mcl"')).map((b) => JSON.parse(b).a[2].length);
+      assert.deepEqual(sizes, withLimits ? [4, 4, 4, 4, 4] : [20]);
+      // update_cells batches follow max_items (3) when published, else 2000
+      await db.insertMany("t", Array.from({ length: 4 }, (_, i) => ({ id: i, v: i })));
+      sizes = f.bodies.filter((b) => b.includes('"update_cells"')).map((b) => JSON.parse(b).a[1].length);
+      assert.deepEqual(sizes, withLimits ? [3, 1] : [4]);
+    } finally { plain.close(); db.close(); f.close(); }
+  }
+});
+
+test("an old server without update_cells: fall back to update_cell once, remember it", async () => {
+  const key = FheKey.fromHex(SECRET, 100_000);
+  const f = await fheFake(helloWith(), (m) => m === "update_cells" ? { err: "BadRequest: unknown method 'update_cells'" } : undefined);
+  const db = await Client.connect("127.0.0.1", f.port, { fheKey: key, authenticated: true });
+  try {
+    db.trustTable("t");
+    await db.insert("t", { id: 1, v: 5 });
+    await db.insert("t", { id: 2, v: 6 });
+    await db.insertMany("t", [{ id: 3, v: 1 }, { id: 4, v: 2 }]);
+    assert.equal(f.seen.filter((m) => m === "update_cells").length, 1);            // asked once only
+    assert.equal(f.seen.filter((m) => m === "update_cell").length, 4);             // 1 + 1 + 2 tags by repetition
+  } finally { db.close(); f.close(); }
 });

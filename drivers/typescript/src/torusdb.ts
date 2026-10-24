@@ -176,6 +176,18 @@ function isRational(v: unknown): v is Rational {
 }
 
 // ── strict reply validation ─────────────────────────────────────────────────
+/** Request-size limits a server publishes in `hello` (absent on older servers: conservative defaults apply). */
+export interface ServerLimits {
+  maxItems?: number;
+  fhe?: {
+    maxSumRows?: number;
+    maxDotRows: { pyecc?: number; mcl?: number };
+    recommendedDotRows: { pyecc?: number; mcl?: number };
+  };
+}
+const posInt = (x: unknown): number | undefined =>
+  typeof x === "number" && Number.isSafeInteger(x) && x >= 1 ? x : undefined;
+
 /** Longest decimal string accepted for any integer from the server. */
 export const MAX_DIGITS = 90;
 const DEC = /^-?[0-9]+$/;
@@ -675,6 +687,7 @@ const FHE_SUM_CHUNK = 2000;                  // ids per fhe_sum call (server cap
 const FHE_DOT_CHUNK_NATIVE = 2000;           // server cap 6000 with the native back end
 const FHE_DOT_CHUNK = 50;                    // server cap 300 with pure Python (~0.2 s per row)
 const FHE_READ_CHUNK = 5000;                 // cells per plain_cells call (~600 bytes each)
+const FHE_WRITE_CHUNK = 2000;                // items per update_cells call
 const FHE_MAX_K = 1n << 40n;
 function mkey(table: string, rowid: number, col: string): string {
   return table + SEP + rowid + SEP + col;
@@ -709,11 +722,12 @@ export class Client {
   #alpha = 0n;                                   // SECRET MAC key
   #fhe: FheKey | undefined;                      // SECRET key of the FHE columns
   #fheUnverifiedDot: boolean;
+  #updateCells = true;                           // false once the server answered "unknown method" for update_cells
   #als = new AsyncLocalStorage<boolean>();
   #tail: Promise<void> = Promise.resolve();
   /** What the server said in `hello` (protocol 1 servers: {protocol:1,...}). */
   serverInfo: { protocol: number; server?: string; auth_required: boolean;
-                max_frame?: number; persistent?: boolean } =
+                max_frame?: number; persistent?: boolean; limits?: ServerLimits } =
     { protocol: 1, auth_required: false };
 
   private constructor(tr: Transport, target: Target, o: ConnectOptions) {
@@ -804,6 +818,17 @@ export class Client {
     if (o.persistent !== undefined) {
       if (typeof o.persistent !== "boolean") throw proto("hello.persistent: expected a boolean");
       info.persistent = o.persistent;
+    }
+    // limits are advisory sizing hints: malformed parts are ignored, never trusted blindly
+    if (o.limits !== null && typeof o.limits === "object" && !Array.isArray(o.limits)) {
+      const l = o.limits as Record<string, any>;
+      const lim: ServerLimits = { maxItems: posInt(l.max_items) };
+      const f = l.fhe;
+      if (f !== null && typeof f === "object" && !Array.isArray(f)) {
+        const pair = (x: any) => (x !== null && typeof x === "object" ? { pyecc: posInt(x.pyecc), mcl: posInt(x.mcl) } : {});
+        lim.fhe = { maxSumRows: posInt(f.max_sum_rows), maxDotRows: pair(f.max_dot_rows), recommendedDotRows: pair(f.recommended_dot_rows) };
+      }
+      info.limits = lim;
     }
     return info;
   }
@@ -1069,7 +1094,7 @@ export class Client {
   }
 
   /** The encrypted wire cell of an FHE column plus (authenticated) its tag. `rowid` is unknown at INSERT
-   *  time: a placeholder tag is sent and replaced by {@link fheWriteTags} once the row id exists. */
+   *  time: a placeholder tag is sent and replaced by {@link writeCells} once the row id exists. */
   private fheCells(table: string, c: Column, x: bigint, rowid?: number): Array<[string, WireVal]> {
     const key = this.fheKey();
     const cells: Array<[string, WireVal]> = [[c.name, wvCell(key.encrypt(x))]];
@@ -1079,11 +1104,31 @@ export class Client {
     return cells;
   }
 
-  private async fheWriteTags(table: string, rowid: number, tags: Array<[string, bigint]>): Promise<void> {
-    const key = this.fheKey();
-    for (const [col, x] of tags) {
-      await this.call("update_cell", [table, rowid, FMAC + col, wvCell(key.tag(x, table, col, rowid))]);
+  /** Several cell writes in ONE atomic `update_cells` RPC per chunk (<= 2000 items and the server's
+   *  `max_items`); the caller's transaction makes the chunks atomic together. A server that does not
+   *  know `update_cells` gets repeated `update_cell` calls instead, and is not asked again. */
+  private async writeCells(table: string, items: Array<[number, string, WireVal]>): Promise<void> {
+    const chunk = Math.min(FHE_WRITE_CHUNK, this.serverInfo.limits?.maxItems ?? FHE_WRITE_CHUNK);
+    for (let i = 0; i < items.length; i += chunk) {
+      const part = items.slice(i, i + chunk);
+      if (this.#updateCells) {
+        try {
+          const n = safeInt(await this.call("update_cells", [table, part], 4096), "update_cells");
+          if (n !== part.length) throw proto("update_cells: implausible count");
+          continue;
+        } catch (e) {
+          if (!(e instanceof TorusError && e.kind === "BadRequest" && /unknown method/.test(e.message))) throw e;
+          this.#updateCells = false;
+        }
+      }
+      for (const [row, col, w] of part) await this.call("update_cell", [table, row, col, w]);
     }
+  }
+
+  private fheTagItems(table: string, rowid: number, tags: Array<[string, bigint]>): Array<[number, string, WireVal]> {
+    if (tags.length === 0) return [];
+    const key = this.fheKey();
+    return tags.map(([col, x]) => [rowid, FMAC + col, wvCell(key.tag(x, table, col, rowid))]);
   }
 
   private blindRow(table: string, row: Record<string, Value>): {
@@ -1125,7 +1170,7 @@ export class Client {
         const rowid = rowId(await this.call("insert", [table, wire]), "insert");
         for (const [col, r] of pending) this.setMask(mkey(table, rowid, col), r);
         // authenticated FHE: the tag binds the row id, known only now - same transaction as the INSERT
-        if (tags.length) await this.fheWriteTags(table, rowid, tags);
+        if (tags.length) await this.writeCells(table, this.fheTagItems(table, rowid, tags));
         return rowid;
       };
       return tags.length ? this.atomically(run) : run();
@@ -1149,7 +1194,9 @@ export class Client {
           const ids = arr(await this.call("insert_many", [table, part.map((b) => b.wire)],
             part.length * 24 + 4096), "insert_many", part.length).map((x) => rowId(x, "insert_many"));
           part.forEach((b, k) => { for (const [col, r] of b.pending) this.setMask(mkey(table, ids[k], col), r); });
-          for (let k = 0; k < part.length; k++) if (part[k].tags.length) await this.fheWriteTags(table, ids[k], part[k].tags);
+          const items: Array<[number, string, WireVal]> = [];
+          for (let k = 0; k < part.length; k++) items.push(...this.fheTagItems(table, ids[k], part[k].tags));
+          if (items.length) await this.writeCells(table, items);
           all.push(...ids);
         }
         return all;
@@ -1169,6 +1216,7 @@ export class Client {
       const pred = wirePred(where);
       return this.atomically(async () => {
         const idxs = await this.matching(table, pred);
+        const fheItems: Array<[number, string, WireVal]> = [];
         for (const i of idxs) {
           for (const [col, v] of Object.entries(assignments)) {
             const c = this.col(table, col);
@@ -1176,9 +1224,7 @@ export class Client {
               await this.call("update_cell", [table, i, col, wv(v)]);
             } else if (c.policy === "fhe") {
               // a fresh ciphertext (and tag) per row, never one shared cell
-              for (const [n, w] of this.fheCells(table, c, this.fheInt(v, table, col), i)) {
-                await this.call("update_cell", [table, i, n, w]);
-              }
+              for (const [n, w] of this.fheCells(table, c, this.fheInt(v, table, col), i)) fheItems.push([i, n, w]);
             } else {
               const b = this.blindCell(table, c, v);
               for (const [n, w] of b.cells) await this.call("update_cell", [table, i, n, w]);
@@ -1186,6 +1232,7 @@ export class Client {
             }
           }
         }
+        if (fheItems.length) await this.writeCells(table, fheItems);   // value + tag of every row, atomically batched
         return idxs.length;
       });
     });
@@ -1475,8 +1522,9 @@ export class Client {
     const key = this.fheKey();
     if (idxs.length === 0) return 0n;
     let total: Buffer | null = null, tags: Buffer | null = null;
-    for (let i = 0; i < idxs.length; i += FHE_SUM_CHUNK) {
-      const part = idxs.slice(i, i + FHE_SUM_CHUNK);
+    const sumChunk = Math.min(FHE_SUM_CHUNK, this.serverInfo.limits?.fhe?.maxSumRows ?? FHE_SUM_CHUNK);
+    for (let i = 0; i < idxs.length; i += sumChunk) {
+      const part = idxs.slice(i, i + sumChunk);
       const args: unknown[] = k === 1n ? [table, col, part] : [table, col, part, Number(k)];
       const b = blob(await this.call("fhe_sum", args, 4096), "fhe_sum", FHE_SUM_BYTES);
       total = total === null ? b : fheAddSums(total, b);
@@ -1509,7 +1557,12 @@ export class Client {
     }
     if (backend !== undefined && backend !== "pyecc" && backend !== "mcl") throw usage("backend must be 'pyecc' or 'mcl'");
     if (lids.length === 0) return 0n;
-    const chunk = backend === "mcl" ? FHE_DOT_CHUNK_NATIVE : FHE_DOT_CHUNK;
+    // the server's recommended size for the requested back end (unspecified = its default is "auto":
+    // be conservative and size for pyecc), never above its published cap
+    const lim = this.serverInfo.limits?.fhe;
+    const be = backend ?? "pyecc";
+    const rec = lim?.recommendedDotRows[be] ?? (be === "mcl" ? FHE_DOT_CHUNK_NATIVE : FHE_DOT_CHUNK);
+    const chunk = Math.max(1, Math.min(rec, lim?.maxDotRows[be] ?? rec));
     let total: Buffer | null = null;
     for (let i = 0; i < lids.length; i += chunk) {
       const args: unknown[] = [lt, lc, lids.slice(i, i + chunk), rt, rc, rids.slice(i, i + chunk)];

@@ -349,6 +349,7 @@ fn xcell(b: &[u8]) -> Value {
 /// connection when an integrity tag is written. Modes: 0 none, 1 scale, 2 drop a row,
 /// 3 duplicate a row, 4 wrong column, 5 kill on tag write.
 struct Proxy {
+    seen: Arc<std::sync::Mutex<Vec<String>>>,
     addr: String,
     mode: Arc<AtomicU8>,
     stop: Arc<AtomicBool>,
@@ -359,19 +360,22 @@ impl Proxy {
         let addr = l.local_addr().unwrap().to_string();
         let (mode, stop) = (Arc::new(AtomicU8::new(0)), Arc::new(AtomicBool::new(false)));
         let (m2, s2) = (mode.clone(), stop.clone());
+        let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(vec![]));
+        let seen2 = seen.clone();
         std::thread::spawn(move || {
             for conn in l.incoming() {
                 if s2.load(Ordering::SeqCst) {
                     break;
                 }
                 let Ok(mut cli) = conn else { continue };
-                let (up, m3) = (upstream.clone(), m2.clone());
+                let (up, m3, seen3) = (upstream.clone(), m2.clone(), seen2.clone());
                 std::thread::spawn(move || {
                     let mut srv = TcpStream::connect(up).unwrap();
                     while let Some(req) = read_frame(&mut cli) {
                         let mut r: Value = serde_json::from_slice(&req).unwrap();
                         let mode = m3.load(Ordering::SeqCst);
                         let method = r["m"].as_str().unwrap_or("").to_string();
+                        seen3.lock().unwrap().push(method.clone());
                         let col = r["a"][1].as_str().unwrap_or("").to_string();
                         if method == "fhe_sum" && !col.starts_with("__fmac__") {
                             let ids = r["a"][2].as_array().cloned().unwrap_or_default();
@@ -392,7 +396,10 @@ impl Proxy {
                                 _ => {}
                             }
                         }
-                        if mode == 5 && method == "update_cell" && r["a"][2].as_str().unwrap_or("").starts_with("__fmac__") {
+                        let tag_write = (method == "update_cell" && r["a"][2].as_str().unwrap_or("").starts_with("__fmac__"))
+                            || (method == "update_cells"
+                                && r["a"][1].as_array().is_some_and(|v| v.iter().any(|it| it[1].as_str().unwrap_or("").starts_with("__fmac__"))));
+                        if mode == 5 && tag_write {
                             return; // drop both sockets: the tag write never arrives
                         }
                         if !write_frame(&mut srv, r.to_string().as_bytes()) {
@@ -406,7 +413,10 @@ impl Proxy {
                 });
             }
         });
-        Proxy { addr, mode, stop }
+        Proxy { seen, addr, mode, stop }
+    }
+    fn count(&self, m: &str) -> usize {
+        self.seen.lock().unwrap().iter().filter(|x| *x == m).count()
     }
     fn set(&self, m: u8) {
         self.mode.store(m, Ordering::SeqCst);
@@ -809,4 +819,118 @@ fn cross_implementation_sealed_key_files_interoperate_with_pythons_save_key_and_
     FheKey::from_hex(&sec, 777).unwrap().save(&rs_file, Some("hunter2")).unwrap();
     let out = run_peer("127.0.0.1", s.port, &json!({"key": sec, "ops": [["loadkey", rs_file.to_str().unwrap(), "hunter2"]]}));
     assert_eq!(out, json!([[sec, 777]]));
+}
+
+// ── batched cell writes (update_cells) and server-published limits ───────────
+#[test]
+fn authenticated_fhe_writes_use_one_update_cells_call_per_batch_and_update_cells_is_atomic() {
+    let Some(s) = server(&[]) else { return };
+    let key = key100k();
+    let proxy = Proxy::start(s.addr.clone());
+    let mut db = connect_to(&proxy.addr, &key, true);
+    seed(&mut db, "batch", &ROWS);
+    assert_eq!(proxy.count("update_cell"), 0);
+    assert_eq!(proxy.count("update_cells"), 4); // one per single-row INSERT
+    let rows: Vec<_> = (0..6).map(|i| row(10 + i, 1, i, i)).collect();
+    db.insert_many("batch", rows).unwrap();
+    assert_eq!(proxy.count("update_cells"), 5); // 6 rows x 2 tags = 12 cells, one RPC
+    assert_eq!(db.update("batch", vec![("rate", ci(7))], dept(1)).unwrap(), 6);
+    assert_eq!(proxy.count("update_cells"), 6); // 6 rows x (value + tag), one RPC
+    assert_eq!(proxy.count("update_cell"), 0);
+    assert_eq!(int(db.sum("batch", "rate", dept(1)).unwrap()), 42); // every tag verifies
+    // atomicity on the server: the second item is invalid, so the first is rolled back too
+    let c1 = raw_call(&s.addr, "plain_cells", json!(["batch", "rate", [0]]))["ok"][0].clone();
+    let bad = json!(["batch", [[0, "rate", xcell(&key.encrypt(999).unwrap())], [1, "rate", xcell(&[0u8; 5])]]]);
+    assert!(raw_call(&s.addr, "update_cells", bad)["err"].as_str().is_some());
+    assert_eq!(raw_call(&s.addr, "plain_cells", json!(["batch", "rate", [0]]))["ok"][0], c1);
+    assert_eq!(raw_call(&s.addr, "update_cells", json!(["batch", [[0, "rate", c1]]]))["ok"], json!(1));
+}
+
+fn fhe_fake(limits: Option<Value>, old_server: bool) -> (common::fake::Fake, FheKey) {
+    use common::fake::{base, fake, hello, Reply};
+    let key = key100k();
+    let one = key.encrypt(1).unwrap();
+    let dot = hex(&vec_json()["dot_blob_pyecc"]);
+    let h = base(move |m, a, _| {
+        let ok = |v: Value| Some(Reply::Json(json!({"ok": v})));
+        match m {
+            "hello" => {
+                let mut h = hello();
+                if let Some(l) = &limits {
+                    h["ok"]["limits"] = l.clone();
+                }
+                Some(Reply::Json(h))
+            }
+            "tables" => ok(json!(["t"])),
+            "schema" => ok(json!([["id", "int", "plain"], ["v", "int", "fhe"]])),
+            "matching_rowids" => ok(json!((0..20).collect::<Vec<i64>>())),
+            "fhe_sum" => {
+                let n = a[2].as_array().unwrap().len();
+                let cells: Vec<&[u8]> = vec![&one; n];
+                ok(json!(b64(&fhe_sum_cells(&cells, &one_big()).unwrap())))
+            }
+            "fhe_dot" => {
+                let mut d = dot.clone();
+                if a.get(6).and_then(|b| b.as_str()) == Some("mcl") {
+                    d[0] = 2;
+                }
+                ok(json!(b64(&d)))
+            }
+            "update_cells" if old_server => Some(Reply::Json(json!({"err": "BadRequest: unknown method 'update_cells'"}))),
+            "update_cells" => ok(json!(a[1].as_array().unwrap().len())),
+            "insert" => ok(json!(0)),
+            "insert_many" => ok(json!((0..a[1].as_array().unwrap().len() as i64).collect::<Vec<_>>())),
+            _ => None,
+        }
+    });
+    (fake(h), key)
+}
+fn one_big() -> BigInt {
+    BigInt::from(1)
+}
+fn sizes(f: &common::fake::Fake, method: &str, idx: usize, mcl: Option<bool>) -> Vec<usize> {
+    f.bodies()
+        .iter()
+        .filter(|b| b.contains(&format!("\"{}\"", method)))
+        .filter(|b| mcl.is_none_or(|m| b.contains("\"mcl\"") == m))
+        .map(|b| serde_json::from_str::<Value>(b).unwrap()["a"][idx].as_array().unwrap().len())
+        .collect()
+}
+
+#[test]
+fn hello_limits_shrink_fhe_sum_fhe_dot_and_update_cells_chunks_and_defaults_apply_without_them() {
+    let limits = json!({"max_items": 3, "fhe": {"max_sum_rows": 7, "max_dot_rows": {"pyecc": 5, "mcl": 6},
+        "recommended_dot_rows": {"pyecc": 3, "mcl": 4}, "backends": ["pyecc"], "default_backend": "auto"}});
+    for with in [true, false] {
+        let (f, key) = fhe_fake(if with { Some(limits.clone()) } else { None }, false);
+        let mut plain = Client::connect_with(&f.addr, &opts(&key, false, false)).unwrap();
+        let mut db = Client::connect_with(&f.addr, &opts(&key, true, false)).unwrap();
+        plain.trust_table("t").unwrap();
+        db.trust_table("t").unwrap();
+        assert_eq!(int(plain.sum("t", "v", all()).unwrap()), 20);
+        assert_eq!(sizes(&f, "fhe_sum", 2, None), if with { vec![7, 7, 6] } else { vec![20] });
+        // default back end: pyecc sizing (recommended 3 | 50)
+        assert_eq!(int(plain.dot("t", "v", "v", all()).unwrap()), 844 * if with { 7 } else { 1 });
+        assert_eq!(sizes(&f, "fhe_dot", 2, Some(false)), if with { vec![3, 3, 3, 3, 3, 3, 2] } else { vec![20] });
+        let _ = plain.dot_with_backend("t", "v", "v", all(), Some(FheBackend::Mcl)); // mcl: recommended 4 (cap 6)
+        assert_eq!(sizes(&f, "fhe_dot", 2, Some(true)), if with { vec![4, 4, 4, 4, 4] } else { vec![20] });
+        // update_cells batches follow max_items (3) when published, else 2000
+        let rows: Vec<_> = (0..4).map(|i| vec![("id", ci(i)), ("v", ci(i))]).collect();
+        db.insert_many("t", rows).unwrap();
+        assert_eq!(sizes(&f, "update_cells", 1, None), if with { vec![3, 1] } else { vec![4] });
+    }
+}
+
+#[test]
+fn an_old_server_without_update_cells_falls_back_to_update_cell_once_and_remembers_it() {
+    let (f, key) = fhe_fake(None, true);
+    let mut db = Client::connect_with(&f.addr, &opts(&key, true, false)).unwrap();
+    db.trust_table("t").unwrap();
+    let r = |id: i64, v: i64| vec![("id", ci(id)), ("v", ci(v))];
+    db.insert("t", r(1, 5)).unwrap();
+    db.insert("t", r(2, 6)).unwrap();
+    db.insert_many("t", vec![r(3, 1), r(4, 2)]).unwrap();
+    let seen = f.seen();
+    assert_eq!(seen.iter().filter(|m| *m == "update_cells").count(), 1); // asked once only
+    assert_eq!(seen.iter().filter(|m| *m == "update_cell").count(), 4); // 1 + 1 + 2 tags by repetition
 }

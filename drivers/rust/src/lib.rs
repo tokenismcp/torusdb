@@ -64,6 +64,7 @@ const FHE_SUM_CHUNK: usize = 2000; // ids per fhe_sum call (server cap 5000)
 const FHE_DOT_CHUNK_NATIVE: usize = 2000; // server cap 6000 with the native back end
 const FHE_DOT_CHUNK: usize = 50; // server cap 300 with pure Python (~0.2 s per row)
 const FHE_READ_CHUNK: usize = 5000; // cells per plain_cells call (~600 bytes each)
+const FHE_WRITE_CHUNK: usize = 2000; // items per update_cells call
 const FHE_MAX_K: i64 = 1 << 40;
 const POLICIES: [&str; 4] = ["plain", "encrypted", "paired", "fhe"];
 const TYPES: [&str; 3] = ["int", "str", "rational"];
@@ -336,6 +337,55 @@ pub struct ServerInfo {
     pub auth_required: bool,
     pub max_frame: Option<u64>,
     pub persistent: Option<bool>,
+    /// Request-size limits published in `hello` (`None` on older servers: conservative defaults apply).
+    pub limits: Option<ServerLimits>,
+}
+
+/// Per-back-end row counts (`None` = not published).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BackendRows {
+    pub pyecc: Option<usize>,
+    pub mcl: Option<usize>,
+}
+
+impl BackendRows {
+    fn get(&self, b: FheBackend) -> Option<usize> {
+        match b {
+            FheBackend::Pyecc => self.pyecc,
+            FheBackend::Mcl => self.mcl,
+        }
+    }
+}
+
+/// FHE request limits from `hello.limits.fhe`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FheLimits {
+    pub max_sum_rows: Option<usize>,
+    pub max_dot_rows: BackendRows,
+    pub recommended_dot_rows: BackendRows,
+}
+
+/// Request-size limits a server publishes in `hello`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ServerLimits {
+    pub max_items: Option<usize>,
+    pub fhe: Option<FheLimits>,
+}
+
+fn pos(v: &Value) -> Option<usize> {
+    v.as_u64().filter(|n| *n >= 1 && *n <= MAX_SAFE as u64).map(|n| n as usize)
+}
+
+/// Limits are advisory sizing hints: malformed parts are ignored, never trusted blindly.
+fn parse_limits(l: &Value) -> Option<ServerLimits> {
+    l.as_object()?;
+    let rows = |v: &Value| BackendRows { pyecc: pos(&v["pyecc"]), mcl: pos(&v["mcl"]) };
+    let fhe = l.get("fhe").filter(|f| f.is_object()).map(|f| FheLimits {
+        max_sum_rows: pos(&f["max_sum_rows"]),
+        max_dot_rows: rows(&f["max_dot_rows"]),
+        recommended_dot_rows: rows(&f["recommended_dot_rows"]),
+    });
+    Some(ServerLimits { max_items: pos(&l["max_items"]), fhe })
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -460,6 +510,7 @@ pub struct Client {
     addr: String,
     opts: ConnectOptions, // holds the token: private, redacted in Debug
     alpha: BigInt,        // SECRET MAC key
+    update_cells_ok: bool, // false once the server answered "unknown method" for update_cells
 }
 
 impl fmt::Debug for Client {
@@ -584,6 +635,9 @@ fn parse_hello(h: &Value) -> Result<ServerInfo> {
     if let Some(p) = o.get("persistent") {
         info.persistent = Some(p.as_bool().ok_or_else(|| proto("hello.persistent: expected a boolean"))?);
     }
+    if let Some(l) = o.get("limits") {
+        info.limits = parse_limits(l);
+    }
     Ok(info)
 }
 
@@ -618,6 +672,7 @@ impl Client {
             addr: addr.to_string(),
             opts: o.clone(),
             alpha: BigInt::zero(),
+            update_cells_ok: true,
         };
         if o.authenticated {
             c.alpha = BigInt::from(1) + md(&rand_scalar()).mod_floor(&(n() - 1));
@@ -1004,12 +1059,42 @@ impl Client {
         Ok(cells)
     }
 
-    fn fhe_write_tags(&mut self, table: &str, rowid: i64, tags: &[(String, i64)]) -> Result<()> {
-        for (col, x) in tags {
-            let cell = self.fhe_key()?.tag(*x, table, col, rowid)?;
-            self.call_max("update_cell", json!([table, rowid, format!("{}{}", FMAC, col), wv_cell(&cell)?]), 4096)?;
+    /// Several cell writes in ONE atomic `update_cells` RPC per chunk (<= 2000 items and the server's
+    /// `max_items`); the caller's transaction makes the chunks atomic together. A server that does not
+    /// know `update_cells` gets repeated `update_cell` calls instead, and is not asked again.
+    fn write_cells(&mut self, table: &str, items: &[(i64, String, Value)]) -> Result<()> {
+        let chunk = FHE_WRITE_CHUNK.min(self.info.limits.as_ref().and_then(|l| l.max_items).unwrap_or(FHE_WRITE_CHUNK));
+        for part in items.chunks(chunk) {
+            if self.update_cells_ok {
+                let arg: Vec<Value> = part.iter().map(|(r, c, w)| json!([r, c, w])).collect();
+                match self.call_max("update_cells", json!([table, arg]), 4096) {
+                    Ok(v) => {
+                        if v.as_u64() != Some(part.len() as u64) {
+                            return Err(proto("update_cells: implausible count"));
+                        }
+                        continue;
+                    }
+                    Err(e) if e.kind == Kind::BadRequest && e.message.contains("unknown method") => {
+                        self.update_cells_ok = false;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            for (r, c, w) in part {
+                self.call_max("update_cell", json!([table, r, c, w]), 4096)?;
+            }
         }
         Ok(())
+    }
+
+    fn fhe_tag_items(&self, table: &str, rowid: i64, tags: &[(String, i64)]) -> Result<Vec<(i64, String, Value)>> {
+        if tags.is_empty() {
+            return Ok(vec![]);
+        }
+        let key = self.fhe_key()?;
+        tags.iter()
+            .map(|(col, x)| Ok((rowid, format!("{}{}", FMAC, col), wv_cell(&key.tag(*x, table, col, rowid)?)?)))
+            .collect()
     }
 
     fn blind_row(&self, table: &str, row: &[(&str, CellIn)]) -> Result<BlindedRow> {
@@ -1070,7 +1155,10 @@ impl Client {
                 db.set_mask((table_s.clone(), rowid, col), r);
             }
             // the tag binds the row id, known only now - same transaction as the INSERT
-            db.fhe_write_tags(&table_s, rowid, &b.tags)?;
+            let items = db.fhe_tag_items(&table_s, rowid, &b.tags)?;
+            if !items.is_empty() {
+                db.write_cells(&table_s, &items)?;
+            }
             Ok(rowid)
         };
         if tagged {
@@ -1106,11 +1194,15 @@ impl Client {
                     .iter()
                     .map(|x| row_id(x, "insert_many"))
                     .collect::<Result<Vec<i64>>>()?;
+                let mut items = vec![];
                 for (rid, b) in ids.iter().zip(part) {
                     for (col, r) in b.pending {
                         db.set_mask((table.clone(), *rid, col), r);
                     }
-                    db.fhe_write_tags(&table, *rid, &b.tags)?;
+                    items.extend(db.fhe_tag_items(&table, *rid, &b.tags)?);
+                }
+                if !items.is_empty() {
+                    db.write_cells(&table, &items)?;
                 }
                 all.extend(ids);
             }
@@ -1134,6 +1226,7 @@ impl Client {
         let pred = wire_pred(&pred)?;
         self.atomically(|db| {
             let idxs = db.matching(table, pred)?;
+            let mut fhe_items: Vec<(i64, String, Value)> = vec![];
             for i in &idxs {
                 for (col, v) in &set {
                     let policy = db.policy(table, col)?;
@@ -1143,7 +1236,7 @@ impl Client {
                         // a fresh ciphertext (and tag) per row, never one shared cell
                         let x = Self::fhe_int(v, table, col)?;
                         for (n, w) in db.fhe_cells(table, col, x, Some(*i))? {
-                            db.call_max("update_cell", json!([table, i, n, w]), 4096)?;
+                            fhe_items.push((*i, n, w));
                         }
                     } else {
                         let (cells, masks) = db.blind_cell(table, col, v)?;
@@ -1155,6 +1248,9 @@ impl Client {
                         }
                     }
                 }
+            }
+            if !fhe_items.is_empty() {
+                db.write_cells(table, &fhe_items)?; // value + tag of every row, atomically batched
             }
             Ok(idxs.len())
         })
@@ -1536,7 +1632,10 @@ impl Client {
             return Ok(0);
         }
         let (mut total, mut tags): (Option<Vec<u8>>, Option<Vec<u8>>) = (None, None);
-        for part in idxs.chunks(FHE_SUM_CHUNK) {
+        let sum_chunk = FHE_SUM_CHUNK.min(
+            self.info.limits.as_ref().and_then(|l| l.fhe.as_ref()).and_then(|f| f.max_sum_rows).unwrap_or(FHE_SUM_CHUNK),
+        );
+        for part in idxs.chunks(sum_chunk) {
             let mut args = vec![json!(table), json!(col), json!(part)];
             if !k.is_one() {
                 args.push(json!(k.to_i64().unwrap_or(0)));
@@ -1595,7 +1694,13 @@ impl Client {
         if lids.is_empty() {
             return Ok(0);
         }
-        let chunk = if backend == Some(FheBackend::Mcl) { FHE_DOT_CHUNK_NATIVE } else { FHE_DOT_CHUNK };
+        // the server's recommended size for the requested back end (unspecified = its default is "auto":
+        // be conservative and size for pyecc), never above its published cap
+        let be = backend.unwrap_or(FheBackend::Pyecc);
+        let lim = self.info.limits.as_ref().and_then(|l| l.fhe.as_ref());
+        let fallback = if be == FheBackend::Mcl { FHE_DOT_CHUNK_NATIVE } else { FHE_DOT_CHUNK };
+        let rec = lim.and_then(|f| f.recommended_dot_rows.get(be)).unwrap_or(fallback);
+        let chunk = rec.min(lim.and_then(|f| f.max_dot_rows.get(be)).unwrap_or(rec)).max(1);
         let mut total: Option<Vec<u8>> = None;
         for (l, r) in lids.chunks(chunk).zip(rids.chunks(chunk)) {
             let mut args = vec![json!(lt), json!(lc), json!(l), json!(rt), json!(rc), json!(r)];
