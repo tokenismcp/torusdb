@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """FHE columns: server-side ``SUM`` and ``DOT`` on ciphertexts, with NO key at the server.
 
-A BGN-style scheme over the BN254 pairing groups (G1, G2, GT), implemented on
+An EC-FHE scheme (elliptic-curve based — not lattice-based; no noise, no bootstrapping) over
+the BN254 pairing groups (G1, G2, GT), implemented on
 ``py_ecc`` (portable) with an optional native ``mclbn256`` back end — nothing here depends
 on the proprietary engine.
 
@@ -12,7 +13,8 @@ on the proprietary engine.
 
 * **SUM** (server): add the G1 halves of the chosen cells. Owner: ``ΣC2 − s·ΣC1 = (Σv)·P``,
   then a bounded discrete log.
-* **DOT** (server): for each row pair the G2 half of cell a with the G1 half of cell b:
+* **DOT** (server): the ciphertext×ciphertext product ★_ct (pairing, NOT a scalar multiplication):
+  for each row pair the G2 half of cell a with the G1 half of cell b:
   ``c00=e(D1,C1′) c01=e(D1,C2′) c10=e(D2,C1′) c11=e(D2,C2′)`` and multiply the four GT
   values over all rows. Owner: ``c11·c01^−s·c10^−s·c00^(s²) = e(P,G2)^(Σ a·b)``.
 
@@ -29,6 +31,8 @@ wrong ciphertext (MAC columns are future work); no WHERE/ORDER/GROUP on FHE colu
 """
 from __future__ import annotations
 
+import hashlib
+import hmac
 import math
 import secrets
 from typing import Iterable
@@ -44,6 +48,13 @@ DEFAULT_RANGE = 1_000_000
 
 class FheError(ValueError):
     pass
+
+
+from .errors import IntegrityError as _CoreIntegrityError
+
+
+class IntegrityError(FheError, _CoreIntegrityError):
+    """The server's answer does not match the authenticated data."""
 
 
 def _be(backend=None):
@@ -70,13 +81,17 @@ def parse_cell(raw: bytes, backend=None):
 
 
 # ── server-side evaluation (public data only) ────────────────────────────────
-def sum_cells(cells: Iterable[bytes], backend=None) -> bytes:
-    """Σ of the G1 halves → 128 bytes (ΣC1, ΣC2). Back-end independent output."""
+def sum_cells(cells: Iterable[bytes], backend=None, scale: int = 1) -> bytes:
+    """Σ of the G1 halves → 128 bytes (ΣC1, ΣC2), optionally multiplied by the PUBLIC
+    scalar ``scale`` (EC scalar multiplication of the ciphertext points — a different,
+    cheap operation from ct×ct multiplication, which uses pairings). Back-end independent."""
     be = _be(backend)
     c1, c2 = be.g1_zero(), be.g1_zero()
     for raw in cells:
         a, b_, _d1, _d2 = parse_cell(raw, be)
         c1, c2 = be.g1_add(c1, a), be.g1_add(c2, b_)
+    if scale != 1:
+        c1, c2 = be.g1_mul(c1, scale), be.g1_mul(c2, scale)
     return be.g1_to(c1) + be.g1_to(c2)
 
 
@@ -159,14 +174,67 @@ class FheKey:
             raise FheError("FHE columns hold integers")
         if abs(v) > self.range:
             raise FheError(f"|value| must be <= the key's range ({self.range})")
+        return self.encrypt_scalar(v)
+
+    def encrypt_scalar(self, m: int) -> bytes:
+        """Encrypt an arbitrary scalar mod the group order (no range limit: tags, not data)."""
         be = self.be
         r1, r2 = (secrets.randbelow(N - 1) + 1 for _ in range(2))
-        vm = v % N
+        vm = m % N
         c1 = be.g1_mul(be.G1, r1)
         c2 = be.g1_add(be.g1_mul(be.G1, vm), be.g1_mul(self.Q, r1))
         d1 = be.g2_mul(be.G2, r2)
         d2 = be.g2_add(be.g2_mul(be.G2, vm), be.g2_mul(self.Q2, r2))
         return be.g1_to(c1) + be.g1_to(c2) + be.g2_to(d1) + be.g2_to(d2)
+
+    # ── integrity tags (optional, ``authenticated=True``) ─────────────────────
+    # Next to the value ciphertext Enc(v) each cell carries a TAG ciphertext
+    # Enc(α·v + γ) where α is a secret MAC key and γ = PRF(table, column, row id) is a
+    # secret per-cell tweak; both derive from the owner's secret. For any set of rows I the
+    # owner checks, in the exponent and without any discrete log,
+    #       tag-sum point  ==  α · value-sum point  +  k · (Σ_{i∈I} γᵢ)·P
+    # (k = public scalar multiplier). A server that alters a value, drops/duplicates/swaps a
+    # row, or scales a result cannot satisfy it without α and γ (soundness ≈ 1/n per attempt).
+    # Not covered: replaying an older version of the same cell; ct×ct (DOT) results.
+    def _prf(self, label: bytes, *parts) -> int:
+        h = hmac.new(self.secret_bytes, b"torussql/fhe/" + label, hashlib.sha256).digest()
+        msg = b"\x00".join(str(p).encode() for p in parts)
+        return int.from_bytes(hmac.new(h, msg, hashlib.sha512).digest(), "big") % N
+
+    @property
+    def alpha(self) -> int:
+        return self._prf(b"alpha") or 1
+
+    def gamma(self, table: str, col: str, rowid: int) -> int:
+        return self._prf(b"gamma", table, col, rowid)
+
+    def tag(self, v: int, table: str, col: str, rowid: int) -> bytes:
+        return self.encrypt_scalar(self.alpha * v + self.gamma(table, col, rowid))
+
+    def _opened(self, blob: bytes):
+        """(ΣC2 − s·ΣC1) of a SUM blob — the plaintext times P, as a group element."""
+        be = self.be
+        c1, c2 = self._point_pair(blob)
+        return be.g1_add(c2, be.g1_neg(be.g1_mul(c1, self._s)))
+
+    def decrypt_sum_verified(self, value_blob: bytes, tag_blob: bytes, table: str, col: str,
+                             rowids, scale: int = 1) -> int:
+        be = self.be
+        gam = sum(self.gamma(table, col, i) for i in rowids) % N
+        mv, mt = self._opened(value_blob), self._opened(tag_blob)
+        want = be.g1_add(be.g1_mul(mv, self.alpha), be.g1_mul(be.G1, scale * gam))
+        if be.g1_key(mt) != be.g1_key(want):
+            raise IntegrityError(f"integrity check failed for {table}.{col}: the server's "
+                                 f"aggregate does not match the authenticated cells")
+        return self._g1_dlog(mv)
+
+    def decrypt_cell_verified(self, cell: bytes | None, tag: bytes | None, table: str,
+                              col: str, rowid: int) -> int:
+        if tag is None or cell is None:
+            raise IntegrityError(f"{table}.{col} row {rowid} has no integrity tag "
+                                 f"(written without authentication, or tampered)")
+        return self.decrypt_sum_verified(sum_cells([cell], self.be), sum_cells([tag], self.be),
+                                         table, col, [rowid])
 
     # decryption: bounded discrete logs (baby-step / giant-step)
     def _g1_dlog(self, M) -> int:

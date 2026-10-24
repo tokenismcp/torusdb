@@ -11,6 +11,14 @@ Versioning: [Versioning Policy](docs/versioning.md).
 Hardening release: SQL joins completed, server and drivers made operable, a
 cryptographic self-audit, and the open repository made self-contained.
 
+### Added — FHE integrity tags, `k * SUM` (late 0.5.0)
+
+- `authenticated=True` now also protects FHE cells, `SUM`, `AVG` and `k * SUM(col)` with row-bound
+  integrity tags (detects altered values, dropped/duplicated/swapped rows, scaled answers).
+  `DOT` (ciphertext × ciphertext, ★_ct) has no tag check and needs `fhe_allow_unverified_dot=True`.
+- `k * SUM(col)` on FHE columns (public EC scalar multiplication of the ciphertext).
+- Canonical GT encoding shared by both pairing back ends.
+
 ### Added — FHE columns (late 0.5.0, experimental)
 
 - Column policy `FHE` (`INT` only): the server adds (`SUM`/`AVG`) and multiplies (`DOT`)

@@ -13,7 +13,7 @@ An earlier version of this page said a server-side evaluation mode would add not
 server-held keys. That was wrong for the *pairing* path. The reference engine's default
 evaluator (`bootstrap_assisted`) does need a bootstrap key at the evaluator, and its
 `ct_native` path assumes a co-located secret-key holder — both rejected here. But the
-pairing step itself (`★_ct`, BGN-style) uses **only public ciphertext data**, so the server
+pairing step itself (`★_ct`, the pairing-based ciphertext×ciphertext product) uses **only public ciphertext data**, so the server
 can add and multiply ciphertexts and the owner decrypts the aggregate. That is implemented
 as the `FHE` column policy — see [`fhe-columns.md`](fhe-columns.md) — with a layout that fixes a
 weakness we found in shared-randomness paired ciphertexts (a public-key value oracle).

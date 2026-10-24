@@ -1,15 +1,27 @@
-# FHE columns — the server computes on ciphertexts, with no key
+# FHE columns — EC-FHE: the server computes on ciphertexts, with no key
+
+> **This is elliptic-curve FHE (EC-FHE), not lattice-based FHE.** Ciphertexts are points on the
+> BN254 pairing curve (G1/G2). There is no noise budget and no bootstrapping.
+>
+> Two different operations — do not confuse them:
+> * **ciphertext × ciphertext** (`DOT`) is the pairing-based tensor product **★_ct**
+>   (Weil/optimal-ate pairing of ciphertext points, landing in the target group GT; one level
+>   deep). It is *not* a scalar multiplication.
+> * **public scalar × ciphertext** (`k * SUM(col)`) is plain EC scalar multiplication of the
+>   ciphertext points — cheap, and a different operation.
 
 `ENC`/`PAIRED` columns use the *no-key delegation* protocol: the server stores one-time
 pads and the owner finishes every computation. **`FHE` columns** are the other, complementary
-mode: the server itself adds and multiplies **ciphertexts** using public data only. It never
-holds a secret key, a bootstrap key or any mask; only the owner's `FheKey` can decrypt.
+mode: the server itself adds ciphertexts (EC point addition), scales them by public scalars
+(EC scalar multiplication) and multiplies two ciphertext columns (★_ct pairing). It never holds a
+secret key, a bootstrap key or any mask; only the owner's `FheKey` can decrypt.
 
 ```sql
 CREATE TABLE emp (id INT PLAIN, dept INT PLAIN, rate INT FHE, hours INT FHE);
 INSERT INTO emp (id, dept, rate, hours) VALUES (1, 5, 40, 160);
-SELECT SUM(rate), AVG(rate), COUNT(*) FROM emp WHERE dept = 5;   -- server adds ciphertexts
-SELECT DOT(rate, hours) FROM emp;                                -- server multiplies + sums: Σ rateᵢ·hoursᵢ
+SELECT SUM(rate), AVG(rate), COUNT(*) FROM emp WHERE dept = 5;   -- server adds ciphertexts (EC addition)
+SELECT 3 * SUM(rate) FROM emp;                                   -- ... times a PUBLIC scalar (EC scalar mult)
+SELECT DOT(rate, hours) FROM emp;                                -- ct × ct (★_ct pairing) summed: Σ rateᵢ·hoursᵢ
 SELECT id, rate FROM emp WHERE id = 1;                           -- cells are decrypted by the owner
 UPDATE emp SET rate = 45 WHERE id = 1;                           -- fresh ciphertext, no mask bookkeeping
 ```
@@ -21,7 +33,7 @@ torussql --fhe-key ./fhe.key --fhe-pass-env FHE_PASS -p 8533                   #
 ```python
 from torusdb_core import fhe
 key = fhe.load_key("fhe.key", passphrase)
-conn = torussql.connect(host, fhe_key=key)
+conn = torussql.connect(host, fhe_key=key, authenticated=True)   # authenticated: integrity tags
 ```
 
 ## What you get compared with `ENC` / `PAIRED`
@@ -30,14 +42,14 @@ conn = torussql.connect(host, fhe_key=key)
 |---|---|---|
 | server learns about a cell | nothing (one-time pad, information-theoretic) | nothing computationally (SXDH on BN254, ≈100-bit) |
 | owner state | **mask vault** per cell (or a mask cluster) | **only the key**; no per-cell state, any number of clients with the key read/write |
-| `SUM` / `AVG` | owner sums masks | server adds ciphertexts, owner decrypts one point |
-| `DOT` / `a*b` | owner needs the plaintext operands (O(n) at the owner) | **server** multiplies ciphertexts with pairings; owner decrypts one value |
+| `SUM` / `AVG` / `k*SUM` | owner sums masks | server adds ciphertext points (and scales them by public k); owner decrypts one point |
+| `DOT` / `a*b` | owner needs the plaintext operands (O(n) at the owner) | **server** multiplies ciphertexts with the ★_ct pairing; owner decrypts one value |
 | UPDATE/DELETE/crash/orphans | mask-first ordering, gc, repair | nothing to repair |
 | speed | fast | native back end: encrypt 0.3 ms/cell, `SUM` 0.4 ms/row, `DOT` 1.4 ms/row; pure Python: 33 ms, 0.1 ms, 200 ms |
 | result range | ≈ ±2^126 exact rationals | integers only, results within the key's range (default ±10^6) |
-| integrity vs a lying server | optional SPDZ MACs | **none yet** |
+| integrity vs a lying server | optional SPDZ MACs | optional tags for cells / `SUM` / `k*SUM` (see below); **none for `DOT`** |
 
-## Scheme (BGN-style, BN254 pairing groups; implemented in `torusdb_core/fhe.py`)
+## Scheme (EC-FHE on the BN254 pairing groups; implemented in `torusdb_core/fhe.py`)
 
 `s` secret; public `Q = sP`, `Q2 = sG2`. Encrypting `v`: G1 half `(r₁P, vP + r₁Q)` and G2
 half `(r₂G2, vG2 + r₂Q2)` with **independent** `r₁, r₂`. SUM adds the G1 halves; DOT pairs the
@@ -52,9 +64,17 @@ ciphertext and verified it finds nothing here (`tests/test_fhe.py`).
 
 ## Limits — read before relying on it
 
-* **No integrity.** A malicious server can return a wrong ciphertext; the owner decrypts a
-  wrong number (or fails with *out of range*). Use `ENC` + `authenticated=True` when you need
-  to detect that. FHE MACs are future work.
+* **Integrity is partial** (`authenticated=True`). Each FHE cell gets a second ciphertext, a
+  *tag* `Enc(α·v + γ(table, column, row id))` where `α` and the per-cell tweak `γ` are PRF
+  outputs of the owner's secret. For any set of rows the owner checks, in the exponent and
+  without a discrete log, `tag-sum = α·value-sum + k·Σγ`. This catches a changed value, a
+  dropped, duplicated or swapped row, a result scaled by the server, and cells written without
+  tags (soundness ≈ 1/n per attempt). **Not covered:** replay of an older version of the same
+  cell, and **`DOT`** — a ciphertext product cannot be tag-checked, so an authenticated
+  connection refuses `DOT` unless you pass `fhe_allow_unverified_dot=True`. Without
+  `authenticated=True` a malicious server can return a wrong ciphertext and the owner decrypts
+  a wrong number (or fails with *out of range*); use `ENC` + `authenticated=True` when
+  you need verified products.
 * **Malleability.** The server can compute any sum/product of your ciphertexts — that is the
   feature. It also means access control of who may *ask* the server matters.
 * **What the server still sees:** plaintext columns, the schema, row counts, which rows each

@@ -353,9 +353,10 @@ class Schema:
                 raise ValidationError(
                     f"k * col requires an ENC/PAIRED column, got PLAIN "
                     f"(column {col.name!r})")
-            if col.policy == "fhe":
+            if col.policy == "fhe" and isinstance(proj, ScalarMulExpr):
                 raise ValidationError(
-                    f"k * col is not supported on FHE columns (column {col.name!r})")
+                    f"k * col (per row) is not supported on FHE columns (column {col.name!r}); "
+                    f"k * SUM(col) is")
 
         elif isinstance(proj, CtMulExpr):
             _i, a = scope.resolve(proj.left, "col * col")

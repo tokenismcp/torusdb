@@ -160,9 +160,13 @@ class NoKeyServer:
         return self._rows[table].indexed_columns
 
     # — FHE columns: the server evaluates on ciphertexts using PUBLIC data only —
-    def fhe_sum(self, table: str, col: str, idxs: list[int]) -> bytes:
+    def fhe_sum(self, table: str, col: str, idxs: list[int], k: int = 1) -> bytes:
         from . import fhe
-        return fhe.sum_cells(self._rows[table].cells(col, idxs))
+        try:
+            cells = self._rows[table].cells(col, idxs)
+        except KeyError:
+            raise ExecError(f"rows of {table!r} have no {col!r} cells (integrity tag missing)") from None
+        return fhe.sum_cells(cells, None, k)
 
     def fhe_dot(self, ltable: str, lcol: str, lids: list[int],
                 rtable: str, rcol: str, rids: list[int], backend: str | None = None) -> bytes:
@@ -184,7 +188,7 @@ class NoKeyServer:
 
     def plain_cells(self, table: str, col: str, idxs: list[int]) -> list[Any]:
         store = self._rows[table]
-        if col == "__cid__" or col.startswith("__mv__"):
+        if col == "__cid__" or col.startswith("__mv__") or col.startswith("__fmac__"):
             # owner bookkeeping columns may be absent on rows written by another
             # mask store; report None instead of failing the whole read
             return [store.cell(i, col, None) for i in idxs]
@@ -352,6 +356,10 @@ def _mac_col(col: str) -> str:
     return "__mac__" + col
 
 
+def _fmac_col(col: str) -> str:
+    return "__fmac__" + col
+
+
 @dataclass
 class NoKeyClient:
     server: NoKeyServer
@@ -374,6 +382,7 @@ class NoKeyClient:
     maskstore: MaskStore | None = None
     # secret key of the FHE columns (torusdb_core.fhe.FheKey); None = no FHE columns
     fhe: Any = None
+    fhe_allow_unverified_dot: bool = False
     # Tables whose column policies were learned from the (untrusted) server
     # rather than created/vaulted by this owner. A malicious server could relabel
     # an encrypted column "plain" and receive plaintext, so writes to such
@@ -458,6 +467,8 @@ class NoKeyClient:
                 row[cname] = value
             elif policy == "fhe":
                 row[cname] = self._fhe_key().encrypt(self._fhe_int(value, cname))
+                if self.authenticated:           # real tag is written once the row id is known
+                    row[_fmac_col(cname)] = self._fhe_key().encrypt_scalar(0)
             else:
                 s = encode(value)
                 blinded, r = self._owner.blind(s)
@@ -480,6 +491,7 @@ class NoKeyClient:
         row.update(extras)
         rowid = self.server.insert(q.table, row)
         self.maskstore.commit_insert(q.table, [rowid], [masks], [extras])
+        self._fhe_tag_rows(q.table, [(rowid, q)])
         return 1
 
     def insert_many(self, sqls: list[str]) -> int:
@@ -501,7 +513,35 @@ class NoKeyClient:
             rows.append(row)
         rowids = self.server.insert_many(table, rows)
         self.maskstore.commit_insert(table, rowids, all_masks, extras)
+        self._fhe_tag_rows(table, [(rid, p.raw) for rid, p in zip(rowids, plans)])
         return len(rowids)
+
+    def _fhe_tag_rows(self, table: str, rows: list) -> None:
+        """Authenticated FHE columns: now that the row ids are known, replace each
+        placeholder tag by the row-id-bound one (the driver runs this inside a
+        transaction, so a crash cannot leave a half-tagged row)."""
+        if not self.authenticated:
+            return
+        fcols = [c for (c, _t, p) in self._schema[table] if p == "fhe"]
+        if not fcols:
+            return
+        key = self._fhe_key()
+        for rowid, q in rows:
+            given = dict(zip(q.columns, q.values))
+            for c in fcols:
+                v = self._fhe_int(_literal_to_value(given[c], self._coltype[(table, c)]), c)
+                self.server.update_cell(table, rowid, _fmac_col(c), key.tag(v, table, c, rowid))
+
+    def needs_transaction(self, sql: str) -> bool:
+        """True when executing ``sql`` takes more than one server write that must be atomic
+        (INSERT into a table with authenticated FHE columns)."""
+        if not self.authenticated:
+            return False
+        try:
+            plan = plan_query(parse(sql), _CatalogView(self._schema))
+        except Exception:                                # noqa: BLE001 — the real run reports it
+            return False
+        return plan.kind == "insert" and any(p == "fhe" for (_c, _t, p) in self._schema[plan.table])
 
     def _forget_table(self, table: str) -> None:
         self._schema.pop(table, None)
@@ -525,7 +565,10 @@ class NoKeyClient:
                 if self._colpolicy[(table, col)] == "plain":
                     cells.append((col, value))
                 elif self._colpolicy[(table, col)] == "fhe":
-                    cells.append((col, self._fhe_key().encrypt(self._fhe_int(value, col))))
+                    iv = self._fhe_int(value, col)
+                    cells.append((col, self._fhe_key().encrypt(iv)))
+                    if self.authenticated:
+                        cells.append((_fmac_col(col), self._fhe_key().tag(iv, table, col, i)))
                 else:
                     s = encode(value)
                     blinded, r = self._owner.blind(s)
@@ -692,7 +735,12 @@ class NoKeyClient:
             return self.server.plain_cells(table, col, idxs)
         if policy == "fhe":
             key = self._fhe_key()
-            return [key.decrypt_cell(c) for c in self.server.plain_cells(table, col, idxs)]
+            cells = self.server.plain_cells(table, col, idxs)
+            if not self.authenticated:
+                return [key.decrypt_cell(c) for c in cells]
+            tags = self.server.plain_cells(table, _fmac_col(col), idxs)
+            return [key.decrypt_cell_verified(c, t, table, col, i)
+                    for c, t, i in zip(cells, tags, idxs)]
         return [decode(s) for s in self._read_verified_scalars(table, col, idxs)]
 
     _AGG = (PSum, PAvg, PCountStar, PScaledSum, PDot, PScalarMul, PCtMul,
@@ -811,6 +859,8 @@ class NoKeyClient:
             return total / n if isinstance(total, Fraction) else Fraction(total, n)
         if isinstance(p, PScaledSum):
             table, bare, lv = live(p.column)
+            if self._colpolicy[(table, bare)] == "fhe":
+                return self._fhe_sum(table, bare, lv, p.scalar)
             return self._pi_lin_scaled_sum(table, bare, lv, p.scalar)
         if isinstance(p, PScalarMul):
             table, bare, all_ids = ids(p.column)
@@ -856,20 +906,36 @@ class NoKeyClient:
             raise ExecError(f"FHE column {col!r} holds integers only")
         return value
 
-    def _fhe_sum(self, table: str, col: str, idxs: list[int]) -> int:
+    def _fhe_sum(self, table: str, col: str, idxs: list[int], k: int = 1) -> int:
         from . import fhe
         key = self._fhe_key()
         if not idxs:
             return 0
-        total = None
+        total = tags = None
         for i in range(0, len(idxs), self._FHE_SUM_CHUNK):
-            part = self.server.fhe_sum(table, col, idxs[i:i + self._FHE_SUM_CHUNK])
+            part_ids = idxs[i:i + self._FHE_SUM_CHUNK]
+            part = self.server.fhe_sum(table, col, part_ids, k)
             total = part if total is None else fhe.add_sums(total, part)
-        return key.decrypt_sum(total)
+            if self.authenticated:
+                try:
+                    tpart = self.server.fhe_sum(table, _fmac_col(col), part_ids, k)
+                except Exception as exc:                       # noqa: BLE001
+                    if "integrity tag" in str(exc):
+                        raise IntegrityError(f"{table}.{col} has no integrity tags — it was "
+                                             f"written without authentication") from None
+                    raise
+                tags = tpart if tags is None else fhe.add_sums(tags, tpart)
+        if not self.authenticated:
+            return key.decrypt_sum(total)
+        return key.decrypt_sum_verified(total, tags, table, col, idxs, k)
 
     def _fhe_dot(self, lt, lc, lids, rt, rc, rids) -> int:
         from . import fhe
         key = self._fhe_key()
+        if self.authenticated and not self.fhe_allow_unverified_dot:
+            raise ExecError("DOT on FHE columns has no integrity protection (a ciphertext "
+                            "product cannot be tag-checked); connect with "
+                            "fhe_allow_unverified_dot=True to accept an unverified result")
         if not lids:
             return 0
         total = None

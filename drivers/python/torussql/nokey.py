@@ -271,8 +271,8 @@ class RemoteNoKeyServer:
     def drop(self, table):
         self._c.call("drop", [table])
 
-    def fhe_sum(self, table, col, idxs):
-        return _b64d(self._c.call("fhe_sum", [table, col, idxs]))
+    def fhe_sum(self, table, col, idxs, k=1):
+        return _b64d(self._c.call("fhe_sum", [table, col, idxs] + ([k] if k != 1 else [])))
 
     def fhe_dot(self, lt, lc, lids, rt, rc, rids, backend=None):
         args = [lt, lc, lids, rt, rc, rids] + ([backend] if backend else [])
@@ -590,6 +590,7 @@ class Connection:
                  sync_schema: bool = True,
                  trust_server_schema: bool = False,
                  fhe_key=None,
+                 fhe_allow_unverified_dot: bool = False,
                  timeout: float | None = 30.0):
         if mask_cluster is not None and (vault_path or vault_passphrase or vault_custody):
             raise ProgrammingError(
@@ -614,7 +615,8 @@ class Connection:
         try:
             self.client = NoKeyClient(RemoteNoKeyServer(self._wire),
                                       authenticated=authenticated,
-                                      maskstore=mask_cluster, fhe=fhe_key)
+                                      maskstore=mask_cluster, fhe=fhe_key,
+                                      fhe_allow_unverified_dot=fhe_allow_unverified_dot)
             if mask_cluster is not None:
                 if authenticated and not self.client.authenticated:
                     raise ProgrammingError(
@@ -845,7 +847,9 @@ class Connection:
         try:
             if kind == "Select":
                 return self.client.execute(sql)
-            implicit = kind == "Update" and not self._in_tx
+            implicit = ((kind == "Update"
+                         or (kind == "Insert" and self.client.needs_transaction(sql)))
+                        and not self._in_tx)
             if implicit:
                 self.begin()
             try:
@@ -885,6 +889,9 @@ class Connection:
     @_synchronized
     def _run_insert_many(self, sqls: list[str]) -> int:
         self._check_open()
+        if not self._in_tx and sqls and self.client.needs_transaction(sqls[0]):
+            with self.transaction():            # rows and their integrity tags land together
+                return self._run_insert_many(sqls)
         if self._in_tx and self._tx_failed:
             raise ProgrammingError(f"the current transaction was aborted ({self._tx_failed})")
         try:
@@ -1059,6 +1066,7 @@ def connect(host: str = "127.0.0.1", port: int = 8533, *,
             sync_schema: bool = True,
             trust_server_schema: bool = False,
             fhe_key=None,
+            fhe_allow_unverified_dot: bool = False,
             timeout: float | None = 30.0) -> Connection:
     """Open a PEP 249 connection to a no-key TorusDB server.
 
@@ -1084,6 +1092,8 @@ def connect(host: str = "127.0.0.1", port: int = 8533, *,
         sync_schema: learn tables that exist on the server (schema only)
         fhe_key: a ``torusdb_core.fhe.FheKey`` (or None) — the owner's secret for
             ``FHE`` columns; load one with ``torusdb_core.fhe.load_key(path, passphrase)``
+        fhe_allow_unverified_dot: with ``authenticated=True``, allow ``DOT`` on FHE columns
+            (its ciphertext-product result cannot be integrity-checked)
         trust_server_schema: allow INSERT/UPDATE on tables whose column policies
             were learned from the server (default: they are read-only, because a
             malicious server could relabel an encrypted column "plain"). Tables
@@ -1098,4 +1108,5 @@ def connect(host: str = "127.0.0.1", port: int = 8533, *,
                       vault_path=vault_path, vault_passphrase=vault_passphrase,
                       vault_custody=vault_custody, mask_cluster=mask_cluster,
                       sync_schema=sync_schema, trust_server_schema=trust_server_schema,
-                      fhe_key=fhe_key, timeout=timeout)
+                      fhe_key=fhe_key, fhe_allow_unverified_dot=fhe_allow_unverified_dot,
+                      timeout=timeout)

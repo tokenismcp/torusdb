@@ -192,19 +192,54 @@ class Mcl:
     def gt_mul(self, a, c): return a * c
     def gt_pow(self, a, k): return a.pow(self._fr(k))
 
+    # GT elements travel in ONE canonical encoding for every back end: the 12 coefficients of
+    # the py_ecc polynomial basis (w^12 = 18·w^6 − 82). mcl's tower basis
+    # (Fp12 = Fp6[w]/(w²−v), Fp6 = Fp2[v]/(v³−(9+i)), Fp2 = Fp[i]/(i²+1)) maps onto it with
+    # i = w^6 − 9 and v = w² — a ring isomorphism (checked in tests/test_fhe.py).
     def gt_to(self, g) -> bytes:
-        return b"".join(_i32(int(t, 16)) for t in g.tostr().split())
+        v = [int(t, 16) for t in g.tostr().split()]
+        c = [0] * 12
+        for j in range(3):
+            xa, ya = v[2 * j], v[2 * j + 1]                    # A_j = xa + ya·i  at  w^(2j)
+            xb, yb = v[6 + 2 * j], v[7 + 2 * j]                # B_j = xb + yb·i  at  w^(2j+1)
+            c[2 * j] = (xa - 9 * ya) % P_MOD
+            c[2 * j + 6] = ya % P_MOD
+            c[2 * j + 1] = (xb - 9 * yb) % P_MOD
+            c[2 * j + 7] = yb % P_MOD
+        return b"".join(_i32(x) for x in c)
 
     def gt_from(self, raw: bytes):
-        v = _rd(raw, 12)
+        c = _rd(raw, 12)
+        v = [0] * 12
+        for j in range(3):
+            v[2 * j + 1] = c[2 * j + 6]
+            v[2 * j] = (c[2 * j] + 9 * c[2 * j + 6]) % P_MOD
+            v[7 + 2 * j] = c[2 * j + 7]
+            v[6 + 2 * j] = (c[2 * j + 1] + 9 * c[2 * j + 7]) % P_MOD
         try:
-            return self._GT().fromstr(" ".join(f"{c:x}" for c in v).encode(), 16)
+            return self._GT().fromstr(" ".join(f"{x:x}" for x in v).encode(), 16)
         except ValueError:
             raise BackendError("not a GT element") from None
 
     def gt_key(self, g) -> bytes:
         return g.serialize()
 
+    def gt_gen_bytes(self) -> bytes:
+        return self.gt_to(self.gt_gen())
+
+
+class McLDecodeOnly(PyEcc):
+    """Reads (not produces) results of the native back end using only ``py_ecc``: the GT
+    values are in the canonical encoding, and the native pairing differs from py_ecc's only
+    by its generator ``e_mcl(P, G2)``, a public constant."""
+    name, tag = "mcl-decode", b"\x02"
+
+    def gt_gen(self):
+        return FQ12(_rd(MCL_GT_GENERATOR, 12))
+
+
+# e_mcl(P, G2) in the canonical encoding (computed with mclbn256 on BN_SNARK1; pinned by a test)
+MCL_GT_GENERATOR = bytes.fromhex("0c498eace9669afdb2ac004a2bc3352ff31fa2b137a520190498891a96af31fb0f7abc6cd882a79148ae975c363201b64294a69c7da04b4dc0fcc4a6b77f99801fa5477cf344c578b943985d188016c90cfed95c39da64d34f7dab3bf29053a4189cc22058b17f919c91a5da449e1130585d76d6c852c08307a7355064d0e6682e5c373f19a914ff641dc62428638e6209a0f8ca64990df7966a7cce65903e150ae359efdcdc3ff0067fb863975a0289d468186d63f62e156aec452863c445d402e02d2cc795a2000a1b1f823879abbd397c4dea0918ed66b49d34b48efb8a4a14d3d6ca72d8a950a31dc10f7b4053c9e9ad9ebb590cb4a60f8215d4b99f2b4a040ba9fa500f1a5c4b31984a74e68659c4b420bd699ce630b130b08a6ea1162b0b53320e5a6488cb98a855ffc837d2a75ab90d61ac16cc1b7ab2cd3ed5e22b971c54a530398c9064bdc662d929e645cadda9a712cc5a8243f9cddbd2d98dd1f000f97b5221474526b601f3730a3afa965ceee1b343940c383e5314859e762c97")
 
 _cache: dict[str, object] = {}
 
@@ -225,7 +260,19 @@ def get(name: str):
 
 
 def by_tag(tag: bytes):
-    return get({b"\x01": "pyecc", b"\x02": "mcl"}.get(bytes(tag), "?"))
+    """Back end able to *read* a GT blob with this tag (the native library if present,
+    otherwise a py_ecc-only decoder)."""
+    t = bytes(tag)
+    if t == b"\x01":
+        return get("pyecc")
+    if t == b"\x02":
+        try:
+            return get("mcl")
+        except BackendError:
+            if "mcl-decode" not in _cache:
+                _cache["mcl-decode"] = McLDecodeOnly()
+            return _cache["mcl-decode"]
+    raise BackendError("unknown GT back-end tag")
 
 
 def default():

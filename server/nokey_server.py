@@ -1113,8 +1113,9 @@ class Engine:
             raise BadRequest("row must be an object")
         keys = set(row_wire)
         macs = {k for k in keys if k.startswith("__mac__") and k[7:] in names}
+        fmacs = {k for k in keys if k.startswith("__fmac__") and k[8:] in names}
         hidden = {k for k in keys if self._is_hidden(k)}
-        if keys - macs - hidden != names:
+        if keys - macs - fmacs - hidden != names:
             raise BadRequest("INSERT must provide exactly the table's columns")
         row = {k: w.uwv(v) for k, v in row_wire.items()}
         for k, v in row.items():
@@ -1130,7 +1131,11 @@ class Engine:
     def _check_cell(self, table, col, value) -> None:
         """Binary values belong in FHE columns (and must be valid ciphertexts), and
         FHE columns hold nothing else."""
-        pol = {c[0]: c[2] for c in self._cols(table)}.get(col)
+        pols = {c[0]: c[2] for c in self._cols(table)}
+        base = col[8:] if col.startswith("__fmac__") else col
+        pol = pols.get(base)
+        if col.startswith("__fmac__") and pol != "fhe":
+            raise BadRequest(f"{col!r} is not the tag column of an FHE column")
         if pol == "fhe":
             if not isinstance(value, bytes):
                 raise BadRequest(f"FHE column {col!r} takes ciphertext bytes")
@@ -1147,7 +1152,8 @@ class Engine:
         if not isinstance(col, str):
             raise BadRequest("column must be a string")
         if (col not in known and not self._is_hidden(col)
-                and not (col.startswith("__mac__") and col[7:] in known)):
+                and not (col.startswith("__mac__") and col[7:] in known)
+                and not (col.startswith("__fmac__") and col[8:] in known)):
             raise BadRequest(f"no such column: {col}")
         value = w.uwv(wire_value)
         self._check_cell(table, col, value)
@@ -1207,7 +1213,8 @@ class Engine:
     def _col(self, table, col) -> str:
         known = {c[0] for c in self._cols(table)}
         if not isinstance(col, str) or not (col in known or self._is_hidden(col)
-                                            or (col.startswith("__mac__") and col[7:] in known)):
+                                            or (col.startswith("__mac__") and col[7:] in known)
+                                            or (col.startswith("__fmac__") and col[8:] in known)):
             raise BadRequest(f"no such column: {col!r}")
         return col
 
@@ -1247,17 +1254,23 @@ class Engine:
 
     # — FHE columns: ciphertext SUM / DOT with public data only (no key, no mask) —
     def _fhe_col(self, table, col) -> None:
-        pol = {c[0]: c[2] for c in self._cols(table)}.get(col)
+        base = col[8:] if isinstance(col, str) and col.startswith("__fmac__") else col
+        pol = {c[0]: c[2] for c in self._cols(table)}.get(base)
         if pol != "fhe":
             raise BadRequest(f"{col!r} is not an FHE column of {table!r}")
 
-    def _rpc_fhe_sum(self, table, col, idxs):
+    def _rpc_fhe_sum(self, table, col, idxs, k=1):
         self._fhe_col(table, col)
+        if isinstance(k, bool) or not isinstance(k, int) or not -(1 << 40) <= k <= (1 << 40):
+            raise BadRequest("scale must be an integer with |k| <= 2^40")
         ids = self._check_ids(table, idxs)
         if len(ids) > self.cfg.fhe_max_sum_rows:
             raise BadRequest(f"fhe_sum takes at most {self.cfg.fhe_max_sum_rows} rows per call")
-        cells = self.srv._rows[table].cells(col, ids)         # copied under the lock ...
-        return lambda: _b64e(repl_fhe().sum_cells(cells))       # ... computed outside it
+        try:
+            cells = self.srv._rows[table].cells(col, ids)     # copied under the lock ...
+        except KeyError:
+            raise BadRequest(f"rows of {table!r} have no {col!r} cells (integrity tag missing)") from None
+        return lambda: _b64e(repl_fhe().sum_cells(cells, None, k))   # ... computed outside it
 
     def _rpc_fhe_dot(self, lt, lc, lids, rt, rc, rids, backend=None):
         self._fhe_col(lt, lc)

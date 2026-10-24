@@ -247,3 +247,162 @@ def test_server_uses_the_native_backend_and_a_pure_client_can_still_decrypt(tmp_
                 c._wire.call("fhe_dot", ["emp", "rate", [0] * 6001, "emp", "hours", [0] * 6001, "mcl"])
     finally:
         s.stop()
+
+
+@needs_mcl
+def test_canonical_gt_encoding_is_a_ring_isomorphism_and_the_pinned_generator_is_right():
+    from py_ecc.optimized_bn128 import FQ12
+    mcl = fhe._fb.get("mcl")
+    g = mcl.gt_gen()
+    h = mcl.gt_pow(g, 987654321)
+    a, b_ = FQ12(fhe._fb._rd(mcl.gt_to(g), 12)), FQ12(fhe._fb._rd(mcl.gt_to(h), 12))
+    assert FQ12(fhe._fb._rd(mcl.gt_to(mcl.gt_mul(g, h)), 12)) == a * b_       # multiplication preserved
+    assert mcl.gt_to(mcl.gt_from(mcl.gt_to(h))) == mcl.gt_to(h)                # round trip
+    assert mcl.gt_gen_bytes() == fhe._fb.MCL_GT_GENERATOR                       # the published constant
+
+
+@needs_mcl
+def test_native_dot_results_decrypt_without_the_native_library():
+    """The py_ecc-only decoder reads a result made by the native back end."""
+    xs, ys = [3, -5, 7], [2, 4, -6]
+    nat = fhe.FheKey(KEY._s, 50_000, backend="mcl")
+    blob = fhe.dot_cells([nat.encrypt(x) for x in xs], [nat.encrypt(y) for y in ys], "mcl")
+    assert blob[:1] == b"\x02"
+    dec = fhe._fb.McLDecodeOnly()
+    pure = fhe.FheKey(KEY._s, 50_000, backend="pyecc")
+    be = pure.be
+    real = fhe._fb.by_tag
+    fhe._fb.by_tag = lambda tag: dec if bytes(tag) == b"\x02" else real(tag)
+    try:
+        assert pure.decrypt_dot(blob) == sum(a * b for a, b in zip(xs, ys))
+    finally:
+        fhe._fb.by_tag = real
+
+
+# ── integrity (authenticated=True) ───────────────────────────────────────────
+from torusdb_core.errors import IntegrityError as CoreIntegrity
+
+
+def auth_client():
+    srv = NoKeyServer()
+    c = NoKeyClient(srv, fhe=KEY, authenticated=True)
+    c.execute("CREATE TABLE emp (id INT PLAIN, dept INT PLAIN, rate INT FHE, hours INT FHE)")
+    for i, d, r, h in [(1, 5, 40, 160), (2, 5, 55, 150), (3, 7, 30, 120), (4, 5, 20, 100)]:
+        c.execute(f"INSERT INTO emp (id, dept, rate, hours) VALUES ({i}, {d}, {r}, {h})")
+    return srv, c
+
+
+def test_authenticated_reads_sums_scaled_sums_and_updates():
+    srv, c = auth_client()
+    assert c.execute("SELECT SUM(rate) FROM emp").rows == [[145]]
+    assert c.execute("SELECT SUM(rate) FROM emp WHERE dept = 5").rows == [[115]]
+    assert c.execute("SELECT 3 * SUM(rate) FROM emp").rows == [[435]]            # scalar mult of the ciphertext
+    assert c.execute("SELECT -2 * SUM(hours) FROM emp WHERE dept = 5").rows == [[-820]]
+    assert c.execute("SELECT id, rate FROM emp WHERE id = 3").rows == [[3, 30]]
+    c.execute("UPDATE emp SET rate = 60 WHERE id = 1")
+    assert c.execute("SELECT SUM(rate) FROM emp").rows == [[165]]
+    c.execute("DELETE FROM emp WHERE id = 4")
+    assert c.execute("SELECT SUM(rate) FROM emp").rows == [[145]]
+    assert "__fmac__rate" in srv._rows["emp"].row(0)                              # tags are stored server-side
+
+
+def test_a_lying_server_is_caught():
+    srv, c = auth_client()
+    store = srv._rows["emp"]
+    # 1. a value replaced by another valid ciphertext (tag no longer matches)
+    good = store.row(1)["rate"]
+    store.set_cell(1, "rate", KEY.encrypt(999))
+    with pytest.raises(CoreIntegrity):
+        c.execute("SELECT SUM(rate) FROM emp")
+    with pytest.raises(CoreIntegrity):
+        c.execute("SELECT rate FROM emp WHERE id = 2")
+    store.set_cell(1, "rate", good)
+    assert c.execute("SELECT SUM(rate) FROM emp").rows == [[145]]
+    # 2. a whole row swapped (value AND its tag) with another row's
+    r0, r2 = store.row(0), store.row(2)
+    a = (r0["rate"], r0["__fmac__rate"]); b = (r2["rate"], r2["__fmac__rate"])
+    store.set_cell(0, "rate", b[0]); store.set_cell(0, "__fmac__rate", b[1])
+    with pytest.raises(CoreIntegrity):
+        c.execute("SELECT rate FROM emp WHERE id = 1")
+    store.set_cell(0, "rate", a[0]); store.set_cell(0, "__fmac__rate", a[1])
+    # 3. an answer scaled, or computed over fewer / duplicated rows
+    real = srv.fhe_sum
+    for lie in (lambda t, col, ids, k=1: real(t, col, ids, k * 2),
+                lambda t, col, ids, k=1: real(t, col, ids[:-1], k),
+                lambda t, col, ids, k=1: real(t, col, ids + ids[:1], k)):
+        srv.fhe_sum = lie
+        with pytest.raises(CoreIntegrity):
+            c.execute("SELECT SUM(rate) FROM emp")
+        with pytest.raises(CoreIntegrity):
+            c.execute("SELECT 2 * SUM(hours) FROM emp")
+    srv.fhe_sum = real
+    assert c.execute("SELECT SUM(hours) FROM emp").rows == [[530]]
+
+
+def test_untagged_data_is_refused_by_an_authenticated_client_and_dot_needs_opt_in():
+    srv = NoKeyServer()
+    plain_c = NoKeyClient(srv, fhe=KEY)                      # writes without tags
+    plain_c.execute("CREATE TABLE t (a INT FHE, b INT FHE)")
+    plain_c.execute("INSERT INTO t (a, b) VALUES (2, 3)")
+    auth = NoKeyClient(srv, fhe=KEY, authenticated=True)
+    auth._schema, auth._coltype, auth._colpolicy = plain_c._schema, plain_c._coltype, plain_c._colpolicy
+    with pytest.raises(CoreIntegrity):
+        auth.execute("SELECT a FROM t")
+    with pytest.raises(CoreIntegrity):
+        auth.execute("SELECT SUM(a) FROM t")
+    _, c = auth_client()
+    with pytest.raises(Exception, match="no integrity protection"):
+        c.execute("SELECT DOT(rate, hours) FROM emp")
+    c.fhe_allow_unverified_dot = True
+    assert c.execute("SELECT DOT(rate, hours) FROM emp").rows == [[40 * 160 + 55 * 150 + 30 * 120 + 20 * 100]]
+
+
+def test_authenticated_insert_is_atomic_over_the_wire(tmp_path):
+    s = Running(db=str(tmp_path / "db"))
+    try:
+        with s.connect(fhe_key=KEY, authenticated=True) as c:
+            c.execute("CREATE TABLE t (id INT PLAIN, v INT FHE)")
+            c.execute("INSERT INTO t (id, v) VALUES (1, 10)")
+            c.cursor().executemany("INSERT INTO t (id, v) VALUES (%s, %s)", [(2, 20), (3, 30)])
+            assert c.execute("SELECT SUM(v) FROM t").rows == [[60]]
+            assert c.execute("SELECT 2 * SUM(v) FROM t WHERE id > 1").rows == [[100]]
+            # the tag write fails midway -> the row must not exist at all
+            real = c.client.server.update_cell
+            def boom(*a, **k):
+                raise RuntimeError("network died")
+            c.client.server.update_cell = boom
+            with pytest.raises(Exception):
+                c.execute("INSERT INTO t (id, v) VALUES (4, 40)")
+            c.client.server.update_cell = real
+            assert c._wire.call("table_info", ["t"])["rows"] == 3
+            assert c.execute("SELECT SUM(v) FROM t").rows == [[60]]
+        # a server that tampers on disk is caught by a fresh authenticated client
+        with s.connect(fhe_key=KEY, authenticated=True) as c2:
+            c2._wire.call("update_cell", ["t", 0, "v", {"t": "x", "v": __import__("base64").b64encode(KEY.encrypt(11)).decode()}])
+            with pytest.raises(torussql.IntegrityError):
+                c2.execute("SELECT SUM(v) FROM t")
+    finally:
+        s.stop()
+
+
+def test_published_vectors():
+    """proto/fhe-vectors.json is what other-language drivers are tested against."""
+    import json
+    from pathlib import Path
+    v = json.loads((Path(__file__).resolve().parents[1] / "proto/fhe-vectors.json").read_text())
+    key = fhe.FheKey.from_secret_bytes(bytes.fromhex(v["secret"]), v["range"], backend="pyecc")
+    A = [bytes.fromhex(c) for c in v["cells_a"]]
+    assert [key.decrypt_cell(c) for c in A] == v["values_a"]
+    assert key.decrypt_sum(bytes.fromhex(v["sum_blob"])) == v["sum_expected"]
+    assert key.decrypt_sum(bytes.fromhex(v["scaled3_sum_blob"])) == v["scaled3_expected"]
+    assert key.decrypt_dot(bytes.fromhex(v["dot_blob_pyecc"])) == v["dot_expected"]
+    if v["dot_blob_mcl"]:
+        assert key.decrypt_dot(bytes.fromhex(v["dot_blob_mcl"])) == v["dot_expected"]   # via the decode-only path if needed
+    mac = v["mac"]
+    assert hex(key.alpha) == mac["alpha"]
+    assert [hex(key.gamma(mac["table"], mac["column"], i)) for i in mac["row_ids"]] == mac["gamma"]
+    assert key.decrypt_sum_verified(bytes.fromhex(v["sum_blob"]), bytes.fromhex(mac["tag_sum_blob"]),
+                                    mac["table"], mac["column"], mac["row_ids"]) == v["sum_expected"]
+    gens = v["gt_generators"]
+    assert fhe._fb.get("pyecc").gt_to(fhe._fb.get("pyecc").gt_gen()).hex() == gens["pyecc_tag01"]
+    assert fhe._fb.MCL_GT_GENERATOR.hex() == gens["mcl_tag02"]

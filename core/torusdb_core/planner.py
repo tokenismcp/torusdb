@@ -449,7 +449,8 @@ def _plan_select(q: Select, cat: Catalog) -> Plan:
                 if col.policy == "plain":
                     raise PlanError(f"k*col requires encrypted/paired, got plain (column {col.name!r})")
                 if col.policy == "fhe":
-                    raise PlanError(f"k*col is not supported on FHE columns (column {col.name!r})")
+                    raise PlanError(f"k*col (per row) is not supported on FHE columns "
+                                    f"(column {col.name!r}); k*SUM(col) is")
                 projs.append(PScalarMul(scalar=proj.scalar, column=qname,
                                         policy=col.policy))
             elif isinstance(proj, ScaledSumExpr):
@@ -458,8 +459,7 @@ def _plan_select(q: Select, cat: Catalog) -> Plan:
                 qname, col = _rcol(proj.column)
                 if col.policy == "plain":
                     raise PlanError(f"k*SUM(col) requires encrypted/paired, got plain (column {col.name!r})")
-                if col.policy == "fhe":
-                    raise PlanError(f"k*SUM(col) is not supported on FHE columns (column {col.name!r})")
+                _no_fhe_in_join(is_join, col)
                 projs.append(PScaledSum(scalar=proj.scalar, column=qname,
                                         policy=col.policy))
             elif isinstance(proj, CountStar):
