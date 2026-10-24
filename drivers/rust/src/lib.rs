@@ -31,6 +31,7 @@ mod hash;
 
 pub use error::{Error, Kind};
 pub use fhe::{
+    new_nonce as fhe_new_nonce,
     add_sums as fhe_add_sums, cell_to_sum as fhe_cell_to_sum, mul_dots as fhe_mul_dots, sum_cells as fhe_sum_cells,
     FheBackend, FheKey, FHE_CELL_BYTES, FHE_DEFAULT_RANGE, FHE_DOT_BYTES, FHE_MAX_RANGE, FHE_SUM_BYTES,
 };
@@ -60,6 +61,7 @@ type Result<T> = std::result::Result<T, Error>;
 const LIST_CHUNK: usize = 100_000;
 const MAC: &str = "__mac__";
 const FMAC: &str = "__fmac__";
+const FNONCE: &str = "__fnonce__";
 const FHE_SUM_CHUNK: usize = 2000; // ids per fhe_sum call (server cap 5000)
 const FHE_DOT_CHUNK_NATIVE: usize = 2000; // server cap 6000 with the native back end
 const FHE_DOT_CHUNK: usize = 50; // server cap 300 with pure Python (~0.2 s per row)
@@ -522,7 +524,7 @@ type Schema = HashMap<String, TableDef>;
 struct BlindedRow {
     wire: serde_json::Map<String, Value>,
     pending: Vec<(String, BigInt)>,
-    tags: Vec<(String, i64)>,
+    tags: Vec<(String, i64, BigInt)>,
 }
 
 pub struct Client {
@@ -1075,15 +1077,16 @@ impl Client {
 
     /// The encrypted wire cell of an FHE column plus (authenticated) its tag. `rowid` is unknown at
     /// INSERT time: a placeholder tag is sent and replaced by `fhe_write_tags` once the row id exists.
-    fn fhe_cells(&self, table: &str, col: &str, x: i64, rowid: Option<i64>) -> Result<Vec<(String, Value)>> {
+    fn fhe_cells(&self, table: &str, col: &str, x: i64, nonce: &BigInt, rowid: Option<i64>) -> Result<Vec<(String, Value)>> {
         let key = self.fhe_key()?;
         let mut cells = vec![(col.to_string(), wv_cell(&key.encrypt(x)?)?)];
         if self.opts.authenticated {
             let tag = match rowid {
                 None => key.placeholder_cell()?,
-                Some(id) => key.tag(x, table, col, id)?,
+                Some(id) => key.tag(x, table, col, id, nonce)?,
             };
             cells.push((format!("{}{}", FMAC, col), wv_cell(&tag)?));
+            cells.push((format!("{}{}", FNONCE, col), json!({"t": "i", "v": nonce.to_string()}))); // fresh for EVERY write
         }
         Ok(cells)
     }
@@ -1116,13 +1119,13 @@ impl Client {
         Ok(())
     }
 
-    fn fhe_tag_items(&self, table: &str, rowid: i64, tags: &[(String, i64)]) -> Result<Vec<(i64, String, Value)>> {
+    fn fhe_tag_items(&self, table: &str, rowid: i64, tags: &[(String, i64, BigInt)]) -> Result<Vec<(i64, String, Value)>> {
         if tags.is_empty() {
             return Ok(vec![]);
         }
         let key = self.fhe_key()?;
         tags.iter()
-            .map(|(col, x)| Ok((rowid, format!("{}{}", FMAC, col), wv_cell(&key.tag(*x, table, col, rowid)?)?)))
+            .map(|(col, x, nonce)| Ok((rowid, format!("{}{}", FMAC, col), wv_cell(&key.tag(*x, table, col, rowid, nonce)?)?)))
             .collect()
     }
 
@@ -1153,11 +1156,12 @@ impl Client {
                 wire.insert(c.name.clone(), wv(v)?);
             } else if c.policy == "fhe" {
                 let x = Self::fhe_int(v, table, &c.name)?;
-                for (n, w) in self.fhe_cells(table, &c.name, x, None)? {
+                let nonce = fhe_new_nonce();
+                for (n, w) in self.fhe_cells(table, &c.name, x, &nonce, None)? {
                     wire.insert(n, w);
                 }
                 if self.opts.authenticated {
-                    tags.push((c.name.clone(), x));
+                    tags.push((c.name.clone(), x, nonce));
                 }
             } else {
                 let (cells, masks) = self.blind_cell(table, &c.name, v)?;
@@ -1264,7 +1268,7 @@ impl Client {
                     } else if policy == "fhe" {
                         // a fresh ciphertext (and tag) per row, never one shared cell
                         let x = Self::fhe_int(v, table, col)?;
-                        for (n, w) in db.fhe_cells(table, col, x, Some(*i))? {
+                        for (n, w) in db.fhe_cells(table, col, x, &fhe_new_nonce(), Some(*i))? {
                             fhe_items.push((*i, n, w));
                         }
                     } else {
@@ -1695,7 +1699,8 @@ impl Client {
         }
         let total = total.unwrap();
         if self.opts.authenticated {
-            key.decrypt_sum_verified(&total, &tags.unwrap(), table, col, idxs, k)
+            let nonces = self.fetch_nonces(table, col, idxs)?;
+            key.decrypt_sum_verified(&total, &tags.unwrap(), table, col, idxs, &nonces, k)
         } else {
             key.decrypt_sum(&total)
         }
@@ -1742,17 +1747,29 @@ impl Client {
                 args.push(json!(b.as_str()));
             }
             let b = blob(&self.call_max("fhe_dot", Value::Array(args), 8192)?, "fhe_dot", FHE_DOT_BYTES)?;
-            if let Some(be) = backend {
-                if b[0] != be.tag() {
-                    return Err(proto("fhe_dot: the back-end tag does not match the requested back end"));
-                }
-            }
+            // `backend` is only a request: the server may use its own, and the blob's tag says which (both decrypt)
             total = Some(match total {
                 None => b,
                 Some(t) => fhe_mul_dots(&t, &b)?,
             });
         }
         Ok(BigInt::from(key.decrypt_dot(&total.unwrap())?))
+    }
+
+    /// The write nonces the server reports for `ids` (`None` where absent or not an integer: the
+    /// verification then fails with `Kind::Integrity`).
+    fn fetch_nonces(&mut self, table: &str, col: &str, ids: &[i64]) -> Result<Vec<Option<BigInt>>> {
+        let mut out = vec![];
+        for part in ids.chunks(FHE_READ_CHUNK) {
+            let v = self.call_max("plain_cells", json!([table, format!("{}{}", FNONCE, col), part]), part.len() * 120 + 4096)?;
+            for w in arr(&v, "plain_cells", Some(part.len()))? {
+                out.push(match w.get("t").and_then(|t| t.as_str()) {
+                    Some("i") => Some(big(&w["v"], "write nonce")?),
+                    _ => None,
+                });
+            }
+        }
+        Ok(out)
     }
 
     /// Decrypt the FHE cells of `ids` (verified against their tags when authenticated).
@@ -1779,11 +1796,13 @@ impl Client {
                 .collect();
         }
         let tags = fetch(self, &format!("{}{}", FMAC, col))?;
+        let nonces = self.fetch_nonces(table, col, ids)?;
         cells
             .iter()
             .zip(&tags)
             .zip(ids)
-            .map(|((c, t), id)| key.decrypt_cell_verified(c.as_deref(), t.as_deref(), table, col, *id))
+            .zip(&nonces)
+            .map(|(((c, t), id), n)| key.decrypt_cell_verified(c.as_deref(), t.as_deref(), table, col, *id, n.as_ref()))
             .collect()
     }
 

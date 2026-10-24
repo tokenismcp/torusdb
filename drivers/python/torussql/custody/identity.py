@@ -133,20 +133,23 @@ def _canon(obj) -> bytes:
 
 # ── signed broadcast ─────────────────────────────────────────────────────────
 def sign_broadcast(idn: Identity, kind: str, session: bytes, b: Broadcast,
-                   params: dict | None = None) -> dict:
+                   params: dict | None = None, key_group: Group | None = None) -> dict:
     """Sign (kind, session, signer, ceremony ``params``, broadcast). ``params`` is
     the ceremony specification (group, k, n, participant-list digest; for a
     reshare also old key_id/epoch, quorum, new k/n): every participant must
     present the identical value or the broadcast is refused."""
     g = idn.g
     body = {"kind": kind, "session": session.hex(), "signer": idn.index,
-            "params": params or {}, "bcast": b.to_json(g)}
+            "params": params or {}, "bcast": b.to_json(key_group or g)}
     _, sig = schnorr_prove(g, idn.secret, b"sig\x00" + _canon(body))
     return {"body": body, "sig": sig.to_json(g), "signer": idn.index}
 
 
 def open_broadcast(g: Group, signer_pub, msg: dict, kind: str, session: bytes, *,
-                   expected_index: int | None = None, params: dict | None = None) -> Broadcast:
+                   expected_index: int | None = None, params: dict | None = None,
+                   key_group: Group | None = None) -> Broadcast:
+    """``g`` is the IDENTITY group (signatures); ``key_group`` the group the key's commitments
+    live in (defaults to ``g``; ``bn254g2`` for the second FHE secret)."""
     try:
         body = msg["body"]
         if body.get("kind") != kind or body.get("session") != session.hex():
@@ -162,7 +165,7 @@ def open_broadcast(g: Group, signer_pub, msg: dict, kind: str, session: bytes, *
         if got != want:
             raise CustodyError("broadcast was made for a different ceremony specification "
                                "(group/k/n/participants differ)")
-        b = Broadcast.from_json(g, body["bcast"])
+        b = Broadcast.from_json(key_group or g, body["bcast"])
         signer = body.get("signer")
         if b.index != msg.get("signer") or b.index != signer:
             raise CustodyError("broadcast index does not match its signer")
@@ -236,14 +239,14 @@ def decrypt_share(idn: Identity, session: bytes, msg: dict, sender_pub) -> int:
 # ── file-based ceremony helpers ──────────────────────────────────────────────
 def export_dealing(idn: Identity, kind: str, session: bytes, dealing: Dealing,
                    recipient_pubs: dict[int, object], outdir: str,
-                   params: dict | None = None) -> list[str]:
+                   params: dict | None = None, key_group: Group | None = None) -> list[str]:
     """Write ``broadcast_<i>.json`` and one encrypted+signed ``share_<i>_to_<j>.json``
     per recipient. Files are created exclusively, mode 0600 for shares from the start."""
     out = Path(outdir)
     out.mkdir(parents=True, exist_ok=True)
     files = []
     p = out / f"broadcast_{idn.index}.json"
-    _atomic(str(p), json.dumps(sign_broadcast(idn, kind, session, dealing.broadcast, params),
+    _atomic(str(p), json.dumps(sign_broadcast(idn, kind, session, dealing.broadcast, params, key_group),
                                indent=1).encode(), 0o644)
     files.append(str(p))
     for j, y in dealing.shares.items():
@@ -258,7 +261,7 @@ def export_dealing(idn: Identity, kind: str, session: bytes, dealing: Dealing,
 
 def import_dealings(idn: Identity, kind: str, session: bytes, indir: str,
                     sender_pubs: dict[int, object], senders: list[int],
-                    params: dict | None = None
+                    params: dict | None = None, key_group: Group | None = None
                     ) -> tuple[dict[int, Broadcast], dict[int, int]]:
     g = idn.g
     d = Path(indir)
@@ -274,7 +277,7 @@ def import_dealings(idn: Identity, kind: str, session: bytes, indir: str,
         except (ValueError, UnicodeError) as exc:
             raise CustodyError(f"unreadable ceremony file from participant {i}") from None
         bcasts[i] = open_broadcast(g, sender_pubs[i], bmsg, kind, session,
-                                   expected_index=i, params=params)
+                                   expected_index=i, params=params, key_group=key_group)
         if not isinstance(msg, dict) or msg.get("from") != i:
             raise CustodyError(f"{sf.name} claims to be from participant "
                                f"{msg.get('from') if isinstance(msg, dict) else None}, "

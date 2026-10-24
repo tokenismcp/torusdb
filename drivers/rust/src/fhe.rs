@@ -49,12 +49,6 @@ impl FheBackend {
             FheBackend::Mcl => "mcl",
         }
     }
-    pub(crate) fn tag(&self) -> u8 {
-        match self {
-            FheBackend::Pyecc => 1,
-            FheBackend::Mcl => 2,
-        }
-    }
 }
 
 const G2X0: &str = "10857046999023057135944570762232829481370756359578518086990519993285655852781";
@@ -716,25 +710,33 @@ fn g1_baby_table(m: u64) -> Arc<G1Table> {
     t
 }
 
-/// Discrete log of `M` (w.r.t. G1) over [-range, range].
+/// Discrete log of `target` (w.r.t. G1) over [-range, range].
 fn g1_dlog(target: &G1, range: u64) -> Result<i64> {
-    let pt = match target {
-        None => return Ok(0),
-        Some(a) => a,
-    };
     let c = c1();
     let m = bsgs_m(range);
     let tab = g1_baby_table(m);
     let shift = c.mul_fixed(g1_base(), &BigUint::from(range))?;
-    let mut cur = c.add(&c.lift(pt), &shift);
+    let tj = target.as_ref().map(|a| c.lift(a)).unwrap_or_else(|| c.inf());
+    let base = c.add(&tj, &shift);
     let giant = c.to_affine(&c.mul_fixed(g1_base(), &BigUint::from(m))?).unwrap();
     let neg_giant = Aff { x: giant.x.clone(), y: giant.y.neg() };
-    let mut i = 0u64;
-    while i <= m {
-        let mut pts = vec![];
+    // Start the giant-step walk at a RANDOM position and wrap around: the number of steps until a hit
+    // is then uniform and independent of the plaintext (a fixed start leaks the value through timing).
+    let steps = m + 1;
+    let i0 = rand_index(steps);
+    let back = c.mul_fixed(g1_base(), &(BigUint::from(i0) * m))?;
+    let mut cur = c.add(&base, &c.neg(&back));
+    let mut t = 0u64;
+    while t < steps {
+        let (mut pts, mut idx) = (vec![], vec![]);
         let mut k = 0;
-        while k < 128 && i + k <= m {
+        while k < 128 && t + k < steps {
+            let i = (i0 + t + k) % steps;
+            if i == 0 && t + k > 0 {
+                cur = base.clone(); // wrapped around
+            }
             pts.push(cur.clone());
+            idx.push(i);
             cur = c.add_mixed(&cur, &neg_giant);
             k += 1;
         }
@@ -744,16 +746,29 @@ fn g1_dlog(target: &G1, range: u64) -> Result<i64> {
                 Some(a) => tab.map.get(&g1_key(a)).copied(),
             };
             if let Some(j) = j {
-                let val = ((i + k as u64) * m + j as u64) as i64 - range as i64;
+                let val = (idx[k] * m + j as u64) as i64 - range as i64;
                 if val.unsigned_abs() > range {
                     return Err(out_of_range());
                 }
                 return Ok(val);
             }
         }
-        i += pts.len() as u64;
+        t += pts.len() as u64;
     }
     Err(out_of_range())
+}
+
+fn rand_index(n: u64) -> u64 {
+    let mut b = [0u8; 8];
+    rand::thread_rng().fill_bytes(&mut b);
+    u64::from_be_bytes(b) % n
+}
+
+/// A fresh per-write number (1 <= n < 2^120) that individualises an integrity tag.
+pub fn new_nonce() -> BigInt {
+    let mut b = [0u8; 15];
+    rand::thread_rng().fill_bytes(&mut b);
+    BigInt::from(BigUint::from_bytes_be(&b) | BigUint::one())
 }
 
 fn out_of_range() -> Error {
@@ -789,8 +804,15 @@ fn gt_dlog(mm: &Fp12, tag: u8, range: u64) -> Result<i64> {
         }
     };
     let giant = g.pow(&(group_order() - BigUint::from(m)));
-    let mut cur = mm.mul(&g.pow(&BigUint::from(range)));
-    for i in 0..=m {
+    let base = mm.mul(&g.pow(&BigUint::from(range)));
+    let steps = m + 1;
+    let i0 = rand_index(steps); // random start: see g1_dlog
+    let mut cur = base.mul(&giant.pow(&BigUint::from(i0)));
+    for t in 0..steps {
+        let i = (i0 + t) % steps;
+        if i == 0 && t > 0 {
+            cur = base.clone(); // wrapped around
+        }
         if let Some(j) = tab.map.get(&cur.key()) {
             let val = (i * m + *j as u64) as i64 - range as i64;
             if val.unsigned_abs() > range {
@@ -1232,17 +1254,21 @@ impl FheKey {
         BigInt::from(self.alpha_u().clone())
     }
     /// The per-cell tweak `gamma = PRF("gamma", table, column, row id)`.
-    pub fn gamma(&self, table: &str, col: &str, rowid: i64) -> BigInt {
-        BigInt::from(self.prf("gamma", &[table.to_string(), col.to_string(), rowid.to_string()]))
+    pub fn gamma(&self, table: &str, col: &str, rowid: i64, nonce: &BigInt) -> BigInt {
+        BigInt::from(self.prf(
+            "gamma",
+            &[table.to_string(), col.to_string(), rowid.to_string(), nonce.to_string()],
+        ))
     }
     /// The tag cell `Enc(alpha*v + gamma)` for the cell `(table, col, rowid)`.
-    pub fn tag(&self, v: i64, table: &str, col: &str, rowid: i64) -> Result<Vec<u8>> {
-        let m = self.alpha() * BigInt::from(v) + self.gamma(table, col, rowid);
+    pub fn tag(&self, v: i64, table: &str, col: &str, rowid: i64, nonce: &BigInt) -> Result<Vec<u8>> {
+        let m = self.alpha() * BigInt::from(v) + self.gamma(table, col, rowid, nonce);
         self.encrypt_scalar(&m)
     }
 
     /// Check `tag-sum == alpha * value-sum + k * (sum gamma_i) * G1` (group elements) and return the
     /// decrypted value sum. Fails with `Kind::Integrity` on any mismatch.
+    #[allow(clippy::too_many_arguments)]
     pub fn decrypt_sum_verified(
         &self,
         value_blob: &[u8],
@@ -1250,15 +1276,28 @@ impl FheKey {
         table: &str,
         col: &str,
         row_ids: &[i64],
+        nonces: &[Option<BigInt>],
         scale: &BigInt,
     ) -> Result<i64> {
         if value_blob.len() != FHE_SUM_BYTES || tag_blob.len() != FHE_SUM_BYTES {
             return Err(proto("bad SUM ciphertext"));
         }
+        if nonces.len() != row_ids.len() {
+            return Err(Error::new(
+                Kind::Integrity,
+                format!("{}.{}: write nonces missing for the requested rows", table, col),
+            ));
+        }
         let n = BigInt::from(group_order().clone());
         let mut gam = BigInt::zero();
-        for i in row_ids {
-            gam += self.gamma(table, col, *i);
+        for (i, nonce) in row_ids.iter().zip(nonces) {
+            let nonce = nonce.as_ref().ok_or_else(|| {
+                Error::new(
+                    Kind::Integrity,
+                    format!("{}.{} row {} has no write nonce (written without authentication, or tampered)", table, col, i),
+                )
+            })?;
+            gam += self.gamma(table, col, *i, nonce);
         }
         gam = gam.mod_floor(&n);
         let c = c1();
@@ -1290,6 +1329,7 @@ impl FheKey {
         table: &str,
         col: &str,
         rowid: i64,
+        nonce: Option<&BigInt>,
     ) -> Result<i64> {
         let (cell, tag) = match (cell, tag) {
             (Some(c), Some(t)) => (c, t),
@@ -1303,7 +1343,7 @@ impl FheKey {
                 ))
             }
         };
-        self.decrypt_sum_verified(&cell_to_sum(cell)?, &cell_to_sum(tag)?, table, col, &[rowid], &BigInt::one())
+        self.decrypt_sum_verified(&cell_to_sum(cell)?, &cell_to_sum(tag)?, table, col, &[rowid], &[nonce.cloned()], &BigInt::one())
     }
 }
 
@@ -1323,6 +1363,23 @@ pub mod internals {
             && b.on_curve(&g2_gen())
             && a.is_inf(&a.mul(&a.lift(&g1_gen()), group_order()))
             && b.is_inf(&b.mul(&b.lift(&g2_gen()), group_order()))
+    }
+    /// base64 decode (test helper)
+    pub fn unb64(s: &str) -> Vec<u8> {
+        b64_decode(s).unwrap()
+    }
+    /// `a*A + b*B` on the two G1 halves (C1 || C2, 128 bytes each) - what a keyless server can do (test helper)
+    pub fn g1_affine_combo(a_blob: &[u8], a: i64, b_blob: &[u8], b: i64) -> Vec<u8> {
+        let c = c1();
+        let k = |x: i64| to_scalar(&BigInt::from(x));
+        let mut out = vec![];
+        for off in [0usize, 64] {
+            let pa = g1_from(&a_blob[off..off + 64]).unwrap().map(|p| c.lift(&p)).unwrap_or_else(|| c.inf());
+            let pb = g1_from(&b_blob[off..off + 64]).unwrap().map(|p| c.lift(&p)).unwrap_or_else(|| c.inf());
+            let r = c.add(&c.mul(&pa, &k(a)), &c.mul(&pb, &k(b)));
+            out.extend(g1_to(&c.to_affine(&r)));
+        }
+        out
     }
     pub fn hex(b: &[u8]) -> String {
         hex_encode(b)

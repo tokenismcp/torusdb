@@ -135,6 +135,7 @@ class ServerConfig:
     fhe_max_sum_rows: int = 5000      # rows per fhe_sum call
     fhe_max_dot_rows: int = 300       # rows per fhe_dot call with the pure-Python back end
     fhe_max_dot_rows_native: int = 6000   # ... with the native (mcl) back end
+    fhe_allow_client_backend: bool = False   # may a client force a different pairing back end?
     tx_ring: int = 100_000            # committed transaction ids remembered
     storage: str = "memory"           # "memory" | "disk" (heap files in <db>.data/)
     cache_rows: int = 50_000          # disk storage: decoded rows cached per table
@@ -895,6 +896,8 @@ class Engine:
                     except ValueError as exc:               # invalid ciphertext bytes
                         raise BadRequest(f"invalid FHE ciphertext: {exc}") from None
                 return res                               # raced with a new tx; retry
+            if method in ("insert", "insert_many", "update_cell", "update_cells"):
+                self._prevalidate_fhe(method, args)
             with self._cv:                             # writers wait out a foreign tx
                 self._check_timed_out(s)
                 while self._tx_owner not in (None, s.id):
@@ -960,6 +963,29 @@ class Engine:
                         "recommended_dot_rows": {"pyecc": 50, "mcl": 2000},
                         "backends": ["pyecc"] + (["mcl"] if have_native else []),
                         "default_backend": os.environ.get("TORUSDB_FHE_BACKEND", "auto")}}
+
+    def _prevalidate_fhe(self, method: str, args: list) -> None:
+        """Validate every FHE cell of a write (curve membership AND G2 subgroup — about a
+        millisecond each natively, a tenth of a second in pure Python) before the global
+        database lock is taken, so a large batch cannot stall every other session."""
+        wires: list = []
+        try:
+            if method == "insert":
+                wires = list(args[1].values())
+            elif method == "insert_many":
+                wires = [v for row in args[1] for v in row.values()]
+            elif method == "update_cell":
+                wires = [args[3]]
+            elif method == "update_cells":
+                wires = [it[2] for it in args[1]]
+        except (AttributeError, IndexError, TypeError, KeyError):
+            return                                      # malformed: the real handler reports it
+        for wv_ in wires:
+            if isinstance(wv_, dict) and wv_.get("t") == "x":
+                try:
+                    repl_fhe().parse_cell(w.uwv(wv_), None, True)
+                except ValueError as exc:
+                    raise BadRequest(f"invalid FHE ciphertext: {exc}") from None
 
     def _call(self, method: str, args: list):
         try:
@@ -1152,8 +1178,9 @@ class Engine:
         keys = set(row_wire)
         macs = {k for k in keys if k.startswith("__mac__") and k[7:] in names}
         fmacs = {k for k in keys if k.startswith("__fmac__") and k[8:] in names}
+        fnonces = {k for k in keys if k.startswith("__fnonce__") and k[10:] in names}
         hidden = {k for k in keys if self._is_hidden(k)}
-        if keys - macs - fmacs - hidden != names:
+        if keys - macs - fmacs - fnonces - hidden != names:
             raise BadRequest("INSERT must provide exactly the table's columns")
         row = {k: w.uwv(v) for k, v in row_wire.items()}
         for k, v in row.items():
@@ -1164,23 +1191,33 @@ class Engine:
         if any(not isinstance(row[k], int) or isinstance(row[k], bool) or row[k] < 0
                for k in hidden if k != "__cid__"):
             raise BadRequest("mask versions must be non-negative integers")
+        for k in fnonces:
+            self._check_nonce(row[k])
         return self.srv.insert(table, row)
+
+    @staticmethod
+    def _check_nonce(v) -> None:
+        if isinstance(v, bool) or not isinstance(v, int) or not 0 < v < (1 << 128):
+            raise BadRequest("an FHE write nonce is an integer in (0, 2^128)")
 
     def _check_cell(self, table, col, value) -> None:
         """Binary values belong in FHE columns (and must be valid ciphertexts), and
         FHE columns hold nothing else."""
         pols = {c[0]: c[2] for c in self._cols(table)}
+        if col.startswith("__fnonce__"):
+            if pols.get(col[10:]) != "fhe":
+                raise BadRequest(f"{col!r} is not the nonce column of an FHE column")
+            self._check_nonce(value)
+            return
         base = col[8:] if col.startswith("__fmac__") else col
         pol = pols.get(base)
         if col.startswith("__fmac__") and pol != "fhe":
             raise BadRequest(f"{col!r} is not the tag column of an FHE column")
         if pol == "fhe":
-            if not isinstance(value, bytes):
-                raise BadRequest(f"FHE column {col!r} takes ciphertext bytes")
-            try:
-                repl_fhe().parse_cell(value)
-            except ValueError as exc:
-                raise BadRequest(f"invalid FHE ciphertext for {col!r}: {exc}") from None
+            # Full validation (curve + subgroup) already ran BEFORE the global lock was taken
+            # (see _prevalidate_fhe); under the lock only the cheap shape check remains.
+            if not isinstance(value, bytes) or len(value) != repl_fhe().CELL_BYTES:
+                raise BadRequest(f"FHE column {col!r} takes {repl_fhe().CELL_BYTES}-byte ciphertext cells")
         elif isinstance(value, bytes):
             raise BadRequest(f"column {col!r} is not an FHE column")
 
@@ -1191,7 +1228,8 @@ class Engine:
             raise BadRequest("column must be a string")
         if (col not in known and not self._is_hidden(col)
                 and not (col.startswith("__mac__") and col[7:] in known)
-                and not (col.startswith("__fmac__") and col[8:] in known)):
+                and not (col.startswith("__fmac__") and col[8:] in known)
+                and not (col.startswith("__fnonce__") and col[10:] in known)):
             raise BadRequest(f"no such column: {col}")
         value = w.uwv(wire_value)
         self._check_cell(table, col, value)
@@ -1252,7 +1290,8 @@ class Engine:
         known = {c[0] for c in self._cols(table)}
         if not isinstance(col, str) or not (col in known or self._is_hidden(col)
                                             or (col.startswith("__mac__") and col[7:] in known)
-                                            or (col.startswith("__fmac__") and col[8:] in known)):
+                                            or (col.startswith("__fmac__") and col[8:] in known)
+                                            or (col.startswith("__fnonce__") and col[10:] in known)):
             raise BadRequest(f"no such column: {col!r}")
         return col
 
@@ -1304,6 +1343,8 @@ class Engine:
         ids = self._check_ids(table, idxs)
         if len(ids) > self.cfg.fhe_max_sum_rows:
             raise BadRequest(f"fhe_sum takes at most {self.cfg.fhe_max_sum_rows} rows per call")
+        if len(set(ids)) != len(ids):
+            raise BadRequest("fhe_sum takes distinct row ids")
         try:
             cells = self.srv._rows[table].cells(col, ids)     # copied under the lock ...
         except KeyError:
@@ -1320,14 +1361,18 @@ class Engine:
             raise BadRequest("backend must be 'pyecc' or 'mcl'")
         from torusdb_core import fhe_backend
         try:
-            be = fhe_backend.get(backend) if backend else fhe_backend.default()
-        except ValueError as exc:
+            be = fhe_backend.default()
+            if backend and backend != be.name and self.cfg.fhe_allow_client_backend:
+                be = fhe_backend.get(backend)        # a client may ask for another one only if allowed:
+        except ValueError as exc:                   # forcing the slow pure-Python path is a DoS lever
             raise BadRequest(f"FHE back end unavailable on this server: {exc}") from None
         cap = (self.cfg.fhe_max_dot_rows_native if be.name == "mcl"
                else self.cfg.fhe_max_dot_rows)
         if len(a) > cap:
             raise BadRequest(f"fhe_dot takes at most {cap} rows per call with the "
                              f"{be.name} back end")
+        if len(set(a)) != len(a) or len(set(b)) != len(b):
+            raise BadRequest("fhe_dot takes distinct row ids on each side")
         left = self.srv._rows[lt].cells(lc, a)
         right = self.srv._rows[rt].cells(rc, b)
         backend = be.name
@@ -1636,6 +1681,8 @@ def main(argv: list[str] | None = None) -> None:
                     help="env var with an admin token for the primary (replication)")
     ap.add_argument("--repl-tls", action="store_true", help="use TLS towards the primary")
     ap.add_argument("--repl-cafile", default=None)
+    ap.add_argument("--fhe-allow-client-backend", action="store_true",
+                    help="let clients pick the FHE pairing back end (default: the server's own)")
     ap.add_argument("--sync-replicas", type=int, default=0,
                     help="commits wait until this many replicas confirmed them (synchronous replication)")
     ap.add_argument("--sync-timeout", type=float, default=10.0)
@@ -1721,7 +1768,8 @@ def main(argv: list[str] | None = None) -> None:
                        tx_idle_timeout=args.tx_idle_timeout,
                        replica_of=replica_of, repl_conn=repl_conn, repl_ring=args.repl_ring,
                        sync_replicas=args.sync_replicas, sync_timeout=args.sync_timeout,
-                       sync_strict=args.sync_strict)
+                       sync_strict=args.sync_strict,
+                       fhe_allow_client_backend=args.fhe_allow_client_backend)
     ssl_ctx = _build_ssl_ctx(args)
     try:
         srv = NoKeyTCPServer(args.host, args.port, args.db, ssl_ctx=ssl_ctx,

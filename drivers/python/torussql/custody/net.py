@@ -59,12 +59,13 @@ from . import gt as _gt
 
 log = logging.getLogger("torusdb.custodian")
 
+COST_G1, COST_G2, COST_GT = 1, 2, 100      # item-budget units per answered item
 PRE_AUTH_FRAME = 4096
 PRE_AUTH_MAX_FRAMES = 16          # frames a connection may send before authenticating
 _LOOPBACK = {"127.0.0.1", "::1", "localhost"}
 ALL_PERMS = frozenset({"key", "mask_write", "mask_read", "mask_admin"})
 _REQUIRES = {
-    "partial": "key", "partial_batch": "key", "gt_partial_batch": "key", "g2_partial": "key",
+    "partial": "key", "partial_batch": "key", "gt_partial_batch": "key",
     "mask_put": "mask_write",
     "mask_sum": "mask_read", "mask_get": "mask_read", "mask_has": "mask_read",
     "mask_meta_get": "mask_read", "mask_tables": "mask_read",
@@ -115,14 +116,16 @@ class Custodian:
                  approve=None, audit_path: str | None = None,
                  rate_per_minute: int = 30, audit_max_bytes: int = 64 * 1024 * 1024,
                  audit_keep: int = 7, unauth_audit_per_minute: int = 20,
-                 item_budget_per_minute: int | None = 20_000, max_batch: int = 2000,
+                 item_budget_per_minute: int | None = 30_000, max_batch: int = 2000,
                  key_access: dict[str, set] | None = None):
         """``share``: one ``KeyShare``, a list of shares of DIFFERENT keys (one daemon serving
         several keys; requests then name a ``key_id``), or None.
 
         Limits: ``rate_per_minute`` caps REQUESTS per caller and key; a batch is one request.
-        ``item_budget_per_minute`` caps the ITEMS (points / GT elements) answered per caller
-        and key per minute (None = unlimited); ``max_batch`` caps the items in one request.
+        ``item_budget_per_minute`` caps the COST-WEIGHTED items answered per caller and key
+        per minute (None = unlimited): a G1 point costs ``COST_G1`` = 1, a G2 point 2 and a GT
+        element ``COST_GT`` = 100 units (a GT item is ~100x the CPU of a G1 item);
+        ``max_batch`` caps the items in one request.
         ``approve`` is a callable or ``{key_id: callable}``; ``key_access`` is
         ``{key_id: {caller, ...}}`` (a key absent from the map is open to every caller that
         has the ``key`` permission)."""
@@ -225,7 +228,7 @@ class Custodian:
 
     def _admit(self, caller: str, peer: str, op: str, share: KeyShare, n_items: int) -> None:
         """Rate limits, per caller AND key: one REQUEST against ``rate_per_minute`` and
-        ``n_items`` against the item budget. Both are charged before any work."""
+        ``n_items`` COST UNITS against the item budget. Both are charged before any work."""
         bucket = f"{caller}|{share.public.key_id}"
         if not self._rate_ok(self._hits, bucket, 1, self._rate):
             self._audit_denial(caller, peer, op, "denied: rate limit")
@@ -233,8 +236,8 @@ class Custodian:
                                f"caller and key)")
         if not self._rate_ok(self._items, bucket, n_items, self._item_cap):
             self._audit_denial(caller, peer, op, "denied: item budget")
-            raise CustodyError(f"item budget exceeded ({self._item_cap} items per minute per "
-                               f"caller and key)")
+            raise CustodyError(f"item budget exceeded ({self._item_cap} cost units per minute per "
+                               f"caller and key; G1 point = {COST_G1}, GT element = {COST_GT})")
 
     def info(self) -> dict:
         s = self._share
@@ -397,7 +400,13 @@ class Custodian:
         self._admit(caller, peer, op, share, n_items)
         return share
 
+    @staticmethod
+    def _g1_only(share: KeyShare) -> None:
+        if share.public.group == "bn254g2":
+            raise CustodyError("this key (the second FHE secret) serves GT exponentiation only")
+
     def _m_partial(self, caller, peer, E_hex, ctx_hex="", key_id=None):
+        self._g1_only(self._pick(key_id))
         share = self._prelude(caller, peer, "partial", key_id, 1)
         g = share.public.g
         kid = share.public.key_id
@@ -421,8 +430,9 @@ class Custodian:
         return part.to_json(g)
 
     # — key service, batch form (threshold FHE keys: many cells per round trip) —
-    def _batch_shape(self, caller, peer, op, items, cap, key_id):
-        """Shape check, then the admission charges: ONE request plus ``len(items)`` items."""
+    def _batch_shape(self, caller, peer, op, items, cap, key_id, unit_cost=COST_G1):
+        """Shape check, then the admission charges: ONE request plus ``len(items)`` items,
+        each weighted by ``unit_cost``."""
         share = self._pick(key_id)
         self._check_key_access(caller, peer, op, share)
         if not isinstance(items, list) or not items:
@@ -434,10 +444,11 @@ class Custodian:
             self._audit(caller, peer, op, {"n": len(items), "key_id": share.public.key_id},
                         "rejected: batch too large")
             raise CustodyError(f"batch too large ({len(items)} items; at most {cap} per request)")
-        self._admit(caller, peer, op, share, len(items))
+        self._admit(caller, peer, op, share, len(items) * unit_cost)
         return share
 
     def _m_partial_batch(self, caller, peer, E_hexes, ctx_hex="", key_id=None):
+        self._g1_only(self._pick(key_id))
         share = self._batch_shape(caller, peer, "partial_batch", E_hexes, self.max_batch, key_id)
         g = share.public.g
         kid = share.public.key_id
@@ -467,11 +478,11 @@ class Custodian:
 
     def _m_gt_partial_batch(self, caller, peer, c_hexes, ctx_hex="", key_id=None):
         share = self._batch_shape(caller, peer, "gt_partial_batch", c_hexes,
-                                  min(self.max_batch, _gt.MAX_GT_BATCH), key_id)
+                                  min(self.max_batch, _gt.MAX_GT_BATCH), key_id, COST_GT)
         g = share.public.g
         kid = share.public.key_id
-        if share.public.group != "bn254":
-            raise CustodyError("GT operations need a bn254 key")
+        if share.public.group not in ("bn254", "bn254g2"):
+            raise CustodyError("GT operations need a bn254 / bn254g2 key")
         try:
             ctx = bytes.fromhex(ctx_hex)
             if len(ctx) > 1024:
@@ -495,14 +506,6 @@ class Custodian:
         self._audit(caller, peer, "gt_partial_batch", {"n": len(raws), "E": efp, "key_id": kid},
                     "served")
         return [p.to_json(g) for p in parts]
-
-    def _m_g2_partial(self, caller, peer, key_id=None):
-        share = self._prelude(caller, peer, "g2_partial", key_id, 1)
-        if share.public.group != "bn254":
-            raise CustodyError("G2 shares need a bn254 key")
-        raw = _gt.g2_partial(share)
-        self._audit(caller, peer, "g2_partial", {"key_id": share.public.key_id}, "served")
-        return {"index": share.index, "Y2": raw.hex()}
 
     # — mask service —
     def _store(self) -> MaskShareStore:
@@ -773,10 +776,6 @@ class _FheCalls:
         out = self.call("gt_partial_batch", [[bytes(c).hex() for c in cs], context.hex()]
                         + self._kid())
         return [_gt.GtPartial.from_json(self.g, d) for d in out]
-
-    def g2_partial(self):
-        d = self.call("g2_partial", self._kid())
-        return int(d["index"]), bytes.fromhex(d["Y2"])
 
 
 class RemoteCustodian(_FheCalls):

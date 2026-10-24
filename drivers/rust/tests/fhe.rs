@@ -99,38 +99,56 @@ fn vectors_gt_generators_are_the_published_constants_and_have_order_n() {
 }
 
 #[test]
-fn vectors_mac_alpha_gamma_tag_cells_and_tag_sum_blob() {
+fn vectors_mac_alpha_nonces_gamma_tag_cells_and_tag_sum_blob() {
     let v = vec_json();
     let key = vec_key();
     let m = &v["mac"];
     let (table, col) = (m["table"].as_str().unwrap(), m["column"].as_str().unwrap());
     let ids = i64s(&m["row_ids"]);
+    let nonces: Vec<BigInt> = m["nonces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| BigInt::parse_bytes(n.as_str().unwrap().trim_start_matches("0x").as_bytes(), 16).unwrap())
+        .collect();
+    let on: Vec<Option<BigInt>> = nonces.iter().cloned().map(Some).collect();
     assert_eq!(format!("0x{:x}", key.alpha()), m["alpha"].as_str().unwrap());
-    let gam: Vec<String> = ids.iter().map(|i| format!("0x{:x}", key.gamma(table, col, *i))).collect();
+    let gam: Vec<String> = ids.iter().zip(&nonces).map(|(i, n)| format!("0x{:x}", key.gamma(table, col, *i, n))).collect();
     let want: Vec<String> = m["gamma"].as_array().unwrap().iter().map(|x| x.as_str().unwrap().to_string()).collect();
     assert_eq!(gam, want);
     let (vb, tb) = (hex(&v["sum_blob"]), hex(&m["tag_sum_blob"]));
-    assert_eq!(key.decrypt_sum_verified(&vb, &tb, table, col, &ids, &one()).unwrap(), 105);
+    assert_eq!(key.decrypt_sum_verified(&vb, &tb, table, col, &ids, &on, &one()).unwrap(), 105);
     let (cells, tags) = (hexes(&v["cells_a"]), hexes(&m["tag_cells"]));
     let vals = i64s(&v["values_a"]);
     for k in 0..4 {
         assert_eq!(
-            key.decrypt_cell_verified(Some(&cells[k]), Some(&tags[k]), table, col, ids[k]).unwrap(),
+            key.decrypt_cell_verified(Some(&cells[k]), Some(&tags[k]), table, col, ids[k], Some(&nonces[k])).unwrap(),
             vals[k]
         );
     }
     // our own tag verifies; every tampering is an Integrity error
-    let t = key.tag(7, "emp", "rate", 2).unwrap();
-    assert_eq!(key.decrypt_cell_verified(Some(&key.encrypt(7).unwrap()), Some(&t), "emp", "rate", 2).unwrap(), 7);
+    let n7 = fhe_new_nonce();
+    assert!(n7 > BigInt::from(0) && n7 < (BigInt::from(1) << 120));
+    let t = key.tag(7, "emp", "rate", 2, &n7).unwrap();
+    assert_eq!(key.decrypt_cell_verified(Some(&key.encrypt(7).unwrap()), Some(&t), "emp", "rate", 2, Some(&n7)).unwrap(), 7);
     let bad = |r: Result<i64, Error>| assert_eq!(r.unwrap_err().kind, Kind::Integrity);
-    bad(key.decrypt_sum_verified(&vb, &tb, table, col, &[0, 1, 2], &one()));
-    bad(key.decrypt_sum_verified(&vb, &tb, table, col, &ids, &BigInt::from(2)));
-    bad(key.decrypt_sum_verified(&hex(&v["scaled3_sum_blob"]), &tb, table, col, &ids, &one()));
-    bad(key.decrypt_sum_verified(&vb, &tb, table, "other", &ids, &one()));
-    bad(key.decrypt_cell_verified(Some(&cells[0]), Some(&tags[1]), table, col, 0));
-    bad(key.decrypt_cell_verified(Some(&cells[0]), Some(&tags[0]), table, col, 1));
-    bad(key.decrypt_cell_verified(Some(&cells[0]), None, table, col, 0));
-    bad(key.decrypt_cell_verified(Some(&key.encrypt(41).unwrap()), Some(&tags[0]), table, col, 0));
+    bad(key.decrypt_sum_verified(&vb, &tb, table, col, &[0, 1, 2], &on[..3], &one()));
+    bad(key.decrypt_sum_verified(&vb, &tb, table, col, &ids, &on, &BigInt::from(2)));
+    bad(key.decrypt_sum_verified(&hex(&v["scaled3_sum_blob"]), &tb, table, col, &ids, &on, &one()));
+    bad(key.decrypt_sum_verified(&vb, &tb, table, "other", &ids, &on, &one()));
+    let mut other = on.clone();
+    other[3] = Some(&nonces[3] + 2); // a different nonce
+    bad(key.decrypt_sum_verified(&vb, &tb, table, col, &ids, &other, &one()));
+    other[3] = None; // nonce hidden
+    bad(key.decrypt_sum_verified(&vb, &tb, table, col, &ids, &other, &one()));
+    bad(key.decrypt_sum_verified(&vb, &tb, table, col, &ids, &on[..3], &one())); // missing entries
+    let n = Some(&nonces[0]);
+    bad(key.decrypt_cell_verified(Some(&cells[0]), Some(&tags[1]), table, col, 0, n));
+    bad(key.decrypt_cell_verified(Some(&cells[0]), Some(&tags[0]), table, col, 1, n));
+    bad(key.decrypt_cell_verified(Some(&cells[0]), Some(&tags[0]), table, col, 0, Some(&nonces[1]))); // another write's nonce
+    bad(key.decrypt_cell_verified(Some(&cells[0]), Some(&tags[0]), table, col, 0, None));
+    bad(key.decrypt_cell_verified(Some(&cells[0]), None, table, col, 0, n));
+    bad(key.decrypt_cell_verified(Some(&key.encrypt(41).unwrap()), Some(&tags[0]), table, col, 0, n));
 }
 
 // ── scheme properties and rejections (no server) ─────────────────────────────
@@ -154,7 +172,7 @@ fn encrypt_decrypt_edge_values_range_and_fresh_randomness() {
     let none: Vec<Vec<u8>> = vec![];
     assert_eq!(small.decrypt_sum(&fhe_sum_cells(&none, &one()).unwrap()).unwrap(), 0);
     // a tag is an arbitrary scalar: decrypting it as a value fails; the SUM blob of a cell is its first 128 bytes
-    let tag = small.tag(5, "t", "c", 1).unwrap();
+    let tag = small.tag(5, "t", "c", 1, &BigInt::from(12345)).unwrap();
     assert_eq!(kind_of(small.decrypt_cell(&tag)), Kind::OutOfBudget);
     let c = small.encrypt(9).unwrap();
     assert_eq!(fhe_sum_cells(std::slice::from_ref(&c), &one()).unwrap(), c[..128].to_vec());
@@ -416,7 +434,21 @@ impl Proxy {
                         if !write_frame(&mut srv, r.to_string().as_bytes()) {
                             return;
                         }
-                        let Some(resp) = read_frame(&mut srv) else { return };
+                        let Some(mut resp) = read_frame(&mut srv) else { return };
+                        if (mode == 6 || mode == 7) && method == "plain_cells" && col.starts_with("__fnonce__") {
+                            let mut v: Value = serde_json::from_slice(&resp).unwrap();
+                            if let Some(list) = v["ok"].as_array_mut() {
+                                for w in list.iter_mut() {
+                                    *w = if mode == 6 {
+                                        json!({"t": "n"})
+                                    } else {
+                                        let n: i128 = w["v"].as_str().unwrap().parse().unwrap();
+                                        json!({"t": "i", "v": (n + 2).to_string()})
+                                    };
+                                }
+                            }
+                            resp = v.to_string().into_bytes();
+                        }
                         if !write_frame(&mut cli, &resp) {
                             return;
                         }
@@ -605,18 +637,21 @@ fn validation_parity_int_only_no_predicates_index_join_range_values_mixed_dot() 
 
 #[test]
 fn sum_beyond_one_chunk_2100_rows_and_bulk_insert() {
-    let Some(s) = server(&[]) else { return };
+    // pure-Python cell validation is ~45 ms/cell: the 2-chunk case (2100 rows) needs the native server
+    let native = native_server();
+    let Some(s) = native.or_else(|| server(&[])) else { return };
+    let big = mcl_path().is_some();
     let key = key100k();
     let mut db = connect_to(&s.addr, &key, false);
     db.create_table("big", vec![col("id", "int", "plain"), col("v", "int", "fhe")]).unwrap();
-    let n = 2100i64;
+    let n = if big { 2100i64 } else { 150 };
     let rows: Vec<Vec<(&str, CellIn)>> = (0..n).map(|i| vec![("id", ci(i)), ("v", ci(i % 7 - 3))]).collect();
     assert_eq!(db.insert_many("big", rows).unwrap().len(), n as usize);
     let expected: i64 = (0..n).map(|i| i % 7 - 3).sum();
     assert_eq!(int(db.sum("big", "v", all()).unwrap()), expected);
     assert_eq!(int(db.scaled_sum("big", "v", 5, all()).unwrap()), 5 * expected);
-    let sel = db.select_range("big", &["v"], all(), 2090, Some(10)).unwrap();
-    let want: Vec<Vec<CellIn>> = (0..10).map(|i| vec![ci((2090 + i) % 7 - 3)]).collect();
+    let sel = db.select_range("big", &["v"], all(), (n - 10) as usize, Some(10)).unwrap();
+    let want: Vec<Vec<CellIn>> = (0..10).map(|i| vec![ci((n - 10 + i) % 7 - 3)]).collect();
     assert_eq!(sel, want);
 }
 
@@ -632,8 +667,8 @@ fn dot_backends_explicit_pyecc_server_default_and_native_when_the_server_has_mcl
         eprintln!("# skipped native DOT (set TORUSDB_MCL_PATH to a dir with mclbn256)");
         return;
     };
-    let e = db.dot_with_backend("dot", "rate", "hours", all(), Some(FheBackend::Mcl)).unwrap_err();
-    assert!(e.message.contains("unavailable") || e.message.contains("back end"), "{}", e);
+    // `backend` is only a request: a server without the native library answers with its own (tag 0x01), which decrypts
+    assert_eq!(int(db.dot_with_backend("dot", "rate", "hours", all(), Some(FheBackend::Mcl)).unwrap()), want);
     let mut nd = connect_to(&ns.addr, &key, false);
     nd.create_table("dotn", emp_fhe_cols()).unwrap();
     // 120 rows: the default back end (native) in chunks of 50, and the explicit ones
@@ -746,9 +781,11 @@ fn authenticated_untagged_data_is_refused_and_a_lying_server_is_caught() {
     assert_eq!(int(db.scaled_sum("lie", "rate", 3, all()).unwrap()), 435);
     for mode in 1..=4u8 {
         proxy.set(mode);
-        assert_eq!(kind_of(db.sum("lie", "rate", all())), Kind::Integrity, "mode {}", mode);
-        assert_eq!(kind_of(db.scaled_sum("lie", "rate", 3, all())), Kind::Integrity, "mode {}", mode);
-        assert_eq!(kind_of(db.avg("lie", "rate", all())), Kind::Integrity, "mode {}", mode);
+        // duplicate ids are refused by the server itself (BadRequest); every other lie is caught by the tags
+        let want = if mode == 3 { Kind::BadRequest } else { Kind::Integrity };
+        assert_eq!(kind_of(db.sum("lie", "rate", all())), want, "mode {}", mode);
+        assert_eq!(kind_of(db.scaled_sum("lie", "rate", 3, all())), want, "mode {}", mode);
+        assert_eq!(kind_of(db.avg("lie", "rate", all())), want, "mode {}", mode);
     }
     proxy.set(0);
     assert_eq!(int(db.sum("lie", "rate", all()).unwrap()), 145);
@@ -1023,4 +1060,121 @@ fn local_dot_has_no_range_limit_on_the_result() {
 }
 fn id_is_all() -> Value {
     all()
+}
+
+// ── write nonces (F2), randomised search start (F7) ──────────────────────────
+#[test]
+fn discrete_log_boundary_zero_and_random_values_are_found_from_every_random_start() {
+    let key = FheKey::generate(5000).unwrap();
+    for _ in 0..3 {
+        for v in [0i64, 1, -1, 5000, -5000, 4999, -4999, 2500, -2500, 1234, -4321] {
+            assert_eq!(key.decrypt_cell(&key.encrypt(v).unwrap()).unwrap(), v);
+        }
+    }
+    for _ in 0..25 {
+        let v = (rand::random::<u32>() % 10001) as i64 - 5000;
+        assert_eq!(key.decrypt_cell(&key.encrypt(v).unwrap()).unwrap(), v);
+    }
+    let sum = fhe_sum_cells(&[key.encrypt(3000).unwrap(), key.encrypt(1999).unwrap()], &one()).unwrap();
+    for _ in 0..5 {
+        assert_eq!(key.decrypt_sum(&sum).unwrap(), 4999);
+    }
+    let v = vec_json();
+    let k2 = vec_key();
+    for _ in 0..12 {
+        assert_eq!(k2.decrypt_dot(&hex(&v["dot_blob_pyecc"])).unwrap(), v["dot_expected"].as_i64().unwrap());
+    }
+    let small = FheKey::generate(100).unwrap();
+    assert_eq!(kind_of(small.decrypt_sum(&fhe_sum_cells(&[key.encrypt(500).unwrap()], &one()).unwrap())), Kind::OutOfBudget);
+}
+
+#[test]
+fn key_range_is_capped_at_2_pow_40_including_key_files() {
+    assert!(FheKey::generate(FHE_MAX_RANGE).is_ok());
+    assert_eq!(kind_of(FheKey::generate(FHE_MAX_RANGE + 1)), Kind::Interface);
+    let dir = tmpdir("fherange");
+    let f = dir.join("big.key");
+    std::fs::write(&f, format!("TORUSFHEKEY1 plain\n{{\"v\": 1, \"range\": {}, \"s\": \"{}\"}}", FHE_MAX_RANGE + 1, secret())).unwrap();
+    assert_eq!(kind_of(FheKey::load(&f, None)), Kind::Interface);
+}
+
+#[test]
+fn write_nonces_fresh_per_write_hiding_or_forging_them_is_an_integrity_error() {
+    let Some(s) = server(&[]) else { return };
+    let key = key100k();
+    let proxy = Proxy::start(s.addr.clone());
+    let mut db = connect_to(&proxy.addr, &key, true);
+    seed(&mut db, "nonce", &ROWS);
+    let nonces = || -> Vec<String> {
+        raw_call(&s.addr, "plain_cells", json!(["nonce", "__fnonce__rate", [0, 1, 2, 3]]))["ok"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|w| w["v"].as_str().unwrap().to_string())
+            .collect()
+    };
+    let n1 = nonces();
+    assert_eq!(n1.iter().collect::<std::collections::HashSet<_>>().len(), 4);
+    for n in &n1 {
+        let v: BigInt = n.parse().unwrap();
+        assert!(v > BigInt::from(0) && v < (BigInt::from(1) << 120));
+    }
+    db.update("nonce", vec![("rate", ci(41))], id_is(1)).unwrap();
+    let n2 = nonces();
+    assert_ne!(n2[0], n1[0]); // fresh nonce for the rewritten row
+    assert_eq!(n2[1..], n1[1..]);
+    db.update("nonce", vec![("rate", ci(41))], id_is(1)).unwrap(); // same value again: still a new nonce + tag
+    assert_ne!(nonces()[0], n2[0]);
+    assert_eq!(int(db.sum("nonce", "rate", all()).unwrap()), 41 + 55 + 30 + 20);
+    for mode in [6u8, 7] {
+        proxy.set(mode);
+        assert_eq!(kind_of(db.sum("nonce", "rate", all())), Kind::Integrity, "mode {}", mode);
+        assert_eq!(kind_of(db.select("nonce", &["rate"], id_is(2))), Kind::Integrity, "mode {}", mode);
+        assert_eq!(kind_of(db.scaled_sum("nonce", "rate", 2, all())), Kind::Integrity, "mode {}", mode);
+    }
+    proxy.set(0);
+    assert_eq!(int(db.sum("nonce", "rate", all()).unwrap()), 146);
+    // the server rejects malformed nonces itself
+    for bad in [json!({"t": "i", "v": "0"}), json!({"t": "i", "v": (BigInt::from(1) << 128usize).to_string()}), json!({"t": "s", "v": "x"}), json!({"t": "n"})] {
+        assert!(raw_call(&s.addr, "update_cell", json!(["nonce", 0, "__fnonce__rate", bad]))["err"].is_string());
+    }
+    assert!(raw_call(&s.addr, "update_cell", json!(["nonce", 0, "__fnonce__id", {"t": "i", "v": "5"}]))["err"].is_string());
+    // UPDATE writes value + tag + nonce in one update_cells call
+    let (u0, c0) = (proxy.count("update_cells"), proxy.count("update_cell"));
+    db.update("nonce", vec![("rate", ci(9))], dept(5)).unwrap();
+    assert_eq!(proxy.count("update_cells"), u0 + 1);
+    assert_eq!(proxy.count("update_cell"), c0);
+}
+
+#[test]
+fn affine_mix_of_an_old_and_a_new_version_of_a_row_is_rejected() {
+    let Some(s) = server(&[]) else { return };
+    let key = key100k();
+    let mut db = connect_to(&s.addr, &key, true);
+    seed(&mut db, "affine", &ROWS);
+    let get = |c: &str| raw_call(&s.addr, "plain_cells", json!(["affine", c, [0]]))["ok"][0].clone();
+    let (old_cell, old_tag, old_nonce) = (get("rate"), get("__fmac__rate"), get("__fnonce__rate"));
+    db.update("affine", vec![("rate", ci(45))], id_is(1)).unwrap();
+    let (new_cell, new_tag, new_nonce) = (get("rate"), get("__fmac__rate"), get("__fnonce__rate"));
+    // lambda*old + (1-lambda)*new on the G1 halves (the server can do this without any key): the
+    // genuine halves are recovered with the public helpers, so mix with 2*old - new via sums
+    let decode = |w: &Value| fhe_internals::unb64(w["v"].as_str().unwrap());
+    let mix = |a: &Value, b: &Value| -> Value {
+        let (ca, cb) = (decode(a), decode(b));
+        // 2*A - B on both G1 halves; the G2 half of the new cell is kept
+        let halves = fhe_internals::g1_affine_combo(&ca[..128], 2, &cb[..128], -1);
+        let mut out = cb.clone();
+        out[..128].copy_from_slice(&halves);
+        xcell(&out)
+    };
+    let (mc, mt) = (mix(&old_cell, &new_cell), mix(&old_tag, &new_tag));
+    for nonce in [old_nonce, new_nonce.clone()] {
+        let items = json!(["affine", [[0, "rate", mc], [0, "__fmac__rate", mt], [0, "__fnonce__rate", nonce]]]);
+        assert_eq!(raw_call(&s.addr, "update_cells", items)["ok"], json!(3));
+        assert_eq!(kind_of(db.select("affine", &["rate"], id_is(1))), Kind::Integrity);
+        assert_eq!(kind_of(db.sum("affine", "rate", all())), Kind::Integrity);
+    }
+    // restoring the genuine new version heals the row
+    raw_call(&s.addr, "update_cells", json!(["affine", [[0, "rate", new_cell], [0, "__fmac__rate", new_tag], [0, "__fnonce__rate", new_nonce]]]));
+    assert_eq!(int(db.sum("affine", "rate", all()).unwrap()), 45 + 55 + 30 + 20);
 }

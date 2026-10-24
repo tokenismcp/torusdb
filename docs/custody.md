@@ -178,12 +178,14 @@ conn = torussql.connect(host, port, token=db_token, vault_path="owner.vault",
 
 ### 2.5 FHE columns on a threshold key
 
-A `bn254` custody key pair can be the secrets of `FHE` columns (`docs/fhe-columns.md`, "Threshold custody
-of the FHE key"): `s` and an independent `s2`, from two DKGs on the same hosts. Custodians gain three
-key-service methods under the existing `key` permission and the same `approve` / rate-limit / audit
-machinery: `partial_batch` (many G1 points per request), `gt_partial_batch` (GT exponentiation with a
-Chaum-Pedersen proof, for `DOT`) and `g2_partial` (the G2 share used once to publish `Q2 = s2*G2`).
-`python -m torussql.custody fhe-keygen-threshold` / `fhe-open-test` are the ceremony and check commands.
+Two custody keys can be the secrets of `FHE` columns (`docs/fhe-columns.md`, "Threshold custody of the FHE
+key"): `s` in group `bn254` and an independent `s2` in group **`bn254g2`** (run its DKG with
+`dkg-start/dkg-finish --key-group bn254g2`, or `keygen-local --group bn254g2` for development). The G2 key's public
+key is the G2 point `Q2`; no G1 image of `s2` is ever produced (it would decrypt every cell publicly). Custodians gain
+two key-service methods under the existing `key` permission and the same `approve` / rate-limit / audit machinery:
+`partial_batch` (many G1 points per request; refused on a G2 key) and `gt_partial_batch` (GT exponentiation with a
+Chaum-Pedersen proof in the key's group, for `DOT`). `python -m torussql.custody fhe-keygen-threshold` /
+`fhe-open-test` are the ceremony and check commands (the bundle has its own fingerprint, see fhe-columns.md).
 
 **One daemon, several keys.** `serve --share A.json --share B.json` makes one daemon hold the shares of
 several different keys (typically `s` and `s2`). Every request then names its `key_id`
@@ -199,10 +201,10 @@ The audit log records the `key_id` of every key-service decision.
 | flag | default | meaning |
 |---|---|---|
 | `--rate` | 30 | REQUESTS per minute; a batch is one request |
-| `--item-budget` | 20000 | ITEMS (points / GT elements / G2 shares) answered per minute; `0` = unlimited |
+| `--item-budget` | 30000 | COST UNITS answered per minute: G1 point = 1, G2 point = 2, GT element = 100 (GT is ~100x the CPU); `0` = unlimited |
 | `--max-batch` | 2000 | items in one batch request (GT batches are further capped at 64 by their cost) |
 
-Reading n FHE cells is one request of n items, so the default budget allows ~20000 cells/minute per caller
+Reading n FHE cells is one request of n items, so the default budget allows ~30000 cells (or 300 GT elements = 60 DOT decryptions) per minute per caller
 while the request limit and the audit-log/DoS protections stay as they were (malformed requests also cost budget).
 
 **Audit log rotation.** `--audit-max-mb` (default 64) rotates `audit.log` to `.1`, `.2`, ... and `--audit-keep N`

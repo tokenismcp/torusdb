@@ -10,9 +10,9 @@ Typical production flow (one command per custodian host):
                        dealerless key generation (exchange the files in ``--out``)
   serve                run the custodian daemon holding one share
   open-test            prove a quorum can open a fresh envelope
-  fhe-keygen-threshold turn TWO independent bn254 keys (s and s2; two DKGs on the same
-                       custodian hosts) into an FHE-column key: derive Q2 = s2*G2 from the
-                       second key's custodians, seal a MAC secret, write the PUBLIC bundle
+  fhe-keygen-threshold turn TWO independent keys (s in bn254; s2 in bn254g2 -- dkg-start
+                       --key-group bn254g2; same custodian hosts) into an FHE-column key: seal a
+                       MAC secret, write the PUBLIC bundle and print its fingerprint
   fhe-open-test        encrypt/decrypt (cell, SUM, DOT, MAC) through a quorum with a bundle
   reshare-start / reshare-finish
                        proactive refresh / change k, n / replace a custodian
@@ -146,11 +146,12 @@ def cmd_dkg_start(a):
     g, pubs, _ = _load_ids(a.ids)
     idn = Identity.load(a.identity, _pass(a, "Identity passphrase: "))
     dig = ids_digest(g, pubs)
-    part = Participant(g.name, a.k, a.n, idn.index, _session(a.session), dig)
+    kg = get_group(a.key_group or g.name)
+    part = Participant(kg.name, a.k, a.n, idn.index, _session(a.session), dig)
     # every private share (including our own, share_i_to_i) is written ENCRYPTED to
     # its recipient; nothing secret is left on disk in the clear
     files = export_dealing(idn, "dkg", _session(a.session), part.round1(), pubs, a.out,
-                           dkg_params(g.name, a.k, a.n, dig))
+                           dkg_params(kg.name, a.k, a.n, dig), kg)
     print(f"wrote {len(files)} files to {a.out}: send broadcast_{idn.index}.json to everyone "
           f"and share_{idn.index}_to_J.json to participant J only")
 
@@ -162,14 +163,15 @@ def cmd_dkg_finish(a):
     dig = ids_digest(g, pubs)
     if len(pubs) != a.n:
         raise SystemExit(f"ids file lists {len(pubs)} participants but --n is {a.n}")
-    part = Participant(g.name, a.k, a.n, idn.index, sess, dig)
+    kg = get_group(a.key_group or g.name)
+    part = Participant(kg.name, a.k, a.n, idn.index, sess, dig)
     bc, sh = import_dealings(idn, "dkg", sess, a.inbox, pubs, list(range(1, a.n + 1)),
-                             dkg_params(g.name, a.k, a.n, dig))
+                             dkg_params(kg.name, a.k, a.n, dig), kg)
     ks, pub, tx = part.finish(bc, sh)
     ks.save(a.out, _pass(a, "New share passphrase: ", confirm=True))
     pub.save(a.public_out)
     print(f"share written to {a.out}; public key file: {a.public_out}")
-    print(f"key_id:     {pub.key_id}\npublic key: {g.hex(pub.X)}")
+    print(f"key_id:     {pub.key_id}\npublic key: {kg.hex(pub.X)}")
     print(f"transcript: {tx}\nCOMPARE THE TRANSCRIPT HASH WITH EVERY OTHER PARTICIPANT.")
 
 
@@ -395,13 +397,15 @@ def _fhe_selftest(key, dot: bool) -> None:
 
 
 def cmd_fhe_keygen_threshold(a):
-    """After the bn254 DKG: Q2 from the custodians (pairing-verified), a MAC secret sealed
-    under the threshold envelope, and one PUBLIC bundle file. No secret is written."""
+    """After the two DKGs (s in bn254, s2 in bn254g2): a MAC secret sealed under the threshold
+    envelope and one PUBLIC bundle file (Q2 = key 2's public key). No secret is written."""
     from torusdb_core.fhe_threshold import ThresholdFheKey
     pub = _load_pub(a.public, a.expect_fingerprint)
     pub2 = _load_pub(a.public2, a.expect_fingerprint2)
-    if pub.group != "bn254" or pub2.group != "bn254":
-        raise SystemExit("an FHE key needs 'bn254' custody keys (run the DKGs with --group bn254)")
+    if pub.group != "bn254" or pub2.group != "bn254g2":
+        raise SystemExit("an FHE key needs --public in group 'bn254' (s) and --public2 in group "
+                         "'bn254g2' (s2: dkg-start --key-group bn254g2). A G1 key for s2 would publish "
+                         "s2*G1 and let anyone decrypt every cell.")
     if pub.key_id == pub2.key_id:
         raise SystemExit("--public and --public2 must be two DIFFERENT keys (two separate DKGs)")
     if os.path.exists(a.out):
@@ -410,6 +414,8 @@ def cmd_fhe_keygen_threshold(a):
                                  with_mac=not a.no_mac, value_range=a.range)
     _fhe_selftest(key, dot=False)
     key.save_bundle(a.out)
+    print(f"BUNDLE FINGERPRINT: {key.bundle_fingerprint}\n  (compare it out of band and pin it everywhere "
+          f"the bundle is loaded: --expect-bundle-fingerprint)")
     print(f"threshold FHE bundle written to {a.out} (range +-{a.range}, key {pub.key_id}, "
           f"quorum {pub.k}-of-{pub.n}); it holds NO secret: s and s2 exist only as custodian shares")
     print("cell/SUM self-test through the quorum: OK")
@@ -422,7 +428,8 @@ def cmd_fhe_open_test(a):
     from torusdb_core.fhe_threshold import ThresholdFheKey
     pub = _load_pub(a.public, a.expect_fingerprint)
     pub2 = _load_pub(a.public2, a.expect_fingerprint2)
-    key = ThresholdFheKey.load(a.bundle, pub, _fhe_custodians(a, pub), pub2, _custodians2(a, pub2))
+    key = ThresholdFheKey.load(a.bundle, pub, _fhe_custodians(a, pub), pub2, _custodians2(a, pub2),
+                               expect_fingerprint=a.expect_bundle_fingerprint)
     _fhe_selftest(key, dot=not a.skip_dot)
     if a.mac:
         key.alpha
@@ -445,7 +452,7 @@ def cmd_reshare_start(a):
         raise SystemExit("this identity is not in the --old-ids list under that index")
     spec = _spec(a, old)
     files = export_dealing(idn, "reshare", spec.session, reshare_deal(spec, ks), new_pubs, a.out,
-                           spec.params(ids_digest(g, old_pubs), ids_digest(g, new_pubs)))
+                           spec.params(ids_digest(g, old_pubs), ids_digest(g, new_pubs)), old.g)
     print(f"wrote {len(files)} files to {a.out}")
 
 
@@ -460,7 +467,7 @@ def cmd_reshare_finish(a):
     if len(new_pubs) != spec.new_n:
         raise SystemExit(f"--new-ids lists {len(new_pubs)} participants but --new-n is {spec.new_n}")
     bc, sh = import_dealings(idn, "reshare", spec.session, a.inbox, old_pubs, sorted(spec.quorum),
-                             spec.params(ids_digest(g, old_pubs), ids_digest(g, new_pubs)))
+                             spec.params(ids_digest(g, old_pubs), ids_digest(g, new_pubs)), old.g)
     ks, new = reshare_finish(spec, idn.index, bc, sh)
     ks.save(a.out, _pass(a, "New share passphrase: ", confirm=True))
     new.save(a.public_out)
@@ -488,6 +495,9 @@ def main(argv=None):
         p.add_argument("--identity", required=True); p.add_argument("--ids", required=True)
         p.add_argument("--k", type=int, required=True); p.add_argument("--n", type=int, required=True)
         p.add_argument("--session", required=True)
+        p.add_argument("--key-group", choices=["secp256k1", "bn254", "bn254g2"],
+                       help="group of the KEY (default: the identity group). The second FHE "
+                            "secret s2 must be generated with --key-group bn254g2")
         if name == "dkg-start":
             p.add_argument("--out", required=True)
         else:
@@ -506,9 +516,9 @@ def main(argv=None):
                         "request then names its key_id)")
     p.add_argument("--key-access", action="append", metavar="KEY_ID:caller,caller",
                    help="restrict a key to the named callers (default: every caller with 'key')")
-    p.add_argument("--item-budget", type=int, default=20_000,
-                   help="items (points / GT elements) answered per caller and key per minute "
-                        "(0 = unlimited; default 20000)")
+    p.add_argument("--item-budget", type=int, default=30_000,
+                   help="cost units answered per caller and key per minute: G1 point = 1, GT "
+                        "element = 100 (0 = unlimited; default 30000)")
     p.add_argument("--max-batch", type=int, default=2000, help="max items in one batch request")
     p.add_argument("--audit-keep", type=int, default=7, help="rotated audit files to keep")
     p.add_argument("--audit-max-mb", type=float, default=64, help="rotate the audit log at this size")
@@ -556,6 +566,9 @@ def main(argv=None):
                            help="no integrity-tag secret (authenticated=True will be unavailable)")
         else:
             p.add_argument("--bundle", required=True)
+            p.add_argument("--expect-bundle-fingerprint",
+                           help="fingerprint printed by fhe-keygen-threshold (refuse a mismatch; "
+                                "without it the load warns)")
             p.add_argument("--skip-dot", action="store_true")
             p.add_argument("--mac", action="store_true", help="also open the sealed MAC secret")
     for name, fn in (("reshare-start", cmd_reshare_start), ("reshare-finish", cmd_reshare_finish)):

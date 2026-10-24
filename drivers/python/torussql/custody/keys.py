@@ -107,7 +107,7 @@ class PublicKey:
     @staticmethod
     def from_json(d: dict) -> "PublicKey":
         try:
-            if not isinstance(d, dict) or d.get("group") not in ("secp256k1", "bn254"):
+            if not isinstance(d, dict) or d.get("group") not in ("secp256k1", "bn254", "bn254g2"):
                 raise ShareError("public key file: unknown or missing group")
             g = get_group(d["group"])
             k, n, epoch = d["k"], d["n"], d.get("epoch", 0)

@@ -182,6 +182,8 @@ def _parser() -> argparse.ArgumentParser:
     ap.add_argument("--custodian2", action="append", metavar="HOST:PORT",
                     help="custodian daemons serving s2 (repeat); default: the same daemons as "
                          "--custodian (one daemon holding both shares)")
+    ap.add_argument("--expect-bundle-fingerprint", metavar="FP",
+                    help="pin the threshold FHE bundle (fingerprint from fhe-keygen-threshold)")
     ap.add_argument("--custody-expect-fingerprint", metavar="FP",
                     help="pin the fingerprint of --custody-public (see `custody public-show`)")
     ap.add_argument("--custody-expect-fingerprint2", metavar="FP",
@@ -221,7 +223,8 @@ def _threshold_key(a):
         return out
     from torusdb_core.fhe_threshold import SAME
     return ThresholdFheKey.load(a.fhe_threshold, pub, nodes(a.custodian, pub), pub2,
-                                nodes(a.custodian2, pub2) if a.custodian2 else SAME)
+                                nodes(a.custodian2, pub2) if a.custodian2 else SAME,
+                                expect_fingerprint=a.expect_bundle_fingerprint)
 
 
 def main(argv=None) -> int:

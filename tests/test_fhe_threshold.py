@@ -18,13 +18,14 @@ import pytest
 import torussql
 from torusdb_core import fhe
 from torusdb_core.fhe import FheError
-from torusdb_core.fhe_threshold import ThresholdFheKey
+from torusdb_core.fhe_threshold import ThresholdFheKey, bundle_fingerprint
 from torusdb_core.nokey_engine import NoKeyClient, NoKeyServer
 from torusdb_core.errors import IntegrityError as CoreIntegrity
 from torussql.custody import (InsufficientPartials, LocalCustodian, Quorum, QuorumError,
                               laurent, run_local_ceremony)
 from torussql.custody import gt as cgt
 from torussql.custody.group import InvalidPoint
+from torussql.custody import get_group as get_group_
 from torussql.custody.net import Custodian, CustodianServer, LocalNode, RemoteCustodian
 from test_ops import Running
 
@@ -50,8 +51,8 @@ def local_nodes(shares, rate=100_000, approve=None, cls=LocalNode, **kw):
 
 @pytest.fixture(scope="module")
 def keyset2():
-    """The INDEPENDENT second secret s2 (a second DKG on the same custodian set)."""
-    return run_local_ceremony(3, 5, "bn254")
+    """The INDEPENDENT second secret s2: a DKG IN THE GROUP G2 (public key = Q2 in G2; no G1 image)."""
+    return run_local_ceremony(3, 5, "bn254g2")
 
 
 def mk(keyset, keyset2, *, Q2=None, nodes=None, nodes2=None, **kw):
@@ -252,9 +253,8 @@ def test_below_quorum_cannot_decrypt(keyset, keyset2, tkey):
     assert weak2.decrypt_cell(cell) == 5
     with pytest.raises(InsufficientPartials):
         weak2.decrypt_dot(fhe.dot_cells([cell], [cell], weak2.be))
-    # two shares do not even give Q2 or the MAC secret
-    with pytest.raises(InsufficientPartials):
-        mk(keyset, keyset2, nodes2=local_nodes(shares2[:2]), value_range=RANGE)
+    # Q2 is a public key (needs no quorum); the MAC secret does need one (below)
+    assert mk(keyset, keyset2, nodes2=local_nodes(shares2[:2]), value_range=RANGE)._q2_raw == tkey._q2_raw
     weak_mac = mk(keyset, keyset2, Q2=tkey._q2_raw, nodes=local_nodes(shares[:2]),
                   mac=tkey.bundle()["mac"], value_range=RANGE)
     with pytest.raises(InsufficientPartials):
@@ -276,10 +276,9 @@ def test_dot_is_impossible_without_the_second_secret(keyset, keyset2, tkey):
     assert key.decrypt_cell(cell) == 11
     with pytest.raises(FheError, match="second secret"):
         key.decrypt_dot(fhe.dot_cells([cell], [cell], key.be))
-    with pytest.raises(FheError, match="Q2 is needed"):
-        ThresholdFheKey(pub, local_nodes(shares), pub2, None)
-    # using the SAME key for both secrets is refused
-    with pytest.raises(FheError, match="independent"):
+    assert ThresholdFheKey(pub, local_nodes(shares), pub2, None).Q2 is not None     # Q2 = pub2.X
+    # using the SAME key for both secrets is refused (key 2 must be a bn254g2 key)
+    with pytest.raises(FheError, match="bn254g2"):
         ThresholdFheKey(pub, local_nodes(shares), pub, local_nodes(shares), Q2=tkey._q2_raw)
 
 
@@ -316,12 +315,6 @@ class Liar(LocalNode):
                 out.append(type(p)(p.index % 5 + 1, p.D, p.proof))
         return out
 
-    def g2_partial(self):
-        idx, raw = super().g2_partial()
-        pt = cgt.g2_decode(raw)
-        from py_ecc.optimized_bn128 import G2, add
-        return idx, cgt.g2_encode(add(pt, G2))
-
 
 class Slow(LocalNode):
     """An honest custodian that answers a little later, so a liar is examined first."""
@@ -333,10 +326,6 @@ class Slow(LocalNode):
     def gt_partial_batch(self, *a, **k):
         time.sleep(0.3)
         return super().gt_partial_batch(*a, **k)
-
-    def g2_partial(self):
-        time.sleep(0.3)
-        return super().g2_partial()
 
 
 @pytest.mark.parametrize("mode", ["d", "z", "index", "other-share"])
@@ -382,44 +371,143 @@ def test_liars_beyond_the_threshold_fail_closed_never_wrong(keyset, keyset2, tke
         key2.decrypt_dot(fhe.dot_cells([tkey.encrypt(2)], [tkey.encrypt(3)], key2.be))
 
 
-def test_a_lying_g2_share_cannot_poison_the_public_key(keyset, keyset2, tkey):
-    shares2, pub2, _ = keyset2
-    nodes2 = local_nodes(shares2, cls=Slow)
-    nodes2[0] = Liar(nodes2[0].custodian, label="liar")
-    nodes2[1] = Liar(nodes2[1].custodian, label="liar2")
-    key = mk(keyset, keyset2, nodes2=nodes2)                  # Q2 derived from the s2 custodians
-    assert key._q2_raw == tkey._q2_raw
-    assert set(key.quorum2.last_problems) >= {"liar"} or set(key.quorum2.last_problems) >= {"liar2"}
-
-
 def test_q2_equal_to_s_times_g2_is_refused(keyset, keyset2, tkey):
-    """Q2 = s·G2 gives a dictionary oracle e(G2, C2 - v·G1) == e(Q2, C1): such a key/bundle is refused."""
+    """Q2 = s·G2 gives a dictionary oracle e(G2, C2 - v·G1) == e(Q2, C1): refused in every form."""
     shares, pub, _ = keyset
+    shares2, pub2, _ = keyset2
     from py_ecc.optimized_bn128 import G2, multiply
+    from torussql.custody import PublicKey
     x = laurent.reconstruct([(s.index, s.y) for s in shares[:3]], pub.g.order)   # test-only
     bad = cgt.g2_encode(multiply(G2, x))
-    with pytest.raises(FheError, match="Q2 equals s"):
+    # (1) a Q2 argument / bundle field that is not key 2's public key
+    with pytest.raises(FheError, match="does not match"):
         mk(keyset, keyset2, Q2=bad)
     b = tkey.bundle(); b["Q2"] = bad.hex()
-    shares2, pub2, _ = keyset2
+    with pytest.raises(FheError, match="does not match"):
+        ThresholdFheKey.from_bundle(b, pub, local_nodes(shares), pub2, local_nodes(shares2),
+                                    expect_fingerprint=None)
+    # (2) a key 2 whose public key IS s·G2 (a bn254g2 key built from the same secret)
+    twin = PublicKey("bn254g2", 2, 3, (cgt.g2_decode(cgt.g2_encode(G2)), cgt.g2_decode(bad)), 0)
     with pytest.raises(FheError, match="Q2 equals s"):
-        ThresholdFheKey.from_bundle(b, pub, local_nodes(shares), pub2, local_nodes(shares2))
-    # a degenerate "second" key equal to the first is refused too
-    with pytest.raises(FheError, match="independent"):
-        ThresholdFheKey(pub, local_nodes(shares), pub, local_nodes(shares), Q2=bad)
+        ThresholdFheKey(pub, local_nodes(shares), twin, None)
+    # (3) the second key must live in G2 and differ from the first
+    with pytest.raises(FheError, match="bn254g2"):
+        ThresholdFheKey(pub, local_nodes(shares), pub, local_nodes(shares))
+    other1 = run_local_ceremony(2, 3, "bn254")[1]
+    with pytest.raises(FheError, match="bn254g2"):
+        ThresholdFheKey(pub, local_nodes(shares), other1, None)
 
 
 def test_q2_is_verified_against_the_public_key(keyset, keyset2, tkey):
-    shares, pub, _ = keyset
     from py_ecc.optimized_bn128 import G2, multiply
     good = cgt.g2_decode(tkey._q2_raw)
-    for bad in (cgt.g2_encode(multiply(G2, 5)),                # some other key's Q2
-                cgt.g2_encode(multiply(good, 2)),              # a multiple of the right one
-                bytes(128),                                    # identity
-                tkey._q2_raw[:-1] + bytes([tkey._q2_raw[-1] ^ 1]),   # off curve
-                b"short"):
-        with pytest.raises(FheError, match="does not match|G2|128"):
+    for bad in (cgt.g2_encode(multiply(G2, 5)), cgt.g2_encode(multiply(good, 2)), bytes(128),
+                tkey._q2_raw[:-1] + bytes([tkey._q2_raw[-1] ^ 1]), b"short"):
+        with pytest.raises(FheError, match="does not match"):
             mk(keyset, keyset2, Q2=bad)
+    assert tkey._q2_raw == keyset2[1].g.encode(keyset2[1].X) and len(tkey._q2_raw) == 128
+
+
+def _recover_with_g1_key(cells, X_g1_bytes, values):
+    """The red-team attack (PoC 1): with a G1 point X = s2·G1 the plaintext of every cell is
+    e(G1, D2) / e(X, D1) = g^v. Returns the recovered values (None where the guess table misses)."""
+    from py_ecc.optimized_bn128 import G1, G2, FQ12, final_exponentiate, neg, pairing
+    from torusdb_core import fhe_backend as fb
+    be = fb.get("pyecc")
+    X = be.g1_from(X_g1_bytes)
+    gen = pairing(G2, G1)
+    tab = {be.gt_to(gen ** (v % fb.N)): v for v in values}
+    out = []
+    for cell in cells:
+        _c1, _c2, d1, d2 = fhe.parse_cell(cell, "pyecc")
+        m = pairing(d2, G1, final_exponentiate=False) * pairing(d1, neg(X), final_exponentiate=False)
+        out.append(tab.get(be.gt_to(final_exponentiate(m))))
+    return out
+
+
+def test_redteam_poc1_public_files_never_contain_a_g1_image_of_s2(keyset, keyset2, tkey):
+    """The second secret s2 lives in G2. Nothing public (bundle, public2.json, RPC answers, audit log
+    fields) contains s2·G1 or any other G1 point related to it; with such a point (positive control)
+    every cell would decrypt."""
+    shares, pub, _ = keyset
+    shares2, pub2, _ = keyset2
+    vals = [7, -42, 0]
+    cells = [tkey.encrypt(v) for v in vals]
+    guesses = range(-60, 61)
+    # --- positive control: the OLD design's X2 = s2·G1 recovers everything -------------------------
+    x2 = laurent.reconstruct([(s.index, s.y) for s in shares2[:3]], pub2.g.order)      # test-only
+    from py_ecc.optimized_bn128 import G1, multiply
+    from torusdb_core import fhe_backend as fb
+    be = fb.get("pyecc")
+    old_x2 = be.g1_to(multiply(G1, x2))
+    assert _recover_with_g1_key(cells, old_x2, guesses) == vals                          # the attack works on it
+    # --- every public G1 point available to an attacker is useless ---------------------------------
+    for pt in (pub.g.encode(pub.X), pub.g.encode(pub.g.G)):                               # Q = s·G1, G1 itself
+        assert _recover_with_g1_key(cells, pt, guesses) == [None] * len(vals)
+    # --- structural: scan EVERYTHING public for G1-sized (64-byte) values -------------------------
+    def hex_strings(o):
+        if isinstance(o, str):
+            yield o
+        elif isinstance(o, dict):
+            for v in o.values():
+                yield from hex_strings(v)
+        elif isinstance(o, (list, tuple)):
+            for v in o:
+                yield from hex_strings(v)
+
+    def g1_like(h):
+        try:
+            raw = bytes.fromhex(h)
+        except ValueError:
+            return False
+        return len(raw) == 64
+
+    pub2_json, bundle = pub2.to_json(), tkey.bundle()
+    assert pub2_json["group"] == "bn254g2" and len(pub2_json["commitments"]) == pub2.k
+    assert all(len(bytes.fromhex(c)) == 128 for c in pub2_json["commitments"])     # only G2 points
+    assert len(bytes.fromhex(pub2_json["public_key"])) == 128
+    assert not [h for h in hex_strings(pub2_json) if g1_like(h)]                    # no G1 point at all
+    assert bundle["Q2"] == pub2_json["public_key"] and "X2" not in bundle
+    assert [h for h in hex_strings({k: v for k, v in bundle.items() if k != "mac"}) if g1_like(h)] == \
+        [bundle["Q"]]                                                                  # only key 1's Q
+    assert bundle["Q"] == pub.g.hex(pub.X)
+    for sh in shares2:                                                                  # share files: same
+        assert not [h for h in hex_strings(sh.to_json()["public"]) if g1_like(h)]
+    # --- the traffic of every key-2 operation contains no G1 point ---------------------------------
+    seen = []
+
+    class Rec(LocalNode):
+        def call(self, method, args):
+            out = super().call(method, args)
+            seen.append((method, out))
+            return out
+
+    key = mk(keyset, keyset2, nodes2=local_nodes(shares2, cls=Rec), Q2=tkey._q2_raw, value_range=RANGE)
+    assert key.decrypt_dot(fhe.dot_cells([key.encrypt(3)], [key.encrypt(5)], key.be)) == 15
+    assert seen and all(m == "gt_partial_batch" for m, _ in seen)
+    for _m, out in seen:
+        assert not [h for h in hex_strings(out) if g1_like(h)]                         # D, R1 (G2), R2 (GT), z
+    # --- the G1-style RPCs and the G2-share RPC do not exist for key 2 ----------------------------
+    node = local_nodes(shares2[:1])[0].for_key(pub2)
+    with pytest.raises(QuorumError, match="GT exponentiation only"):
+        node.call("partial", [pub.g.hex(pub.g.G), "", pub2.key_id])
+    with pytest.raises(QuorumError, match="unknown method"):
+        node.call("g2_partial", [])
+
+
+def test_second_key_group_roundtrip_and_validation(keyset2):
+    """The bn254g2 custody group: 128-byte points, subgroup-checked, usable by the generic DKG."""
+    shares2, pub2, _ = keyset2
+    g = get_group_("bn254g2")
+    assert all(s.verify() for s in shares2)
+    assert g.decode(g.encode(pub2.X)) is not None and len(g.encode(g.G)) == 128
+    raw = bytearray(g.encode(g.G)); raw[-1] ^= 1
+    with pytest.raises(InvalidPoint):
+        g.decode(bytes(raw))                                       # off the twist
+    with pytest.raises(InvalidPoint):
+        g.decode(b"\x01" * 64)                                     # wrong length (a G1 point)
+    PK = pub2.__class__
+    assert PK.from_json(pub2.to_json()).fingerprint == pub2.fingerprint
 
 
 # ── GT proofs (unit level) ───────────────────────────────────────────────────
@@ -516,8 +604,6 @@ def test_custodian_validates_points_and_enforces_policy_and_rate(keyset, tmp_pat
         node.call("partial_batch", [[g.hex(E)], ""])
     with pytest.raises(QuorumError, match="item budget exceeded"):
         node.gt_partial_batch([craw], b"")
-    with pytest.raises(QuorumError, match="item budget exceeded"):
-        node.g2_partial()
     cust._hits.clear(); cust._items.clear()
     cust._rate = 2                                            # the per-request limit is kept
     node.call("partial_batch", [[g.hex(E)], ""]); node.call("partial_batch", [[g.hex(E)], ""])
@@ -541,8 +627,7 @@ def test_custodian_validates_points_and_enforces_policy_and_rate(keyset, tmp_pat
     # a caller without the 'key' permission cannot use any of the new methods
     ro = Custodian(shares[0], {"reader": TOKEN}, permissions={"reader": {"mask_read"}})
     rnode = LocalNode(ro, caller="reader")
-    for m, a in (("partial_batch", [[g.hex(E)], ""]), ("gt_partial_batch", [[craw.hex()], ""]),
-                 ("g2_partial", [])):
+    for m, a in (("partial_batch", [[g.hex(E)], ""]), ("gt_partial_batch", [[craw.hex()], ""])):
         with pytest.raises(QuorumError, match="lacks permission"):
             rnode.call(m, a)
 
@@ -598,37 +683,94 @@ def test_bundle_roundtrip_and_tamper_checks(keyset, keyset2, tkey, tmp_path):
     path = str(tmp_path / "b.json")
     tkey.save_bundle(path)
     assert (os.stat(path).st_mode & 0o777) == 0o644
-    key2 = ThresholdFheKey.load(path, pub, local_nodes(shares), pub2, local_nodes(shares2))
+    fp = tkey.bundle_fingerprint
+    key2 = ThresholdFheKey.load(path, pub, local_nodes(shares), pub2, local_nodes(shares2),
+                                expect_fingerprint=fp)
     assert key2.range == RANGE and key2.decrypt_cell(tkey.encrypt(9)) == 9
-    assert key2.alpha == tkey.alpha and key2.gamma("t", "c", 3) == tkey.gamma("t", "c", 3)
+    assert key2.alpha == tkey.alpha and key2.gamma("t", "c", 3, 7) == tkey.gamma("t", "c", 3, 7)
     good = json.loads(open(path).read())
+    assert good["v"] == 3 and set(good) == {"v", "kind", "key_id", "key_id2", "range", "Q", "Q2", "mac"}
     other_shares, other_pub, _ = run_local_ceremony(2, 3, "bn254")
+    other_shares2, other_pub2, _ = run_local_ceremony(2, 3, "bn254g2")
+    B = lambda b, **kw: ThresholdFheKey.from_bundle(b, pub, local_nodes(shares), pub2,
+                                                     local_nodes(shares2), expect_fingerprint=fp, **kw)
     with pytest.raises(FheError, match="different custody keys"):
         ThresholdFheKey.from_bundle(good, other_pub, local_nodes(other_shares), pub2,
-                                    local_nodes(shares2))
+                                    local_nodes(shares2), expect_fingerprint=fp)
     with pytest.raises(FheError, match="different custody keys"):
-        ThresholdFheKey.from_bundle(good, pub, local_nodes(shares), other_pub, local_nodes(other_shares))
-    B = lambda b: ThresholdFheKey.from_bundle(b, pub, local_nodes(shares), pub2, local_nodes(shares2))
+        ThresholdFheKey.from_bundle(good, pub, local_nodes(shares), other_pub2,
+                                    local_nodes(other_shares2), expect_fingerprint=fp)
+    nf = lambda b: ThresholdFheKey.from_bundle(b, pub, local_nodes(shares), pub2, local_nodes(shares2),
+                                               expect_fingerprint=bundle_fingerprint(b))
     for field, value in (("Q", pub.g.hex(pub.g.mul(pub.g.G, 3))), ("kind", "x"), ("Q2", "00" * 128),
-                         ("X2", pub.g.hex(pub.g.mul(pub.g.G, 3)))):
+                         ("X2", pub.g.hex(pub.g.mul(pub.g.G, 3))), ("extra", 1)):
         bad = dict(good); bad[field] = value
         with pytest.raises(FheError):
-            B(bad)
-    # an old version-1 bundle (Q2 = s·G2) is rejected with a clear message
-    old = dict(good); old["v"] = 1
-    with pytest.raises(FheError, match="version-1.*no longer accepted"):
-        B(old)
-    # a tampered sealed MAC is refused (authenticated encryption under the threshold key)
+            nf(bad)
+    # old bundles are rejected with explicit messages (v2 published X2 = s2·G1: total break)
+    for ver, msg in ((1, "version-1.*no longer accepted"), (2, "version-2.*VULNERABLE.*regenerate")):
+        old = dict(good); old["v"] = ver
+        with pytest.raises(FheError, match=msg):
+            nf(old)
+    # a tampered sealed MAC (valid length, wrong bytes) is refused by the authenticated envelope ...
     bad = json.loads(json.dumps(good))
-    s = bad["mac"]["sealed"]
-    bad["mac"]["sealed"] = s[:-2] + ("00" if s[-2:] != "00" else "01")
-    k3 = B(bad)
+    s_ = bad["mac"]["sealed"]
+    bad["mac"]["sealed"] = s_[:-2] + ("00" if s_[-2:] != "00" else "01")
+    with pytest.raises(FheError, match="fingerprint"):
+        B(bad)                                                   # ... and the pinned fingerprint catches it first
+    k3 = nf(bad)
     with pytest.raises(FheError, match="tampered|damaged"):
         k3.alpha
     # a swapped envelope for another purpose is refused
     bad = json.loads(json.dumps(good)); bad["mac"]["header"]["ctx"] = "00"
     with pytest.raises(FheError, match="different purpose"):
-        B(bad).alpha
+        nf(bad).alpha
+
+
+def test_bundle_fingerprint_stops_the_mac_envelope_swap_and_range_dos(keyset, keyset2, tkey, tmp_path,
+                                                                      recwarn):
+    """Red-team F4: an attacker who edits the public bundle replaces the MAC envelope by one wrapped to
+    the PUBLIC key with a secret HE chose. With a pinned fingerprint the load is refused."""
+    import copy
+    from torussql import seal
+    from torussql.custody import wrap_key
+    shares, pub, _ = keyset
+    shares2, pub2, _ = keyset2
+    good = tkey.bundle()
+    fp = tkey.bundle_fingerprint
+    assert len(fp.replace("-", "")) == 64
+    evil = os.urandom(32)
+    ctx = b"torussql/fhe/mac-secret/v1\x00" + bytes.fromhex(pub.key_id)
+    K, header = wrap_key(pub, ctx)
+    tampered = copy.deepcopy(good)
+    tampered["mac"] = {"header": header, "sealed": seal.seal(K, evil, aad=ctx).hex()}
+    assert bundle_fingerprint(tampered) != fp
+    args = (pub, local_nodes(shares), pub2, local_nodes(shares2))
+    with pytest.raises(FheError, match="expected fingerprint"):
+        ThresholdFheKey.from_bundle(tampered, *args, expect_fingerprint=fp)
+    # fingerprint covers key ids, range, Q, Q2 and the whole envelope
+    for field, val in (("range", 5), ("key_id", "0" * 32), ("key_id2", "0" * 32), ("Q", "00" * 64),
+                       ("Q2", "00" * 128)):
+        t = copy.deepcopy(good); t[field] = val
+        assert bundle_fingerprint(t) != fp
+    for sub in ("header", "sealed"):
+        t = copy.deepcopy(good)
+        t["mac"][sub] = {**t["mac"][sub], "x": 1} if isinstance(t["mac"][sub], dict) else t["mac"][sub][:-2] + "ab"
+        assert bundle_fingerprint(t) != fp
+    # formatting of the pinned value does not matter
+    assert ThresholdFheKey.from_bundle(good, *args, expect_fingerprint=fp.upper().replace("-", " ")).range == RANGE
+    # loading WITHOUT a pin works but warns
+    recwarn.clear()
+    ThresholdFheKey.from_bundle(good, *args)
+    assert any("WITHOUT a pinned fingerprint" in str(w.message) for w in recwarn.list)
+    # range is bounded to [1, 2^40] at load (the BSGS table is O(sqrt(range)))
+    for bad_range in (0, -5, 10 ** 30, 2 ** 40 + 1, True, "5", 1.5):
+        t = copy.deepcopy(good); t["range"] = bad_range
+        with pytest.raises(FheError, match="range"):
+            ThresholdFheKey.from_bundle(t, *args, expect_fingerprint=bundle_fingerprint(t))
+    with pytest.raises(FheError, match="range"):
+        ThresholdFheKey(*args, value_range=10 ** 30)
+    assert ThresholdFheKey(*args, Q2=None, value_range=2 ** 40).range == 2 ** 40
 
 
 def test_mac_secret_is_independent_of_s_and_lazy(keyset, keyset2):
@@ -755,7 +897,8 @@ def test_network_authenticated_sql_and_audit_log(keyset, keyset2, net, net2, tmp
         s.stop()
     text = open(tmp_path / "audit1.log").read()
     assert '"partial_batch"' in text and '"served"' in text
-    assert '"g2_partial"' in open(tmp_path / "k2" / "audit1.log").read()   # Q2 comes from the s2 custodians
+    key.decrypt_dot(fhe.dot_cells([key.encrypt(2)], [key.encrypt(3)], key.be))   # delegated-style DOT: GT rounds
+    assert '"gt_partial_batch"' in open(tmp_path / "k2" / "audit1.log").read()   # s2 only does GT
     x = laurent.reconstruct([(sh.index, sh.y) for sh in shares[:3]], pub.g.order)
     assert hex(x)[2:] not in text and hex(shares[0].y)[2:] not in text
 
@@ -835,18 +978,23 @@ def test_cli_one_daemon_per_host_serves_both_keys(keyset, keyset2, tmp_path):
         assert r.returncode == 0, r.stderr
         assert "holds NO secret" in r.stdout
         bundle = json.loads((d / "fhe.json").read_text())
-        assert bundle["kind"] == "torussql-fhe-threshold" and bundle["range"] == 5000 and bundle["v"] == 2
+        assert bundle["kind"] == "torussql-fhe-threshold" and bundle["range"] == 5000 and bundle["v"] == 3
         for sh, pb in ((shares, pub), (shares2, pub2)):
             x = laurent.reconstruct([(q.index, q.y) for q in sh[:3]], pb.g.order)
             assert hex(x)[2:] not in json.dumps(bundle)
-        assert set(bundle) >= {"Q", "X2", "Q2", "mac"}
+        assert set(bundle) == {"v", "kind", "key_id", "key_id2", "range", "Q", "Q2", "mac"}
+        bfp = re.search(r"BUNDLE FINGERPRINT: (\S+)", r.stdout).group(1)
+        assert bfp == bundle_fingerprint(bundle)
         assert run("fhe-keygen-threshold", *base, "--out", str(d / "fhe.json")).returncode != 0   # no overwrite
         same = ["--public", str(d / "pub.json"), "--public2", str(d / "pub.json"), "--token-env", "CT"]
         for sp in specs:
             same += ["--custodian", sp]
         assert run("fhe-keygen-threshold", *same, "--out", str(d / "x.json")).returncode != 0
-        r = run("fhe-open-test", *base, *fp, "--bundle", str(d / "fhe.json"), "--mac")
+        r = run("fhe-open-test", *base, *fp, "--bundle", str(d / "fhe.json"), "--mac",
+                "--expect-bundle-fingerprint", bfp)
         assert r.returncode == 0 and "DOT" in r.stdout and "MAC" in r.stdout, r.stderr
+        r = run("fhe-open-test", *base, *fp, "--bundle", str(d / "fhe.json"), "--expect-bundle-fingerprint", "00" * 32)
+        assert r.returncode != 0 and "fingerprint" in r.stderr
         # a wrong pinned fingerprint is refused before anything is contacted
         bad = ["--expect-fingerprint", "00" * 32]
         for cmd in (("fhe-open-test", "--bundle", str(d / "fhe.json")),
@@ -861,7 +1009,8 @@ def test_cli_one_daemon_per_host_serves_both_keys(keyset, keyset2, tmp_path):
         # the Python client: same endpoints for both keys (custodians2 omitted)
         key = ThresholdFheKey.load(
             str(d / "fhe.json"), pub,
-            [RemoteCustodian("127.0.0.1", int(sp.split(":")[1]), TOKEN, group=pub.g) for sp in specs], pub2)
+            [RemoteCustodian("127.0.0.1", int(sp.split(":")[1]), TOKEN, group=pub.g) for sp in specs], pub2,
+            expect_fingerprint=bfp)
         assert key.decrypt_cell(key.encrypt(41)) == 41
         assert key.decrypt_dot(fhe.dot_cells([key.encrypt(6)], [key.encrypt(7)], key.be)) == 42
         r = run("fhe-open-test", *base, "--bundle", str(d / "fhe.json"), env={"CT": "wrong-token-0123456789abc"})
@@ -924,36 +1073,51 @@ def test_a_key_one_request_is_never_answered_with_the_key_two_share(keyset, keys
         g = pub.g
         E = g.mul(g.G, 4242)
         k1, k2 = pub.key_id, pub2.key_id
-        d1 = r.call("partial", [g.hex(E), "", k1])
-        d2 = r.call("partial", [g.hex(E), "", k2])
+        from py_ecc.optimized_bn128 import G1, G2, pairing
         from torussql.custody import Partial, verify_partial
-        p1, p2 = Partial.from_json(g, d1), Partial.from_json(g, d2)
-        assert verify_partial(pub, E, p1) and verify_partial(pub2, E, p2)
-        assert not verify_partial(pub2, E, p1) and not verify_partial(pub, E, p2)     # not interchangeable
-        assert not g.eq(p1.D, p2.D)
+        craw = cgt.gt_encode(pairing(G2, G1) ** 4242)
+        p1 = Partial.from_json(g, r.call("partial", [g.hex(E), "", k1]))
+        assert verify_partial(pub, E, p1)
+        # the same GT element, exponentiated by the key-1 and the key-2 share: both verify, only
+        # against THEIR key, and never interchangeably
+        j1 = r.call("gt_partial_batch", [[craw.hex()], "", k1])[0]
+        j2 = r.call("gt_partial_batch", [[craw.hex()], "", k2])[0]
+        q1, q2 = cgt.GtPartial.from_json(pub.g, j1), cgt.GtPartial.from_json(pub2.g, j2)
+        assert cgt.verify_gt_partial(pub, craw, q1) and cgt.verify_gt_partial(pub2, craw, q2)
+        assert q1.D != q2.D and q1.index == q2.index == shares[0].index
+        with pytest.raises(Exception):
+            cgt.verify_gt_partial(pub2, craw, q1)
+        with pytest.raises(Exception):
+            cgt.verify_gt_partial(pub, craw, q2)
+        # key 2 (group G2) serves GT exponentiation ONLY: no G1 decryption oracle on s2
+        for m, a in (("partial", [g.hex(E), "", k2]), ("partial_batch", [[g.hex(E)], "", k2])):
+            with pytest.raises(QuorumError, match="GT exponentiation only"):
+                r.call(m, a)
         # no key_id on a multi-key daemon: refused; unknown key id: refused; same for every method
         for m, a in (("partial", [g.hex(E), ""]), ("partial_batch", [[g.hex(E)], ""]),
-                     ("g2_partial", [])):
+                     ("gt_partial_batch", [[craw.hex()], ""])):
             with pytest.raises(QuorumError, match="must name a key_id"):
                 r.call(m, a)
         for m, a in (("partial", [g.hex(E), "", "ff" * 16]), ("partial_batch", [[g.hex(E)], "", "ff" * 16]),
-                     ("g2_partial", ["ff" * 16]), ("partial", [g.hex(E), "", 5])):
+                     ("gt_partial_batch", [[craw.hex()], "", "ff" * 16]), ("partial", [g.hex(E), "", 5])):
             with pytest.raises(QuorumError, match="no share of that key"):
                 r.call(m, a)
-        # the typed clients carry the key id: for_key() routes to the right share
+        # the removed G2-share RPC is gone (it would hand out s·G2 for key 1)
+        with pytest.raises(QuorumError, match="unknown method"):
+            r.call("g2_partial", [k1])
+        # the typed clients carry the key id (and the key's group): for_key() routes correctly
         c2 = r.for_key(pub2)
-        assert verify_partial(pub2, E, c2.partial(E, b""))
-        idx, y2 = c2.g2_partial()
-        assert cgt.verify_g2_share(pub2, idx, y2)
-        with pytest.raises(InvalidPoint):
-            cgt.verify_g2_share(pub, idx, y2)                    # key 2's G2 share is not key 1's
+        got = c2.gt_partial_batch([craw], b"")[0]
+        assert cgt.verify_gt_partial(pub2, craw, got)
         # a single-share (legacy) daemon: requests without key_id still work, a WRONG key_id is refused
         legacy = Custodian(shares[0], {"owner": TOKEN})
         ln = LocalNode(legacy, caller="owner")
         assert verify_partial(pub, E, ln.partial(E, b""))
         with pytest.raises(QuorumError, match="no share of that key"):
-            ln.for_key(pub2).partial(E, b"")
-        assert len(mn.custodians[0].info()["keys"]) == 2 and "key_id" not in mn.custodians[0].info()
+            ln.for_key(pub2).gt_partial_batch([craw], b"")
+        info = mn.custodians[0].info()
+        assert len(info["keys"]) == 2 and "key_id" not in info
+        assert {k["group"] for k in info["keys"]} == {"bn254", "bn254g2"}
     finally:
         mn.stop()
 
@@ -964,9 +1128,11 @@ def test_per_key_access_rate_limits_and_approve(keyset, keyset2, tmp_path):
     g = pub.g
     E = g.mul(g.G, 99)
     k1, k2 = pub.key_id, pub2.key_id
+    from py_ecc.optimized_bn128 import G1, G2, pairing
+    craw = cgt.gt_encode(pairing(G2, G1) ** 99).hex()
     seen = []
     c = Custodian([shares[0], shares2[0]], {"owner": TOKEN, "ops": "ops-token-0123456789abcd"},
-                  key_access={k2: {"ops"}}, rate_per_minute=3, item_budget_per_minute=10,
+                  key_access={k2: {"ops"}}, rate_per_minute=3, item_budget_per_minute=1000,
                   approve={k1: lambda caller, e, ctx: seen.append(("k1", caller)) or True,
                            k2: lambda caller, e, ctx: False})
     own = LocalNode(c, caller="owner")
@@ -974,9 +1140,9 @@ def test_per_key_access_rate_limits_and_approve(keyset, keyset2, tmp_path):
     own.call("partial", [g.hex(E), "", k1])
     # key access: the owner may not use key 2 at all; ops may (but key 2's own approve declines)
     with pytest.raises(QuorumError, match="no access to that key"):
-        own.call("partial", [g.hex(E), "", k2])
+        own.call("gt_partial_batch", [[craw], "", k2])
     with pytest.raises(QuorumError, match="policy"):
-        ops.call("partial", [g.hex(E), "", k2])
+        ops.call("gt_partial_batch", [[craw], "", k2])
     assert seen == [("k1", "owner")]                          # approve hooks are per key
     # rate limits are per (caller, key): exhausting key 1 does not touch key 2's budget
     own.call("partial", [g.hex(E), "", k1]); own.call("partial", [g.hex(E), "", k1])
@@ -984,10 +1150,23 @@ def test_per_key_access_rate_limits_and_approve(keyset, keyset2, tmp_path):
         own.call("partial", [g.hex(E), "", k1])
     for _ in range(2):
         with pytest.raises(QuorumError, match="policy"):
-            ops.call("partial", [g.hex(E), "", k2])
+            ops.call("gt_partial_batch", [[craw], "", k2])
     with pytest.raises(Exception, match="key_access"):
         Custodian([shares[0]], {"owner": TOKEN}, key_access={k2: {"owner"}})
     with pytest.raises(Exception, match="same key"):
         Custodian([shares[0], shares[0]], {"owner": TOKEN})
+    # the item budget is COST-WEIGHTED: one GT element = 100 units, one G1 point = 1
+    c2 = Custodian([shares[0], shares2[0]], {"owner": TOKEN}, item_budget_per_minute=250,
+                   max_batch=50)
+    n2 = LocalNode(c2, caller="owner")
+    n2.call("gt_partial_batch", [[craw, craw], "", k2])                 # 200 units
+    with pytest.raises(QuorumError, match="item budget exceeded.*GT element = 100"):
+        n2.call("gt_partial_batch", [[craw, craw], "", k2])             # 400 > 250
+    n2.call("partial_batch", [[g.hex(E)] * 40, "", k1])                 # other key: its own budget
+    for _ in range(4):
+        n2.call("partial_batch", [[g.hex(E)] * 50, "", k1])             # 40 + 4*50 = 240 units
+    with pytest.raises(QuorumError, match="item budget exceeded"):
+        n2.call("partial_batch", [[g.hex(E)] * 11, "", k1])             # 251 > 250
+
 
 

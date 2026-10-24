@@ -48,6 +48,7 @@ SUM_BYTES = 2 * G1_BYTES                                  # (ΣC1, ΣC2)
 DOT_BYTES = 1 + 4 * GT_BYTES                              # backend tag + (c00, c01, c10, c11)
 CELL_BYTES = 2 * G1_BYTES + 2 * G2_BYTES                  # C1 C2 | D1 D2  = 384
 DEFAULT_RANGE = 1_000_000
+MAX_RANGE = 1 << 40            # larger ranges would need a ~2^20-entry (and up) baby-step table
 
 
 class FheError(ValueError):
@@ -71,15 +72,33 @@ def available_backends() -> list[str]:
     return _fb.available()
 
 
-def parse_cell(raw: bytes, backend=None):
-    """-> (C1, C2, D1, D2) as points of ``backend``. Validates length and the points."""
+def parse_cell(raw: bytes, backend=None, strict: bool = False):
+    """-> (C1, C2, D1, D2) as points of ``backend``. Validates length and the points;
+    ``strict`` additionally proves the G2 points are in the prime-order subgroup (always done
+    by the native back end; costs ≈0.1 s per cell in pure Python — used when a cell is WRITTEN)."""
     be = _be(backend)
     if not isinstance(raw, (bytes, bytearray)) or len(raw) != CELL_BYTES:
         raise FheError(f"an FHE cell is exactly {CELL_BYTES} bytes")
     r = bytes(raw)
     try:
-        return (be.g1_from(r[:64]), be.g1_from(r[64:128]),
-                be.g2_from(r[128:256]), be.g2_from(r[256:384]))
+        d1, d2 = be.g2_from(r[128:256]), be.g2_from(r[256:384])
+        if strict:
+            for q in (d1, d2):
+                if not be.g2_in_subgroup(q):
+                    raise _fb.BackendError("G2 point is not a valid subgroup element")
+        return (be.g1_from(r[:64]), be.g1_from(r[64:128]), d1, d2)
+    except _fb.BackendError as exc:
+        raise FheError(str(exc)) from None
+
+
+def parse_g1_half(raw: bytes, backend=None):
+    """-> (C1, C2) of a cell, validating only the G1 half (what SUM / decryption use)."""
+    be = _be(backend)
+    if not isinstance(raw, (bytes, bytearray)) or len(raw) != CELL_BYTES:
+        raise FheError(f"an FHE cell is exactly {CELL_BYTES} bytes")
+    r = bytes(raw)
+    try:
+        return be.g1_from(r[:64]), be.g1_from(r[64:128])
     except _fb.BackendError as exc:
         raise FheError(str(exc)) from None
 
@@ -92,7 +111,7 @@ def sum_cells(cells: Iterable[bytes], backend=None, scale: int = 1) -> bytes:
     be = _be(backend)
     c1, c2 = be.g1_zero(), be.g1_zero()
     for raw in cells:
-        a, b_, _d1, _d2 = parse_cell(raw, be)
+        a, b_ = parse_g1_half(raw, be)
         c1, c2 = be.g1_add(c1, a), be.g1_add(c2, b_)
     if scale != 1:
         c1, c2 = be.g1_mul(c1, scale), be.g1_mul(c2, scale)
@@ -206,11 +225,18 @@ class _OwnerOps:
     def alpha(self) -> int:
         return self._prf(b"alpha") or 1
 
-    def gamma(self, table: str, col: str, rowid: int) -> int:
-        return self._prf(b"gamma", table, col, rowid)
+    def gamma(self, table: str, col: str, rowid: int, nonce: int) -> int:
+        """Per-WRITE tweak: ``nonce`` is a fresh random number stored next to the cell and
+        changes with every write, so tags of different versions of one cell (or of a row id that
+        is later reused) never share a γ — otherwise the server could mix an old and a new
+        version affinely, λ·old + (1−λ)·new, and have any integer accepted."""
+        if isinstance(nonce, bool) or not isinstance(nonce, int):
+            raise IntegrityError(f"{table}.{col} row {rowid} has no write nonce "
+                                 f"(written without authentication, or tampered)")
+        return self._prf(b"gamma", table, col, rowid, nonce)
 
-    def tag(self, v: int, table: str, col: str, rowid: int) -> bytes:
-        return self.encrypt_scalar(self.alpha * v + self.gamma(table, col, rowid))
+    def tag(self, v: int, table: str, col: str, rowid: int, nonce: int) -> bytes:
+        return self.encrypt_scalar(self.alpha * v + self.gamma(table, col, rowid, nonce))
 
     def _in_range(self, x: int) -> int:
         """The baby-step grid overshoots ±range slightly; the contract is strict."""
@@ -242,33 +268,38 @@ class _OwnerOps:
                                  f"aggregate does not match the authenticated cells")
 
     def decrypt_sum_verified(self, value_blob: bytes, tag_blob: bytes, table: str, col: str,
-                             rowids, scale: int = 1) -> int:
-        gam = sum(self.gamma(table, col, i) for i in rowids) % N
+                             rowids, scale: int = 1, nonces=None) -> int:
+        rowids = list(rowids)
+        if nonces is None or len(nonces) != len(rowids):
+            raise IntegrityError(f"{table}.{col}: write nonces missing for the requested rows")
+        gam = sum(self.gamma(table, col, i, n) for i, n in zip(rowids, nonces)) % N
         mv, mt = self._open_pairs([self._point_pair(value_blob), self._point_pair(tag_blob)])
         self._verify_open(mv, mt, table, col, gam, scale)
         return self._g1_dlog(mv)
 
     def decrypt_cell_verified(self, cell: bytes | None, tag: bytes | None, table: str,
-                              col: str, rowid: int) -> int:
-        return self.decrypt_cells_verified([cell], [tag], table, col, [rowid])[0]
+                              col: str, rowid: int, nonce=None) -> int:
+        return self.decrypt_cells_verified([cell], [tag], table, col, [rowid], [nonce])[0]
 
-    def decrypt_cells_verified(self, cells, tags, table: str, col: str, rowids) -> list[int]:
+    def decrypt_cells_verified(self, cells, tags, table: str, col: str, rowids,
+                               nonces=None) -> list[int]:
         """Verified read of many cells; a threshold key opens them in as few quorum
         rounds as possible."""
         for cell, tag, rowid in zip(cells, tags, rowids):
             if tag is None or cell is None:
                 raise IntegrityError(f"{table}.{col} row {rowid} has no integrity tag "
                                      f"(written without authentication, or tampered)")
+        rowids = list(rowids)
+        if nonces is None or len(nonces) != len(rowids):
+            raise IntegrityError(f"{table}.{col}: write nonces missing for the requested rows")
         pairs = []
         for cell, tag in zip(cells, tags):
-            c1, c2, _d1, _d2 = parse_cell(cell, self.be)
-            t1, t2, _e1, _e2 = parse_cell(tag, self.be)
-            pairs += [(c1, c2), (t1, t2)]
+            pairs += [parse_g1_half(cell, self.be), parse_g1_half(tag, self.be)]
         opened = self._open_pairs(pairs)
         out = []
         for j, rowid in enumerate(rowids):
             mv, mt = opened[2 * j], opened[2 * j + 1]
-            self._verify_open(mv, mt, table, col, self.gamma(table, col, rowid), 1)
+            self._verify_open(mv, mt, table, col, self.gamma(table, col, rowid, nonces[j]), 1)
             out.append(self._g1_dlog(mv))
         return out
 
@@ -284,8 +315,17 @@ class _OwnerOps:
                 cur = be.g1_add(cur, be.G1)
             tab = self._tables["g1"] = {"m": m, "t": t}
         step = be.g1_neg(be.g1_mul(be.G1, m))
-        cur = be.g1_add(M, be.g1_mul(be.G1, self.range))       # shift so the answer is in [0, 2·range]
-        for i in range(m + 1):
+        # Start the giant-step walk at a RANDOM position and wrap around: the number of steps
+        # until a hit is then uniform and independent of the plaintext, so the time a decryption
+        # takes does not depend on the value (a fixed start leaks it linearly).
+        steps = m + 1
+        i0 = secrets.randbelow(steps)
+        base = be.g1_add(M, be.g1_mul(be.G1, self.range))               # shift into [0, 2·range]
+        cur = be.g1_add(base, be.g1_mul(step, i0))
+        for t_ in range(steps):
+            i = (i0 + t_) % steps
+            if i == 0 and t_:
+                cur = base                                               # wrapped around
             j = tab["t"].get(be.g1_key(cur))
             if j is not None:
                 return self._in_range(i * m + j - self.range)
@@ -318,8 +358,14 @@ class _OwnerOps:
                 cur = be.gt_mul(cur, g)
             tab = self._tables["gt:" + be.name] = {"m": m, "t": t}
         giant = be.gt_pow(g, N - m)                              # g^(-m)
-        cur = be.gt_mul(M, be.gt_pow(g, self.range))
-        for i in range(m + 1):
+        steps = m + 1
+        i0 = secrets.randbelow(steps)                            # random start: see _g1_dlog
+        base = be.gt_mul(M, be.gt_pow(g, self.range))
+        cur = be.gt_mul(base, be.gt_pow(giant, i0))
+        for t_ in range(steps):
+            i = (i0 + t_) % steps
+            if i == 0 and t_:
+                cur = base
             j = tab["t"].get(be.gt_key(cur))
             if j is not None:
                 return self._in_range(i * m + j - self.range)
@@ -334,6 +380,10 @@ class FheKey(_OwnerOps):
         self._s = s if s is not None else secrets.randbelow(N - 1) + 1
         if not 0 < self._s < N:
             raise FheError("secret out of range")
+        if isinstance(value_range, bool) or not isinstance(value_range, int) \
+                or not 1 <= value_range <= MAX_RANGE:
+            raise FheError(f"range must be an integer in [1, 2^40] (the discrete-log table "
+                           f"grows with its square root)")
         self.range = value_range
         self.be = _be(backend)
         self._s2 = derive_s2(self._s)
@@ -377,7 +427,7 @@ class FheKey(_OwnerOps):
         # The secret is used as an exponent below, so every base it touches must lie in the
         # order-n subgroup of GT. Otherwise a hostile server could send an element of small
         # order and learn s modulo that order from whether decryption succeeds.
-        for x in (c00, be.gt_mul(c01, c10)):
+        for x in (c00, c01, c10):                     # every base the secret is an exponent of
             if not be.gt_in_subgroup(x):
                 raise FheError("invalid DOT ciphertext: component outside the GT subgroup")
         s, s2 = self._s, self._s2

@@ -24,7 +24,7 @@ from torussql.custody.group import InvalidPoint
 from torussql.custody.proofs import (dleq_prove, dleq_verify, schnorr_prove,
                                      schnorr_verify)
 
-GROUPS = ["secp256k1", "bn254"]
+GROUPS = ["secp256k1", "bn254", "bn254g2"]
 
 
 def solve(A, b, q):

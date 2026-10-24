@@ -23,7 +23,7 @@ import { randomBytes } from "crypto";
 import { AsyncLocalStorage } from "async_hooks";
 import { TorusError } from "./errors";
 import {
-  FheKey, FheBackend, FHE_CELL_BYTES, FHE_DOT_BYTES, FHE_SUM_BYTES, addSums as fheAddSums, mulDots as fheMulDots,
+  FheKey, FheBackend, newNonce, FHE_CELL_BYTES, FHE_DOT_BYTES, FHE_SUM_BYTES, addSums as fheAddSums, mulDots as fheMulDots,
 } from "./fhe";
 
 export {
@@ -689,6 +689,7 @@ function plainKey(v: Value): string | null {
 const SEP = "\u0000";
 const MAC = "__mac__";
 const FMAC = "__fmac__";
+const FNONCE = "__fnonce__";
 const FHE_SUM_CHUNK = 2000;                  // ids per fhe_sum call (server cap 5000)
 const FHE_DOT_CHUNK_NATIVE = 2000;           // server cap 6000 with the native back end
 const FHE_DOT_CHUNK = 50;                    // server cap 300 with pure Python (~0.2 s per row)
@@ -1106,11 +1107,12 @@ export class Client {
 
   /** The encrypted wire cell of an FHE column plus (authenticated) its tag. `rowid` is unknown at INSERT
    *  time: a placeholder tag is sent and replaced by {@link writeCells} once the row id exists. */
-  private fheCells(table: string, c: Column, x: bigint, rowid?: number): Array<[string, WireVal]> {
+  private fheCells(table: string, c: Column, x: bigint, nonce: bigint, rowid?: number): Array<[string, WireVal]> {
     const key = this.fheKey();
     const cells: Array<[string, WireVal]> = [[c.name, wvCell(key.encrypt(x))]];
     if (this.#authenticated) {
-      cells.push([FMAC + c.name, wvCell(rowid === undefined ? key.placeholderCell() : key.tag(x, table, c.name, rowid))]);
+      cells.push([FMAC + c.name, wvCell(rowid === undefined ? key.placeholderCell() : key.tag(x, table, c.name, rowid, nonce))]);
+      cells.push([FNONCE + c.name, { t: "i", v: nonce.toString() }]);   // a fresh nonce for EVERY write
     }
     return cells;
   }
@@ -1136,14 +1138,14 @@ export class Client {
     }
   }
 
-  private fheTagItems(table: string, rowid: number, tags: Array<[string, bigint]>): Array<[number, string, WireVal]> {
+  private fheTagItems(table: string, rowid: number, tags: Array<[string, bigint, bigint]>): Array<[number, string, WireVal]> {
     if (tags.length === 0) return [];
     const key = this.fheKey();
-    return tags.map(([col, x]) => [rowid, FMAC + col, wvCell(key.tag(x, table, col, rowid))]);
+    return tags.map(([col, x, nonce]) => [rowid, FMAC + col, wvCell(key.tag(x, table, col, rowid, nonce))]);
   }
 
   private blindRow(table: string, row: Record<string, Value>): {
-    wire: Record<string, WireVal>; pending: Array<[string, bigint]>; tags: Array<[string, bigint]>;
+    wire: Record<string, WireVal>; pending: Array<[string, bigint]>; tags: Array<[string, bigint, bigint]>;
   } {
     this.assertTrusted(table);
     const cols = this.cols(table);
@@ -1153,7 +1155,7 @@ export class Client {
     }
     const wire: Record<string, WireVal> = Object.create(null);
     const pending: Array<[string, bigint]> = [];
-    const tags: Array<[string, bigint]> = [];
+    const tags: Array<[string, bigint, bigint]> = [];
     for (const c of cols) {
       if (!hasOwn(row, c.name)) throw usage(`INSERT must provide column ${table}.${c.name}`);
       const v = row[c.name];
@@ -1161,8 +1163,9 @@ export class Client {
         wire[c.name] = wv(v);
       } else if (c.policy === "fhe") {
         const x = this.fheInt(v, table, c.name);
-        for (const [n, w] of this.fheCells(table, c, x)) wire[n] = w;
-        if (this.#authenticated) tags.push([c.name, x]);
+        const nonce = newNonce();
+        for (const [n, w] of this.fheCells(table, c, x, nonce)) wire[n] = w;
+        if (this.#authenticated) tags.push([c.name, x, nonce]);
       } else {
         const b = this.blindCell(table, c, v);
         for (const [n, w] of b.cells) wire[n] = w;
@@ -1235,7 +1238,7 @@ export class Client {
               await this.call("update_cell", [table, i, col, wv(v)]);
             } else if (c.policy === "fhe") {
               // a fresh ciphertext (and tag) per row, never one shared cell
-              for (const [n, w] of this.fheCells(table, c, this.fheInt(v, table, col), i)) fheItems.push([i, n, w]);
+              for (const [n, w] of this.fheCells(table, c, this.fheInt(v, table, col), newNonce(), i)) fheItems.push([i, n, w]);
             } else {
               const b = this.blindCell(table, c, v);
               for (const [n, w] of b.cells) await this.call("update_cell", [table, i, n, w]);
@@ -1553,7 +1556,7 @@ export class Client {
       }
     }
     const v = this.#authenticated
-      ? key.decryptSumVerified(total!, tags!, table, col, idxs, k)
+      ? key.decryptSumVerified(total!, tags!, table, col, idxs, await this.fetchNonces(table, col, idxs), k)
       : key.decryptSum(total!);
     return BigInt(v);
   }
@@ -1580,7 +1583,7 @@ export class Client {
       const args: unknown[] = [lt, lc, lids.slice(i, i + chunk), rt, rc, rids.slice(i, i + chunk)];
       if (backend !== undefined) args.push(backend);
       const b = blob(await this.call("fhe_dot", args, 8192), "fhe_dot", FHE_DOT_BYTES);
-      if (backend !== undefined && b[0] !== (backend === "mcl" ? 2 : 1)) throw proto("fhe_dot: the back-end tag does not match the requested back end");
+      // `backend` is only a request: the server may use its own, and the blob's tag says which (both decrypt)
       total = total === null ? b : fheMulDots(total, b);
     }
     return BigInt(key.decryptDot(total!));
@@ -1715,6 +1718,21 @@ export class Client {
     return ids.map((i) => (i === null ? null : got.get(i) ?? null));
   }
 
+  /** The write nonces the server reports for `ids` (`null` where absent or not an integer: the
+   *  verification then fails with IntegrityError). */
+  private async fetchNonces(table: string, col: string, ids: number[]): Promise<Array<bigint | null>> {
+    const out: Array<bigint | null> = [];
+    for (let i = 0; i < ids.length; i += FHE_READ_CHUNK) {
+      const part = ids.slice(i, i + FHE_READ_CHUNK);
+      const ws = arr(await this.call("plain_cells", [table, FNONCE + col, part], part.length * 120 + 4096), "plain_cells", part.length);
+      for (const w of ws) {
+        const o = obj(w, "plain_cells");
+        out.push(o.t === "i" ? parseBig(o.v, "write nonce") : null);
+      }
+    }
+    return out;
+  }
+
   /** Decrypt the FHE cells of `ids` (verified against their tags when authenticated). */
   private async fheReveal(table: string, col: string, ids: number[]): Promise<bigint[]> {
     const key = this.fheKey();
@@ -1731,7 +1749,8 @@ export class Client {
     if (cells.some((c) => c === null)) throw proto(`${table}.${col}: the server returned an empty FHE cell`);
     if (!this.#authenticated) return cells.map((c) => BigInt(key.decryptCell(c!)));
     const tags = await fetch(FMAC + col);
-    return cells.map((c, k) => BigInt(key.decryptCellVerified(c, tags[k], table, col, ids[k])));
+    const nonces = await this.fetchNonces(table, col, ids);
+    return cells.map((c, k) => BigInt(key.decryptCellVerified(c, tags[k], table, col, ids[k], nonces[k])));
   }
 
   /** SELECT cols FROM table WHERE pred (plain columns as stored, encrypted ones unblinded). */

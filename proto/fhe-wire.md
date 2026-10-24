@@ -42,10 +42,10 @@ cell    = C1 ‖ C2 ‖ D1 ‖ D2                                       384 byte
   Decrypt: `M = c11 · c01^(−s2) · c10^(−s) · c00^(s·s2) = g^(Σ a_i·b_i)` then a bounded discrete log w.r.t. `g`.
   Partial blobs of the same tag combine by component-wise GT multiplication.
 * Integrity tags (optional, `authenticated`): hidden column `__fmac__<col>` holds `Enc_scalar(α·v + γ)`
-  (same cell layout, scalar mod n, no range limit). `α = PRF("alpha") or 1`, `γ = PRF("gamma", table, col, rowid)`,
+  (same cell layout, scalar mod n, no range limit) next to `__fnonce__<col>`. `α = PRF("alpha") or 1`, `γ = PRF("gamma", table, col, rowid, nonce)` where `nonce` is a fresh random integer (1 ≤ n < 2^120) chosen for EVERY write and stored in the plain hidden column `__fnonce__<col>` (server-validated: integer in (0, 2^128)) — without it the server could mix an old and a new version of a row affinely, λ·old + (1−λ)·new, and have any integer accepted —,
   `PRF(label, *parts) = HMAC-SHA512(HMAC-SHA256(secret_bytes, "torussql/fhe/" + label), "\0".join(str(p)))` mod n,
   `secret_bytes` = `s` as 32 big-endian bytes. Check for rows I and multiplier k:
-  `(ΣC2' − s·ΣC1') == α·(ΣC2 − s·ΣC1) + k·(Σ_{i∈I} γ_i)·G1` (group elements, no discrete log needed). The tag of a
+  `(ΣC2' − s·ΣC1') == α·(ΣC2 − s·ΣC1) + k·(Σ_{i∈I} γ_i)·G1` (γ_i uses the nonce the server reports for row i) (group elements, no discrete log needed). The tag of a
   new row is written right after INSERT (the row id is only then known), inside one transaction.
 
 ## RPCs (JSON over the framing of wire v2; binary values are `{"t":"x","v":"<base64>"}`)

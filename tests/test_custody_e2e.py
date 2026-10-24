@@ -541,3 +541,40 @@ def test_daemon_reloads_a_refreshed_share_on_sighup(keyset, tmp_path):
         assert verify_partial(npub, E, r.partial(E, b""), b"")  # serves with the new epoch's share
     finally:
         p.terminate()
+
+
+def test_cli_dkg_in_the_g2_key_group_with_secp256k1_identities(tmp_path):
+    """The second FHE secret: identities sign in secp256k1, the KEY is generated in bn254g2 (128-byte
+    commitments, no G1 image anywhere in the files)."""
+    d, k, n = tmp_path, 2, 3
+    pw = {"PW": "ceremony-passphrase"}
+    for i in range(1, n + 1):
+        cli("identity-new", "--index", str(i), "--out", str(d / f"id{i}.json"),
+            "--passphrase-env", "PW", env_extra=pw)
+    cli("ids-merge", *[str(d / f"id{i}.pub.json") for i in range(1, n + 1)], "--out", str(d / "ids.json"))
+    session = cli("new-session").stdout.strip()
+    for i in range(1, n + 1):
+        cli("dkg-start", "--identity", str(d / f"id{i}.json"), "--ids", str(d / "ids.json"), "--k", str(k),
+            "--n", str(n), "--session", session, "--key-group", "bn254g2", "--out", str(d / "box"),
+            "--passphrase-env", "PW", env_extra=pw)
+    for i in range(1, n + 1):
+        cli("dkg-finish", "--identity", str(d / f"id{i}.json"), "--ids", str(d / "ids.json"), "--k", str(k),
+            "--n", str(n), "--session", session, "--key-group", "bn254g2", "--inbox", str(d / "box"),
+            "--out", str(d / f"share{i}.json"), "--public-out", str(d / f"pub{i}.json"),
+            "--passphrase-env", "PW", env_extra=pw)
+    from torussql.custody import KeyShare, PublicKey, laurent
+    pub = PublicKey.load(str(d / "pub1.json"))
+    assert pub.group == "bn254g2" and (d / "pub1.json").read_text() == (d / "pub2.json").read_text()
+    assert all(len(bytes.fromhex(c)) == 128 for c in json.loads((d / "pub1.json").read_text())["commitments"])
+    shares = [KeyShare.load(str(d / f"share{i}.json"), "ceremony-passphrase") for i in (1, 2, 3)]
+    assert all(s.verify() for s in shares)
+    # the key is x with X = x·G2: any quorum reconstructs the same x (test-only)
+    g = pub.g
+    xs = {laurent.reconstruct([(s.index, s.y) for s in sub], g.order)
+          for sub in (shares[:2], shares[1:], [shares[0], shares[2]])}
+    assert len(xs) == 1 and g.eq(g.mul(g.G, xs.pop()), pub.X)
+    # a dkg-finish with the WRONG key group refuses (broadcast commitments do not parse / params differ)
+    r = cli("dkg-finish", "--identity", str(d / "id1.json"), "--ids", str(d / "ids.json"), "--k", str(k),
+            "--n", str(n), "--session", session, "--inbox", str(d / "box"), "--out", str(d / "x.json"),
+            "--public-out", str(d / "xp.json"), "--passphrase-env", "PW", env_extra=pw, check=False)
+    assert r.returncode != 0

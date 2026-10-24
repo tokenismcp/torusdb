@@ -461,32 +461,52 @@ function g1BabyTable(m: number): G1Table {
 
 /** Discrete log of M (w.r.t. G1) over [-range, range]. */
 function g1Dlog(M: G1, range: number): number {
-  if (M === null) return 0;
   const m = bsgsM(range);
   const tab = g1BabyTable(m);
   const R = BigInt(range);
-  let cur = C1.add(C1.fromAff(M), C1.mulFixed(g1Base(), R));
   // after the shift the answer x + R lies in [0, 2R]; j = 0 means "cur is infinity"
+  const base = C1.add(C1.fromAff(M), C1.mulFixed(g1Base(), R));
   const giant = C1.toAffine(C1.mulFixed(g1Base(), BigInt(m)))!;
   const negGiant: Aff<bigint> = { x: giant.x, y: Fp.neg(giant.y) };
+  // Start the giant-step walk at a RANDOM position and wrap around: the number of steps until a hit
+  // is then uniform and independent of the plaintext (a fixed start leaks the value through timing).
+  const steps = m + 1;
+  const i0 = randIndex(steps);
+  let cur = C1.add(base, C1.neg(C1.mulFixed(g1Base(), BigInt(i0) * BigInt(m))));
   const BATCH = 128;
-  let i = 0;
-  while (i <= m) {
+  let t = 0;
+  while (t < steps) {
     const pts: Jac<bigint>[] = [];
-    for (let k = 0; k < BATCH && i + k <= m; k++) { pts.push(cur); cur = C1.addMixed(cur, negGiant); }
+    const idx: number[] = [];
+    for (let k = 0; k < BATCH && t + k < steps; k++) {
+      const i = (i0 + t + k) % steps;
+      if (i === 0 && t + k > 0) cur = base;                              // wrapped around
+      pts.push(cur); idx.push(i);
+      cur = C1.addMixed(cur, negGiant);
+    }
     const aff = C1.batchToAffine(pts);
     for (let k = 0; k < aff.length; k++) {
       const a = aff[k];
       const j = a === null ? 0 : tab.map.get(g1Key(a));
       if (j !== undefined) {
-        const val = (i + k) * m + j - range;
+        const val = idx[k] * m + j - range;
         if (Math.abs(val) > range) break;
         return val;
       }
     }
-    i += pts.length;
+    t += pts.length;
   }
   throw budget("result is outside the key's value range (or the ciphertext is invalid)");
+}
+
+/** Uniform integer in [0, n) from the CSPRNG. */
+function randIndex(n: number): number {
+  return Number(BigInt("0x" + randomBytes(8).toString("hex")) % BigInt(n));
+}
+
+/** A fresh per-write number (1 <= n < 2^120) that individualises an integrity tag. */
+export function newNonce(): bigint {
+  return BigInt("0x" + randomBytes(15).toString("hex")) | 1n;
 }
 
 interface GtTable { m: number; map: Map<string, number> }
@@ -510,8 +530,13 @@ function gtDlog(M: Fp12, tag: number, range: number): number {
     gtTables.set(tk, tab);
   }
   const giant = fp12Pow(g, N - BigInt(m));                      // g^(-m)
-  let cur = fp12Mul(M, fp12Pow(g, BigInt(range)));
-  for (let i = 0; i <= m; i++) {
+  const base = fp12Mul(M, fp12Pow(g, BigInt(range)));
+  const steps = m + 1;
+  const i0 = randIndex(steps);                                  // random start: see g1Dlog
+  let cur = fp12Mul(base, fp12Pow(giant, BigInt(i0)));
+  for (let t = 0; t < steps; t++) {
+    const i = (i0 + t) % steps;
+    if (i === 0 && t > 0) cur = base;                           // wrapped around
     const j = tab.map.get(fp12Key(cur));
     if (j !== undefined) {
       const val = i * m + j - range;
@@ -820,21 +845,30 @@ export class FheKey {
   }
   /** The MAC key alpha = PRF("alpha") (or 1). */
   alpha(): bigint { return (this.#alpha ??= this.prf("alpha") || 1n); }
-  /** The per-cell tweak gamma = PRF("gamma", table, column, row id). */
-  gamma(table: string, col: string, rowid: number): bigint { return this.prf("gamma", table, col, rowid); }
-  /** The tag cell Enc(alpha*v + gamma) for the cell (table, col, rowid). */
-  tag(v: bigint | number, table: string, col: string, rowid: number): Buffer {
+  /** The per-WRITE tweak gamma = PRF("gamma", table, column, row id, nonce): `nonce` is the fresh random
+   *  integer stored next to the cell in `__fnonce__<col>`. A missing or non-integer nonce is an IntegrityError. */
+  gamma(table: string, col: string, rowid: number, nonce: bigint | null): bigint {
+    if (typeof nonce !== "bigint") {
+      throw new TorusError("IntegrityError", `${table}.${col} row ${rowid} has no write nonce (written without authentication, or tampered)`);
+    }
+    return this.prf("gamma", table, col, rowid, nonce.toString());
+  }
+  /** The tag cell Enc(alpha*v + gamma) for the cell (table, col, rowid) written with `nonce`. */
+  tag(v: bigint | number, table: string, col: string, rowid: number, nonce: bigint): Buffer {
     const x = toBigInt(v, "an FHE plaintext");
-    return this.encryptScalar(this.alpha() * x + this.gamma(table, col, rowid));
+    return this.encryptScalar(this.alpha() * x + this.gamma(table, col, rowid, nonce));
   }
 
-  /** Check `tag-sum == alpha * value-sum + k * (sum gamma_i) * G1` (group elements) and return the
-   *  decrypted value sum. Throws IntegrityError on any mismatch. */
+  /** Check `tag-sum == alpha * value-sum + k * (sum gamma_i) * G1` (group elements; gamma_i uses the nonce
+   *  the server reports for row i) and return the decrypted value sum. Throws IntegrityError on any mismatch. */
   decryptSumVerified(valueBlob: Uint8Array, tagBlob: Uint8Array, table: string, col: string,
-                     rowIds: number[], scale: bigint | number = 1n): number {
+                     rowIds: number[], nonces: Array<bigint | null>, scale: bigint | number = 1n): number {
     if (valueBlob.length !== FHE_SUM_BYTES || tagBlob.length !== FHE_SUM_BYTES) throw proto("bad SUM ciphertext");
+    if (!Array.isArray(nonces) || nonces.length !== rowIds.length) {
+      throw new TorusError("IntegrityError", `${table}.${col}: write nonces missing for the requested rows`);
+    }
     let gam = 0n;
-    for (const i of rowIds) gam += this.gamma(table, col, i);
+    rowIds.forEach((i, k) => { gam += this.gamma(table, col, i, nonces[k]); });
     gam %= N;
     const k = toBigInt(scale, "the scale");
     const mv = this.opened(valueBlob, 0), mt = this.opened(tagBlob, 0);
@@ -849,12 +883,12 @@ export class FheKey {
   }
 
   /** Decrypt one cell and verify it against its tag cell (`null` tag = never tagged). */
-  decryptCellVerified(cell: Uint8Array | null, tag: Uint8Array | null, table: string, col: string, rowid: number): number {
+  decryptCellVerified(cell: Uint8Array | null, tag: Uint8Array | null, table: string, col: string, rowid: number, nonce: bigint | null): number {
     if (cell === null || tag === null) {
       throw new TorusError("IntegrityError",
         `${table}.${col} row ${rowid} has no integrity tag (written without authentication, or tampered)`);
     }
-    return this.decryptSumVerified(cellToSum(cell), cellToSum(tag), table, col, [rowid]);
+    return this.decryptSumVerified(cellToSum(cell), cellToSum(tag), table, col, [rowid], [nonce]);
   }
 }
 

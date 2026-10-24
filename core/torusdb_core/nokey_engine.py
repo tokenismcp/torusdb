@@ -197,7 +197,8 @@ class NoKeyServer:
 
     def plain_cells(self, table: str, col: str, idxs: list[int]) -> list[Any]:
         store = self._rows[table]
-        if col == "__cid__" or col.startswith("__mv__") or col.startswith("__fmac__"):
+        if (col == "__cid__" or col.startswith("__mv__") or col.startswith("__fmac__")
+                or col.startswith("__fnonce__")):
             # owner bookkeeping columns may be absent on rows written by another
             # mask store; report None instead of failing the whole read
             return [store.cell(i, col, None) for i in idxs]
@@ -369,6 +370,15 @@ def _fmac_col(col: str) -> str:
     return "__fmac__" + col
 
 
+def _fnonce_col(col: str) -> str:
+    return "__fnonce__" + col
+
+
+def _new_nonce() -> int:
+    """A fresh per-write number (1 ≤ n < 2^120) that individualises the integrity tag."""
+    return secrets.randbits(120) | 1
+
+
 @dataclass
 class NoKeyClient:
     server: NoKeyServer
@@ -484,6 +494,7 @@ class NoKeyClient:
                 row[cname] = self._fhe_key().encrypt(self._fhe_int(value, cname))
                 if self.authenticated:           # real tag is written once the row id is known
                     row[_fmac_col(cname)] = self._fhe_key().encrypt_scalar(0)
+                    row[_fnonce_col(cname)] = _new_nonce()
             else:
                 s = encode(value)
                 blinded, r = self._owner.blind(s)
@@ -506,7 +517,7 @@ class NoKeyClient:
         row.update(extras)
         rowid = self.server.insert(q.table, row)
         self.maskstore.commit_insert(q.table, [rowid], [masks], [extras])
-        self._fhe_tag_rows(q.table, [(rowid, q)])
+        self._fhe_tag_rows(q.table, [(rowid, q, row)])
         return 1
 
     def insert_many(self, sqls: list[str]) -> int:
@@ -528,7 +539,7 @@ class NoKeyClient:
             rows.append(row)
         rowids = self.server.insert_many(table, rows)
         self.maskstore.commit_insert(table, rowids, all_masks, extras)
-        self._fhe_tag_rows(table, [(rid, p.raw) for rid, p in zip(rowids, plans)])
+        self._fhe_tag_rows(table, [(rid, p.raw, r) for rid, p, r in zip(rowids, plans, rows)])
         return len(rowids)
 
     def _fhe_tag_rows(self, table: str, rows: list) -> None:
@@ -542,11 +553,11 @@ class NoKeyClient:
             return
         key = self._fhe_key()
         items = []
-        for rowid, q in rows:
+        for rowid, q, row in rows:
             given = dict(zip(q.columns, q.values))
             for c in fcols:
                 v = self._fhe_int(_literal_to_value(given[c], self._coltype[(table, c)]), c)
-                items.append((rowid, _fmac_col(c), key.tag(v, table, c, rowid)))
+                items.append((rowid, _fmac_col(c), key.tag(v, table, c, rowid, row[_fnonce_col(c)])))
         self._write_cells(table, items)
 
     def _write_cells(self, table: str, items: list) -> None:
@@ -601,7 +612,9 @@ class NoKeyClient:
                     iv = self._fhe_int(value, col)
                     cells.append((col, self._fhe_key().encrypt(iv)))
                     if self.authenticated:
-                        cells.append((_fmac_col(col), self._fhe_key().tag(iv, table, col, i)))
+                        nonce = _new_nonce()                      # new for EVERY write
+                        cells.append((_fmac_col(col), self._fhe_key().tag(iv, table, col, i, nonce)))
+                        cells.append((_fnonce_col(col), nonce))
                 else:
                     s = encode(value)
                     blinded, r = self._owner.blind(s)
@@ -776,10 +789,11 @@ class NoKeyClient:
                     return key.decrypt_cells(cells)
                 return [key.decrypt_cell(c) for c in cells]
             tags = self.server.plain_cells(table, _fmac_col(col), idxs)
+            nonces = self.server.plain_cells(table, _fnonce_col(col), idxs)
             if hasattr(key, "decrypt_cells_verified"):
-                return key.decrypt_cells_verified(cells, tags, table, col, idxs)
-            return [key.decrypt_cell_verified(c, t, table, col, i)
-                    for c, t, i in zip(cells, tags, idxs)]
+                return key.decrypt_cells_verified(cells, tags, table, col, idxs, nonces)
+            return [key.decrypt_cell_verified(c, t, table, col, i, n)
+                    for c, t, i, n in zip(cells, tags, idxs, nonces)]
         return [decode(s) for s in self._read_verified_scalars(table, col, idxs)]
 
     _AGG = (PSum, PAvg, PCountStar, PScaledSum, PDot, PScalarMul, PCtMul,
@@ -974,7 +988,8 @@ class NoKeyClient:
                 tags = tpart if tags is None else fhe.add_sums(tags, tpart)
         if not self.authenticated:
             return key.decrypt_sum(total)
-        return key.decrypt_sum_verified(total, tags, table, col, idxs, k)
+        nonces = self.server.plain_cells(table, _fnonce_col(col), idxs)
+        return key.decrypt_sum_verified(total, tags, table, col, idxs, k, nonces)
 
     def _fhe_dot(self, lt, lc, lids, rt, rc, rids) -> int:
         from . import fhe

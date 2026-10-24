@@ -1,23 +1,25 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Threshold use of a BN254 key in the pairing groups G2 and GT (EC-FHE ``DOT``).
+"""Threshold use of a BN254 key in the target group GT (EC-FHE ``DOT``).
 
-The custody key is ``x`` with public ``X = x·G1`` (group ``bn254``). Two more owner
-operations of the FHE scheme need ``x`` *applied* to elements of other groups, and the
-Laurent sharing makes both linear in the exponent, so ``x`` is never assembled:
+Two custody keys take part in the FHE scheme, in DIFFERENT groups:
 
-* **GT power** (decrypting a ``DOT``):  custodian ``i`` returns ``Dᵢ = c^{yᵢ}`` for a GT
-  element ``c``; anyone combines ``c^x = Π_{i∈S} Dᵢ^{λᵢ}``.
-* **G2 public share** (publishing ``Q2 = x·G2``): custodian ``i`` returns ``Y2ᵢ = yᵢ·G2``;
-  anyone combines ``Q2 = Σ λᵢ·Y2ᵢ``.
+* key 1, secret ``s``, group ``bn254``  (public ``X1 = s·G1`` — needed for encryption),
+* key 2, secret ``s2``, group ``bn254g2`` (public ``Q2 = s2·G2`` — the public key IS the G2
+  point; **no G1 image of ``s2`` exists anywhere**, because ``X2 = s2·G1`` together with a cell's
+  halves gives ``e(G1, D2) / e(X2, D1) = g^v``, i.e. total plaintext recovery).
+
+Both are Laurent-shared, so applying the secret to a GT element is linear in the exponent and
+``x`` is never assembled: custodian ``i`` returns ``Dᵢ = c^{yᵢ}``; anyone combines
+``c^x = Π_{i∈S} Dᵢ^{λᵢ}``.
 
 Soundness of the GT power  (``GtProof``, Chaum–Pedersen across two groups of the SAME prime
-order ``q`` — G1 and the order-``q`` subgroup μ_q ⊂ GT)
-    statement   Yᵢ = yᵢ·G1  (public verification key)   and   D = c^{yᵢ}
-    prover      k ←$ F_q ;  R1 = k·G1 ,  R2 = c^k ;  h = H(ctx, G1, Yᵢ, c, D, R1, R2) ;  z = k + h·yᵢ
-    verifier    z·G1 = R1 + h·Yᵢ   and   c^z = R2 · D^h        (and  c, D ∈ μ_q)
+order ``q`` — the key's group (G1 or G2) and the order-``q`` subgroup μ_q ⊂ GT)
+    statement   Yᵢ = yᵢ·B  (public verification key, B = G1 or G2)   and   D = c^{yᵢ}
+    prover      k ←$ F_q ;  R1 = k·B ,  R2 = c^k ;  h = H(ctx, B, Yᵢ, R1, c, D, R2) ;  z = k + h·yᵢ
+    verifier    z·B = R1 + h·Yᵢ   and   c^z = R2 · D^h        (and  c, D ∈ μ_q)
   * completeness: both equations are the images of ``z = k + h·y``.
   * special soundness: two accepting transcripts (R1,R2) with challenges h ≠ h′ give
-    ``y = (z − z′)/(h − h′)`` with ``Yᵢ = y·G1`` (first equation) and ``D^{h−h′} = c^{z−z′} =
+    ``y = (z − z′)/(h − h′)`` with ``Yᵢ = y·B`` (first equation) and ``D^{h−h′} = c^{z−z′} =
     c^{(h−h′)y}``. ``c ∈ μ_q`` makes the right side depend only on ``y mod q``; with
     ``D ∈ μ_q`` and ``gcd(h−h′, q) = 1`` the map ``u ↦ u^{h−h′}`` is injective on μ_q, so
     ``D = c^y``. In the random-oracle model a custodian cannot return any ``D`` other than
@@ -27,13 +29,13 @@ order ``q`` — G1 and the order-``q`` subgroup μ_q ⊂ GT)
     would leak ``yᵢ`` modulo small primes (small-subgroup attack). Both ``c`` and ``D`` are
     tested with ``u^q = 1`` (one exponentiation each).
   * zero knowledge: honest-verifier simulatable in the standard way (pick z, h, set R1, R2).
-No pairing is needed for GT proofs. ``G2`` shares need none either: a pairing equation
-``e(Yᵢ, G2) = e(G1, Y2ᵢ)`` plus a G2 subgroup check ties ``Y2ᵢ`` to the same ``yᵢ``.
+No pairing is needed for the proofs.
 
 This module uses ``py_ecc`` only (GT elements are exchanged in the canonical 384-byte
-encoding of ``torusdb_core.fhe_backend``, identical for every back end). Exponentiations by
-a secret scalar use the same split-scalar blinding as ``Group.mul_blinded`` — a mitigation
-of repeated-measurement correlation, NOT constant-time arithmetic.
+encoding of ``torusdb_core.fhe_backend``, identical for every back end). Exponentiation of GT by
+a secret scalar has no constant-time primitive; it uses the same split-scalar blinding as
+``Group.mul_blinded`` — a mitigation of repeated-measurement correlation, NOT constant-time
+arithmetic (the G1/G2 multiplications inside the proof do use mcl's mulCT when available).
 """
 from __future__ import annotations
 
@@ -56,8 +58,8 @@ MAX_GT_BATCH = 64                    # elements per request (each costs ~5 expon
 
 
 def need_bn254(pub: PublicKey) -> None:
-    if pub.group != "bn254":
-        raise CustodyError("GT / G2 operations need a 'bn254' key (the group of the FHE scheme)")
+    if pub.group not in ("bn254", "bn254g2"):
+        raise CustodyError("GT operations need a 'bn254' (s) or 'bn254g2' (s2) key")
 
 
 # ── GT elements (canonical 12 × 32-byte big-endian coefficients) ──────────────
@@ -95,7 +97,7 @@ def _pow_blinded(c: FQ12, k: int) -> FQ12:
 # ── GT power with proof ──────────────────────────────────────────────────────
 @dataclass(frozen=True)
 class GtProof:
-    R1: object                 # k·G1
+    R1: object                 # k·B  (B = the generator of the key's group: G1 for s, G2 for s2)
     R2: bytes                  # c^k   (GT, canonical)
     z: int
 
@@ -197,7 +199,7 @@ def gt_power_local(pub: PublicKey, cs: list[bytes], share_partials: list[list[Gt
     return [combine_gt(pub, {i: pl[j].D for i, pl in ok.items()}) for j in range(len(cs))]
 
 
-# ── G2 public key share ──────────────────────────────────────────────────────
+# ── G2 points (the public key Q2 of the second secret) ───────────────────────
 def g2_encode(pt) -> bytes:
     if is_inf(pt):
         return bytes(G2_BYTES)
@@ -208,7 +210,7 @@ def g2_encode(pt) -> bytes:
 
 def g2_decode(raw: bytes):
     """Validated G2 point: coordinates < p, on the twist AND in the prime-order subgroup.
-    The identity is refused (never a legitimate key share)."""
+    The identity is refused (never a legitimate public key)."""
     if not isinstance(raw, (bytes, bytearray)) or len(raw) != G2_BYTES:
         raise InvalidPoint("a G2 point is 128 bytes")
     v = [int.from_bytes(raw[i:i + 32], "big") for i in range(0, G2_BYTES, 32)]
@@ -217,77 +219,14 @@ def g2_decode(raw: bytes):
     pt = (FQ2([v[0], v[1]]), FQ2([v[2], v[3]]), FQ2([1, 0]))
     if not is_on_curve(pt, _B2):
         raise InvalidPoint("G2 point is not on the curve")
-    if not is_inf(_mul(pt, Q)):
-        raise InvalidPoint("G2 point is not in the prime-order subgroup")
+    if not is_inf(_mul(pt, Q)) or is_inf(pt):
+        raise InvalidPoint("G2 point is not a non-identity element of the prime-order subgroup")
     return pt
 
 
-def _g2_mul_blinded(pt, k: int):
-    """yᵢ·G2 for the secret share: mcl's constant-time ladder when the native library is
-    available (same switch as ``Group``), else split-scalar blinding (NOT constant time)."""
-    be = _G1_GROUP_NATIVE()
-    if be is not None:
-        r = be.g2_mul_secret(be.g2_from(g2_encode(pt)), k % Q)
-        return g2_decode_unchecked(be.g2_to(r))
-    r = secrets.randbelow(Q - 1) + 1
-    return _add(_mul(pt, (k - r) % Q), _mul(pt, r))
-
-
-def _G1_GROUP_NATIVE():
-    from .group import get_group
-    return get_group("bn254")._native()
-
-
-def g2_decode_unchecked(raw: bytes):
-    v = [int.from_bytes(raw[i:i + 32], "big") for i in range(0, G2_BYTES, 32)]
-    return (FQ2([v[0], v[1]]), FQ2([v[2], v[3]]), FQ2([1, 0]))
-
-
-def g2_partial(share: KeyShare) -> bytes:
-    """Custodian side: ``yᵢ·G2``. Public-key material (``yᵢ·G1`` is already public), so
-    no proof is attached: the receiver checks it with a pairing."""
-    need_bn254(share.public)
-    return g2_encode(_g2_mul_blinded(_G2, share.y))
-
-
-def pairing_equal(p1, q2_of_p1, p2, q2_of_p2) -> bool:
-    """e(p1, q_a) == e(p2, q_b) for G1 points p* and G2 points q* (final exponentiation shared)."""
-    m = pairing(q2_of_p1, p1, final_exponentiate=False) * \
-        pairing(q2_of_p2, _neg(p2), final_exponentiate=False)
-    return final_exponentiate(m) == FQ12.one()
-
-
-def verify_g2_share(pub: PublicKey, index: int, raw: bytes):
-    """Y2ᵢ is valid iff it is in the G2 subgroup and e(Yᵢ, G2) = e(G1, Y2ᵢ)."""
-    need_bn254(pub)
-    if not 1 <= index <= pub.n:
-        raise InvalidPoint("bad custodian index")
-    pt = g2_decode(raw)
-    y_pt = pub.verification_key(index)
-    if not pairing_equal(y_pt, _G2, _G1, pt):
-        raise InvalidPoint("G2 share does not match the custodian's verification key")
-    return pt
-
-
-def combine_g2(pub: PublicKey, shares: dict[int, bytes]) -> bytes:
-    """Q2 = x·G2 = Σ λᵢ·Y2ᵢ from ``k`` VERIFIED shares; checked against X by pairing."""
-    need_bn254(pub)
-    idx = sorted(shares)[:pub.k]
-    if len(idx) < pub.k:
-        raise CustodyError(f"need {pub.k} G2 shares")
-    lam = laurent.lambdas(idx, Q)
-    acc = None
-    for i in idx:
-        term = _mul(g2_decode(shares[i]), lam[i])
-        acc = term if acc is None else _add(acc, term)
-    check_q2(pub.X, g2_encode(acc))
-    return g2_encode(acc)
-
-
-def check_q2(X, raw_q2: bytes):
-    """Public-key consistency: Q2 in the G2 subgroup and e(X, G2) = e(G1, Q2), i.e. the
-    G2 and G1 public keys have the same discrete logarithm. Returns the point."""
+def g1_image_matches(X1, raw_q2: bytes) -> bool:
+    """True iff ``e(X1, G2) = e(G1, Q2)`` — i.e. Q2 would be ``s·G2`` for the G1 key X1 = s·G1.
+    That combination is forbidden (it gives a dictionary oracle on every ciphertext)."""
     pt = g2_decode(raw_q2)
-    if is_inf(X) or not pairing_equal(X, _G2, _G1, pt):
-        raise InvalidPoint("Q2 is not the G2 image of the public key (pairing check failed)")
-    return pt
+    m = pairing(_G2, X1, final_exponentiate=False) * pairing(pt, _neg(_G1), final_exponentiate=False)
+    return final_exponentiate(m) == FQ12.one()

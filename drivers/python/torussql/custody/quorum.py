@@ -68,10 +68,6 @@ class LocalCustodian:
         except CustodyError as exc:
             raise QuorumError(str(exc)) from None
 
-    def g2_partial(self):
-        from . import gt as _gt
-        self.requests += 1
-        return self.share.index, _gt.g2_partial(self.share)
 
 
 class Quorum:
@@ -209,28 +205,6 @@ class Quorum:
             out += [_gt.combine_gt(pub, {i: pl[j].D for i, pl in valid.items()})
                     for j in range(len(chunk))]
         return out
-
-    def shared_g2(self) -> bytes:
-        """``Q2 = x*G2`` (x = the secret THIS quorum serves; for FHE columns the second
-        secret s2) assembled from the custodians' pairing-verified G2 shares (the
-        result is also checked against the public key ``X`` by a pairing)."""
-        from . import gt as _gt
-        pub = self.public
-        _gt.need_bn254(pub)
-
-        def ask(c):
-            fn = getattr(c, "g2_partial", None)
-            if fn is None:
-                raise QuorumError("this custodian does not support G2 shares")
-            return fn()
-
-        def verify(ans):
-            idx, raw = ans
-            _gt.verify_g2_share(pub, int(idx), bytes(raw))
-            return int(idx)
-
-        valid = self._collect(ask, verify)
-        return _gt.combine_g2(pub, {i: bytes(a[1]) for i, a in valid.items()})
 
 
 LocalQuorum = Quorum          # alias: a Quorum over LocalCustodians

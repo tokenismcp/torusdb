@@ -7,6 +7,8 @@ prime-order subgroup:
   * ``secp256k1`` — default, ~128-bit security.
   * ``bn254``     — the G1 group of BN254 (same curve family as the engine;
                     ~100-bit security).
+  * ``bn254g2``   — the G2 group of BN254 (128-byte points, order n; the subgroup
+                    is checked on decode). Used only for the second FHE secret.
 
 Only the vetted ``py_ecc`` arithmetic is used; no curve code is implemented
 here. Points are opaque objects; ``encode``/``decode`` give a canonical 64-byte
@@ -36,7 +38,8 @@ import secrets
 
 try:
     from py_ecc.optimized_bn128 import (
-        FQ, G1 as _BN_G, Z1 as _BN_Z, add as _bn_add, curve_order as _BN_N,
+        FQ, FQ2 as _FQ2, G1 as _BN_G, G2 as _BN_G2, Z1 as _BN_Z, Z2 as _BN_Z2, b2 as _BN_B2,
+        is_on_curve as _bn_on_curve, add as _bn_add, curve_order as _BN_N,
         eq as _bn_eq, field_modulus as _BN_P, is_inf as _bn_is_inf,
         multiply as _bn_mul, neg as _bn_neg, normalize as _bn_norm,
     )
@@ -221,6 +224,79 @@ class _Bn254(Group):
         return 0 < x < _BN_P and 0 < y < _BN_P and (y * y - x * x * x - 3) % _BN_P == 0
 
 
+class _Bn254G2(Group):
+    """The G2 group of BN254 (points over Fp2, prime order n, cofactor > 1).
+
+    Used for the SECOND FHE secret ``s2``: its public key is ``Q2 = s2·G2`` and NOTHING in G1
+    is ever derived from ``s2`` (a G1 image ``s2·G1`` would let anyone decrypt every cell:
+    ``e(G1, D2) / e(X2, D1) = g^v``). Points are 128 bytes (x0‖x1‖y0‖y1); ``decode``
+    checks the twist equation AND prime-order subgroup membership."""
+    name = "bn254g2"
+
+    def __init__(self) -> None:
+        _need()
+        self.order = _BN_N
+        self.G = _BN_G2
+        self.identity = _BN_Z2
+
+    def add(self, a, b): return _bn_add(a, b)
+    def neg(self, a): return _bn_neg(a)
+    def eq(self, a, b): return _bn_eq(a, b)
+    def is_identity(self, a): return _bn_is_inf(a)
+    def mul(self, a, k):
+        k %= self.order
+        return self.identity if (k == 0 or self.is_identity(a)) else _bn_mul(a, k)
+
+    def _native(self):
+        return get_group("bn254")._native()
+
+    @property
+    def constant_time(self) -> bool:                          # type: ignore[override]
+        return self._native() is not None
+
+    def mul_secret(self, a, k):
+        be = self._native()
+        k %= self.order
+        if be is None:
+            return self.mul_blinded(a, k)
+        if k == 0 or self.is_identity(a):
+            return self.identity
+        r = be.g2_mul_secret(be.g2_from(self.encode(a)), k)
+        return self.decode(be.g2_to(r))
+
+    def mul_blinded(self, a, k):
+        if self._native() is not None:
+            return self.mul_secret(a, k)
+        return Group.mul_blinded(self, a, k)
+
+    def encode(self, a) -> bytes:
+        if self.is_identity(a):
+            return bytes(4 * _COORD)
+        x, y = _bn_norm(a)
+        return b"".join(int(c.n if hasattr(c, "n") else c).to_bytes(_COORD, "big")
+                        for c in (*x.coeffs, *y.coeffs))
+
+    def decode(self, b: bytes):
+        if not isinstance(b, (bytes, bytearray)) or len(b) != 4 * _COORD:
+            raise InvalidPoint("a G2 point must be 128 bytes")
+        b = bytes(b)
+        if b == bytes(4 * _COORD):
+            return self.identity
+        v = [int.from_bytes(b[i:i + _COORD], "big") for i in range(0, 4 * _COORD, _COORD)]
+        if any(c >= _BN_P for c in v):
+            raise InvalidPoint("G2 coordinate out of range")
+        pt = (_FQ2([v[0], v[1]]), _FQ2([v[2], v[3]]), _FQ2([1, 0]))
+        if not _bn_on_curve(pt, _BN_B2):
+            raise InvalidPoint("point is not on the curve")
+        if not _bn_is_inf(_bn_mul(pt, self.order)):
+            raise InvalidPoint("point is not in the prime-order subgroup of G2")
+        return pt
+
+    def _xy(self, a): raise NotImplementedError
+    def _from_xy(self, x, y): raise NotImplementedError
+    def _on_curve(self, x, y): raise NotImplementedError
+
+
 _CACHE: dict[str, Group] = {}
 
 
@@ -230,6 +306,8 @@ def get_group(name: str = "secp256k1") -> Group:
             _CACHE[name] = _Secp256k1()
         elif name == "bn254":
             _CACHE[name] = _Bn254()
+        elif name == "bn254g2":
+            _CACHE[name] = _Bn254G2()
         else:
-            raise CustodyError(f"unknown group {name!r} (secp256k1 | bn254)")
+            raise CustodyError(f"unknown group {name!r} (secp256k1 | bn254 | bn254g2)")
     return _CACHE[name]

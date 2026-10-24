@@ -9,7 +9,7 @@ import * as net from "net";
 import * as path from "path";
 import * as util from "util";
 import { Client, FheKey, TorusError, eq, gt, Column, FHE_CELL_BYTES } from "../src/torusdb";
-import { _internals as I, FHE_N, FHE_P, sumCells, addSums, mulDots } from "../src/fhe";
+import { _internals as I, FHE_N, FHE_P, sumCells, addSums, mulDots, newNonce } from "../src/fhe";
 import { skipReason, startServer, RunningServer, uniq, tmpdir, mclPath, runPeer } from "./helpers";
 
 const kind = (k: string) => (e: any) => e instanceof TorusError && e.kind === k;
@@ -65,27 +65,40 @@ test("vectors: GT generators are the published constants and have order n; G2 ge
   assert.ok(I.C2.isInf(I.C2.mul(I.C2.fromAff(I.G2_AFF), FHE_N)));
 });
 
-test("vectors: MAC alpha, gamma, tag cells and tag-sum blob", () => {
+test("vectors: MAC alpha, nonces, gamma, tag cells and tag-sum blob", () => {
   const key = FheKey.fromHex(VEC.secret, VEC.range);
   const m = VEC.mac;
+  const nonces: bigint[] = m.nonces.map((n: string) => BigInt(n));
+  const ids: number[] = m.row_ids;
   assert.equal("0x" + key.alpha().toString(16), m.alpha);
-  assert.deepEqual(m.row_ids.map((i: number) => "0x" + key.gamma(m.table, m.column, i).toString(16)), m.gamma);
-  assert.equal(key.decryptSumVerified(hex(VEC.sum_blob), hex(m.tag_sum_blob), m.table, m.column, m.row_ids), VEC.sum_expected);
-  m.row_ids.forEach((id: number, k: number) => {
-    assert.equal(key.decryptCellVerified(hex(VEC.cells_a[k]), hex(m.tag_cells[k]), m.table, m.column, id), VEC.values_a[k]);
+  assert.deepEqual(ids.map((i, k) => "0x" + key.gamma(m.table, m.column, i, nonces[k]).toString(16)), m.gamma);
+  assert.equal(key.decryptSumVerified(hex(VEC.sum_blob), hex(m.tag_sum_blob), m.table, m.column, ids, nonces), VEC.sum_expected);
+  ids.forEach((id, k) => {
+    assert.equal(key.decryptCellVerified(hex(VEC.cells_a[k]), hex(m.tag_cells[k]), m.table, m.column, id, nonces[k]), VEC.values_a[k]);
   });
-  // the tag of each vector cell is Enc(alpha*v + gamma): our own tag verifies too
-  assert.equal(key.decryptCellVerified(key.encrypt(7), key.tag(7, "emp", "rate", 2), "emp", "rate", 2), 7);
+  // the tag of each write is Enc(alpha*v + gamma(.., nonce)): our own tag verifies too
+  const n7 = newNonce();
+  assert.ok(n7 > 0n && n7 < (1n << 120n));
+  assert.equal(key.decryptCellVerified(key.encrypt(7), key.tag(7, "emp", "rate", 2, n7), "emp", "rate", 2, n7), 7);
   // tampering
   const kind_ = kind("IntegrityError");
-  assert.throws(() => key.decryptSumVerified(hex(VEC.sum_blob), hex(m.tag_sum_blob), m.table, m.column, [0, 1, 2]), kind_);
-  assert.throws(() => key.decryptSumVerified(hex(VEC.sum_blob), hex(m.tag_sum_blob), m.table, m.column, m.row_ids, 2), kind_);
-  assert.throws(() => key.decryptSumVerified(hex(VEC.scaled3_sum_blob), hex(m.tag_sum_blob), m.table, m.column, m.row_ids), kind_);
-  assert.throws(() => key.decryptSumVerified(hex(VEC.sum_blob), hex(m.tag_sum_blob), m.table, "other", m.row_ids), kind_);
-  assert.throws(() => key.decryptCellVerified(hex(VEC.cells_a[0]), hex(m.tag_cells[1]), m.table, m.column, 0), kind_);
-  assert.throws(() => key.decryptCellVerified(hex(VEC.cells_a[0]), hex(m.tag_cells[0]), m.table, m.column, 1), kind_);
-  assert.throws(() => key.decryptCellVerified(hex(VEC.cells_a[0]), null, m.table, m.column, 0), kind_);
-  assert.throws(() => key.decryptCellVerified(key.encrypt(41), hex(m.tag_cells[0]), m.table, m.column, 0), kind_);
+  const sum = (blob: string, rows = ids, ns: Array<bigint | null> = nonces, col = m.column, k: number | bigint = 1) =>
+    () => key.decryptSumVerified(hex(blob), hex(m.tag_sum_blob), m.table, col, rows, ns, k);
+  assert.throws(sum(VEC.sum_blob, [0, 1, 2], nonces.slice(0, 3)), kind_);
+  assert.throws(sum(VEC.sum_blob, ids, nonces, m.column, 2), kind_);
+  assert.throws(sum(VEC.scaled3_sum_blob), kind_);
+  assert.throws(sum(VEC.sum_blob, ids, nonces, "other"), kind_);
+  assert.throws(sum(VEC.sum_blob, ids, [...nonces.slice(0, 3), nonces[3] + 2n]), kind_);          // a different nonce
+  assert.throws(sum(VEC.sum_blob, ids, [...nonces.slice(0, 3), null]), kind_);                    // nonce hidden
+  assert.throws(sum(VEC.sum_blob, ids, nonces.slice(0, 3)), kind_);                                // missing entries
+  const cv = (c: string, t: string | null, row: number, n: bigint | null) =>
+    () => key.decryptCellVerified(hex(c), t === null ? null : hex(t), m.table, m.column, row, n);
+  assert.throws(cv(VEC.cells_a[0], m.tag_cells[1], 0, nonces[0]), kind_);
+  assert.throws(cv(VEC.cells_a[0], m.tag_cells[0], 1, nonces[0]), kind_);
+  assert.throws(cv(VEC.cells_a[0], m.tag_cells[0], 0, nonces[1]), kind_);                          // another write's nonce
+  assert.throws(cv(VEC.cells_a[0], m.tag_cells[0], 0, null), kind_);
+  assert.throws(cv(VEC.cells_a[0], null, 0, nonces[0]), kind_);
+  assert.throws(() => key.decryptCellVerified(key.encrypt(41), hex(m.tag_cells[0]), m.table, m.column, 0, nonces[0]), kind_);
 });
 
 // ── scheme properties and rejections (no server) ─────────────────────────────
@@ -111,7 +124,7 @@ test("encrypt/decrypt: edge values, range, fresh randomness, bigint and number i
 test("encrypt: C1 and D1 use independent randomness, tags use scalars beyond the range", () => {
   const key = FheKey.generate(1000);
   // a tag is an arbitrary scalar mod n (alpha*v + gamma): decrypting it as a value must fail (out of range)
-  const tag = key.tag(5, "t", "c", 1);
+  const tag = key.tag(5, "t", "c", 1, 12345n);
   assert.throws(() => key.decryptCell(tag), kind("OutOfBudget"));
   // the sum blob of a cell is exactly its first 128 bytes
   const c = key.encrypt(9);
@@ -267,6 +280,7 @@ async function lyingProxy(up: RunningServer): Promise<{ server: net.Server; port
   const server = net.createServer((cli) => {
     const upc = net.createConnection({ host: up.host, port: up.port });
     let buf = Buffer.alloc(0);
+    let lastReq: any = null;
     cli.on("data", (d) => {
       buf = Buffer.concat([buf, d]);
       while (buf.length >= 4 && buf.length >= 4 + buf.readUInt32BE(0)) {
@@ -274,6 +288,7 @@ async function lyingProxy(up: RunningServer): Promise<{ server: net.Server; port
         const req = JSON.parse(buf.subarray(4, 4 + n).toString());
         buf = buf.subarray(4 + n);
         seen.push(req.m);
+        lastReq = req;
         if (req.m === "fhe_sum" && !String(req.a[1]).startsWith("__fmac__")) {
           const ids: number[] = req.a[2];
           if (mode.value === "scale") req.a[3] = (req.a[3] ?? 1) * 2;
@@ -290,7 +305,20 @@ async function lyingProxy(up: RunningServer): Promise<{ server: net.Server; port
         upc.write(frame(Buffer.from(JSON.stringify(req))));
       }
     });
-    upc.on("data", (d) => cli.write(d));
+    let ubuf = Buffer.alloc(0);
+    upc.on("data", (d) => {
+      if (mode.value !== "hidenonce" && mode.value !== "fakenonce") { cli.write(d); return; }
+      ubuf = Buffer.concat([ubuf, d]);                                    // rewrite whole reply frames
+      while (ubuf.length >= 4 && ubuf.length >= 4 + ubuf.readUInt32BE(0)) {
+        const n = ubuf.readUInt32BE(0);
+        const rep = JSON.parse(ubuf.subarray(4, 4 + n).toString());
+        ubuf = ubuf.subarray(4 + n);
+        if (lastReq && lastReq.m === "plain_cells" && String(lastReq.a[1]).startsWith("__fnonce__") && Array.isArray(rep.ok)) {
+          rep.ok = rep.ok.map((w: any) => mode.value === "hidenonce" ? { t: "n" } : { t: "i", v: String(BigInt(w.v) + 2n) });
+        }
+        cli.write(frame(Buffer.from(JSON.stringify(rep))));
+      }
+    });
     cli.on("close", () => upc.destroy());
     upc.on("close", () => cli.destroy());
     cli.on("error", () => undefined); upc.on("error", () => undefined);
@@ -442,20 +470,20 @@ T("FHE validation parity: INT only, no predicates/index/join/per-row k*col, rang
   } finally { db.close(); }
 });
 
-T("FHE SUM beyond one chunk (2100 rows, 2 fhe_sum calls) and bulk insert", async () => {
+T("FHE SUM beyond one chunk (2100 rows, 2 fhe_sum calls; 150 rows without a native server: pure-Python cell validation is ~45 ms/cell) and bulk insert", async () => {
   const key = FheKey.fromHex(SECRET, 100_000);
-  const db = await Client.connect(mem.host, mem.port, { fheKey: key, ...OPTS });
+  const db = await Client.connect((native ?? mem).host, (native ?? mem).port, { fheKey: key, ...OPTS });
   try {
     const t = uniq("big");
     await db.createTable(t, [{ name: "id", type: "int", policy: "plain" }, { name: "v", type: "int", policy: "fhe" }]);
-    const n = 2100;
+    const n = native ? 2100 : 150;
     const ids = await db.insertMany(t, Array.from({ length: n }, (_, i) => ({ id: i, v: (i % 7) - 3 })));
     assert.equal(ids.length, n);
     const expected = Array.from({ length: n }, (_, i) => (i % 7) - 3).reduce((a, b) => a + b, 0);
     assert.equal(await db.sum(t, "v"), BigInt(expected));
     assert.equal(await db.scaledSum(t, "v", 5), BigInt(5 * expected));
-    const rows = await db.select(t, ["v"], null, { offset: 2090, limit: 10 });
-    assert.deepEqual(rows.map((r) => Number(r.v)), Array.from({ length: 10 }, (_, i) => ((2090 + i) % 7) - 3));
+    const rows = await db.select(t, ["v"], null, { offset: n - 10, limit: 10 });
+    assert.deepEqual(rows.map((r) => Number(r.v)), Array.from({ length: 10 }, (_, i) => (((n - 10) + i) % 7) - 3));
   } finally { db.close(); }
 });
 
@@ -468,7 +496,8 @@ T("DOT backends: explicit pyecc, server default, and the native back end when th
     const want = BigInt(40 * 160 + 55 * 150 + 30 * 120);
     assert.equal(await db.dot(t, "rate", "hours", null, "pyecc"), want);
     if (!native) { console.log("# skipped native DOT (set TORUSDB_MCL_PATH to a dir with mclbn256)"); return; }
-    await assert.rejects(db.dot(t, "rate", "hours", null, "mcl"), /unavailable|back end/);   // pure-Python server
+    // `backend` is only a request: a server without the native library answers with its own (tag 0x01), which decrypts
+    assert.equal(await db.dot(t, "rate", "hours", null, "mcl"), want);
   } finally { db.close(); }
   if (!native) return;
   const nd = await Client.connect(native.host, native.port, { fheKey: key, ...OPTS });
@@ -583,9 +612,11 @@ T("FHE authenticated: untagged data is refused; a lying server (rewritten fhe_su
       assert.equal(await db.scaledSum(t2, "rate", 3), 435n);
       for (const m of ["scale", "drop", "dup", "swapcol"]) {
         setMode(m);
-        await assert.rejects(db.sum(t2, "rate"), kind("IntegrityError"), m);
-        await assert.rejects(db.scaledSum(t2, "rate", 3), kind("IntegrityError"), m);
-        await assert.rejects(db.avg(t2, "rate"), kind("IntegrityError"), m);
+        // duplicate ids are now refused by the server itself (BadRequest); every other lie is caught by the tags
+        const k = m === "dup" ? "BadRequest" : "IntegrityError";
+        await assert.rejects(db.sum(t2, "rate"), kind(k), m);
+        await assert.rejects(db.scaledSum(t2, "rate", 3), kind(k), m);
+        await assert.rejects(db.avg(t2, "rate"), kind(k), m);
       }
       setMode("none");
       assert.equal(await db.sum(t2, "rate"), 145n);
@@ -823,4 +854,97 @@ T("local DOT has no range limit on the result (10^6 * 10^6), delegated does", as
     await dl.syncSchema(); dl.trustTable(t);
     await assert.rejects(dl.dot(t, "a", "b", null, "pyecc"), kind("OutOfBudget"));
   } finally { db.close(); dl.close(); }
+});
+
+// ── write nonces (F2), randomised search start (F7), backend hint (F5b) ──────
+test("discrete log: boundary, zero and random values are found from every random start", () => {
+  const key = FheKey.generate(5000);
+  const vals = [0, 1, -1, 5000, -5000, 4999, -4999, 2500, -2500, 1234, -4321];
+  for (let rep = 0; rep < 3; rep++) for (const v of vals) assert.equal(key.decryptCell(key.encrypt(v)), v);
+  for (let i = 0; i < 25; i++) {
+    const v = Math.floor(Math.random() * 10001) - 5000;
+    assert.equal(key.decryptCell(key.encrypt(v)), v);
+  }
+  // sums land anywhere in range too, and the GT search (random start, wrap-around) finds the DOT vector
+  const sum = sumCells([key.encrypt(3000), key.encrypt(1999)]);
+  for (let i = 0; i < 5; i++) assert.equal(key.decryptSum(sum), 4999);
+  const k2 = FheKey.fromHex(VEC.secret, VEC.range);
+  for (let i = 0; i < 12; i++) assert.equal(k2.decryptDot(hex(VEC.dot_blob_pyecc)), VEC.dot_expected);
+  assert.throws(() => FheKey.generate(100).decryptSum(sumCells([key.encrypt(500)])), kind("OutOfBudget"));
+});
+
+T("write nonces: stored per write and fresh on every UPDATE; hiding or forging them is an IntegrityError", async () => {
+  const key = FheKey.fromHex(SECRET, 100_000);
+  const px = await lyingProxy(mem);
+  const db = await Client.connect("127.0.0.1", px.port, { fheKey: key, authenticated: true, ...OPTS });
+  try {
+    const t = uniq("nonce");
+    await seed(db, t, ROWS);
+    const nonces = async () => (await rawCall(mem.host, mem.port, "plain_cells", [t, "__fnonce__rate", [0, 1, 2, 3]])).ok.map((w: any) => BigInt(w.v));
+    const n1 = await nonces();
+    assert.equal(new Set(n1.map(String)).size, 4);
+    for (const n of n1) assert.ok(n > 0n && n < (1n << 120n));
+    await db.update(t, { rate: 41 }, eq("id", 1));
+    const n2 = await nonces();
+    assert.notEqual(n2[0], n1[0]);                                     // fresh nonce for the rewritten row
+    assert.deepEqual(n2.slice(1), n1.slice(1));
+    await db.update(t, { rate: 41 }, eq("id", 1));                     // same value again: still a new nonce + tag
+    assert.notEqual((await nonces())[0], n2[0]);
+    assert.equal(await db.sum(t, "rate"), BigInt(41 + 55 + 30 + 20));
+    for (const m of ["hidenonce", "fakenonce"]) {
+      px.mode.value = m;
+      await assert.rejects(db.sum(t, "rate"), kind("IntegrityError"), m);
+      await assert.rejects(db.select(t, ["rate"], eq("id", 2)), kind("IntegrityError"), m);
+      await assert.rejects(db.scaledSum(t, "rate", 2), kind("IntegrityError"), m);
+    }
+    px.mode.value = "none";
+    assert.equal(await db.sum(t, "rate"), 146n);
+    // the server rejects malformed nonces itself
+    for (const bad of [{ t: "i", v: "0" }, { t: "i", v: (1n << 128n).toString() }, { t: "s", v: "x" }, { t: "n" }]) {
+      assert.ok((await rawCall(mem.host, mem.port, "update_cell", [t, 0, "__fnonce__rate", bad])).err);
+    }
+    assert.ok((await rawCall(mem.host, mem.port, "update_cell", [t, 0, "__fnonce__id", { t: "i", v: "5" }])).err);
+    // UPDATE writes value + tag + nonce in one update_cells call
+    const before = px.seen.length;
+    await db.update(t, { rate: 9 }, eq("dept", 5));
+    const calls = px.seen.slice(before);
+    assert.equal(calls.filter((x) => x === "update_cells").length, 1);
+    assert.equal(calls.includes("update_cell"), false);
+  } finally { db.close(); px.server.close(); }
+});
+
+T("affine mix of an old and a new version of a row (F2) is rejected", async () => {
+  const key = FheKey.fromHex(SECRET, 100_000);
+  const db = await Client.connect(mem.host, mem.port, { fheKey: key, authenticated: true, ...OPTS });
+  try {
+    const t = uniq("affine");
+    await seed(db, t, ROWS);
+    const get = async (c: string) => (await rawCall(mem.host, mem.port, "plain_cells", [t, c, [0]])).ok[0];
+    const [oldCell, oldTag] = [await get("rate"), await get("__fmac__rate")];
+    const oldNonce = (await get("__fnonce__rate")).v;
+    await db.update(t, { rate: 45 }, eq("id", 1));
+    const [newCell, newTag] = [await get("rate"), await get("__fmac__rate")];
+    const newNonce_ = (await get("__fnonce__rate")).v;
+    // lambda*old + (1-lambda)*new on the G1 halves (the server can do this without any key)
+    const mix = (a: any, b: any, lam: bigint): any => {
+      const A = Buffer.from(a.v, "base64"), B = Buffer.from(b.v, "base64");
+      const out = Buffer.from(B);
+      for (const off of [0, 64]) {
+        const pa = I.C1.mul(I.C1.fromAff(I.g1From(A, off)), lam % FHE_N);
+        const pb = I.C1.mul(I.C1.fromAff(I.g1From(B, off)), (1n - lam + FHE_N) % FHE_N);
+        I.g1To(I.C1.toAffine(I.C1.add(pa, pb))).copy(out, off);
+      }
+      return { t: "x", v: out.toString("base64") };
+    };
+    const lam = 2n;                                   // 2*40 - 45 = 35 would decrypt as a plausible value
+    const mc = mix(oldCell, newCell, lam), mt = mix(oldTag, newTag, lam);
+    for (const nonce of [oldNonce, newNonce_]) {
+      assert.equal((await rawCall(mem.host, mem.port, "update_cells", [t, [[0, "rate", mc], [0, "__fmac__rate", mt], [0, "__fnonce__rate", { t: "i", v: nonce }]]])).ok, 3);
+      await assert.rejects(db.select(t, ["rate"], eq("id", 1)), kind("IntegrityError"));
+      await assert.rejects(db.sum(t, "rate"), kind("IntegrityError"));
+    }
+    // restoring the genuine new version heals the row
+    await rawCall(mem.host, mem.port, "update_cells", [t, [[0, "rate", newCell], [0, "__fmac__rate", newTag], [0, "__fnonce__rate", { t: "i", v: newNonce_ }]]]);
+    assert.equal(await db.sum(t, "rate"), BigInt(45 + 55 + 30 + 20));
+  } finally { db.close(); }
 });

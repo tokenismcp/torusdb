@@ -163,10 +163,10 @@ def test_over_the_wire_disk_storage_and_a_second_client_with_the_same_key(tmp_pa
                 call("update_cell", ["emp", 0, "rate", {"t": "i", "v": "7"}])
             with pytest.raises(Exception, match="invalid FHE ciphertext"):
                 call("update_cell", ["emp", 0, "rate", {"t": "x", "v": "AAAA"}])
-            with pytest.raises(Exception, match="not an FHE column"):
+            with pytest.raises(Exception, match="FHE"):                      # binary value in a non-FHE column
                 call("update_cell", ["emp", 0, "id", {"t": "x", "v": "AAAA"}])
             with pytest.raises(Exception, match="at most"):
-                call("fhe_dot", ["emp", "rate", [0] * 301, "emp", "hours", [0] * 301, "pyecc"])
+                call("fhe_dot", ["emp", "rate", [0] * 6001, "emp", "hours", [0] * 6001])
     finally:
         s.stop()
 
@@ -429,9 +429,10 @@ def test_published_vectors():
         assert key.decrypt_dot(bytes.fromhex(v["dot_blob_mcl"])) == v["dot_expected"]   # via the decode-only path if needed
     mac = v["mac"]
     assert hex(key.alpha) == mac["alpha"]
-    assert [hex(key.gamma(mac["table"], mac["column"], i)) for i in mac["row_ids"]] == mac["gamma"]
+    nonces = [int(n, 16) for n in mac["nonces"]]
+    assert [hex(key.gamma(mac["table"], mac["column"], i, n)) for i, n in zip(mac["row_ids"], nonces)] == mac["gamma"]
     assert key.decrypt_sum_verified(bytes.fromhex(v["sum_blob"]), bytes.fromhex(mac["tag_sum_blob"]),
-                                    mac["table"], mac["column"], mac["row_ids"]) == v["sum_expected"]
+                                    mac["table"], mac["column"], mac["row_ids"], nonces=nonces) == v["sum_expected"]
     gens = v["gt_generators"]
     assert fhe._fb.get("pyecc").gt_to(fhe._fb.get("pyecc").gt_gen()).hex() == gens["pyecc_tag01"]
     assert fhe._fb.MCL_GT_GENERATOR.hex() == gens["mcl_tag02"]

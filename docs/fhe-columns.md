@@ -111,50 +111,72 @@ variants are broken.
 
 ## Threshold custody of the FHE key (`ThresholdFheKey`)
 
+> **Security notice (fixed in bundle version 3).** Earlier threshold bundles (v2) published
+> `X2 = s2*G1`; anyone holding `X2` and a cell recovers the plaintext (`e(G1, D2) / e(X2, D1) = g^v`) with no secret
+> at all. Such bundles are now **rejected** ("VULNERABLE - regenerate"); data encrypted under them must be
+> re-encrypted under a new key (and treat the old `public2.json` as having compromised those cells). Local
+> (non-threshold) keys were never affected.
+
 The FHE secrets can live **only** as k-of-n sharings among custodians (the Laurent-series sharing of
-`torussql.custody`, group `bn254`, dealerless DKG). No server, custodian or owner process holds
-`s` or `s2`, and neither is ever reassembled (the tests run every operation with `laurent.reconstruct`
-patched to raise). The scheme has **two independent secrets**: `s` (`Q = s*G1`, used for the G1 half and cell/SUM
-decryption) and `s2` (`Q2 = s2*G2`, the G2 half). `Q2 = s*G2` is forbidden — with both public keys known it
-lets anyone test a guessed value (`e(G2, C2 - v*G1) = e(Q2, C1)`). A local `FheKey` derives `s2` from `s`; a
-threshold key cannot (nobody knows `s`), so `s2` is a **second threshold key**: run a second DKG on the same
-custodian hosts (a second `serve` daemon per custodian for the second share file) and give both public keys.
+`torussql.custody`, dealerless DKG). No server, custodian or owner process holds `s` or `s2`, and neither
+is ever reassembled (the tests run every operation with `laurent.reconstruct` patched to raise). The scheme has
+**two independent secrets in two different groups**:
+
+* `s`, custody group `bn254` (G1): `Q = s*G1` is the public key of the G1 half and cell/SUM decryption.
+* `s2`, custody group **`bn254g2`** (G2): the DKG itself runs in G2, so its public key **is** `Q2 = s2*G2`. Feldman
+  commitments, verification keys `Y_i = y_i*G2`, proofs of knowledge, DLEQ/GT proofs are all G2 objects. **No G1
+  image of `s2` (`s2*G1`, `y_i*G1`, a G1 commitment vector) is ever created or published** - not in `public2.json`,
+  the bundle, RPC answers or the audit log. `Q2 = s*G2` is forbidden as well (dictionary oracle).
+
+A local `FheKey` derives `s2` from `s`; a threshold key cannot (nobody knows `s`), hence the second DKG on the same
+custodian hosts. The *identity* keys of a file ceremony stay in their own group (`secp256k1` or `bn254`); only the
+key group differs (`dkg-start/finish --key-group bn254g2`; broadcasts are signed in the identity group but carry
+128-byte G2 commitments). The custodian daemon refuses G1-style decryption (`partial`, `partial_batch`) on a G2 key:
+`s2` is only ever applied to GT elements.
 
 ```bash
-# 1. TWO dealerless DKGs on the bn254 group (docs/custody.md section 2.1): key 1 -> s, key 2 -> s2;
+# 1. TWO dealerless DKGs (docs/custody.md section 2.1): key 1 -> s (--key-group bn254), key 2 -> s2 (--key-group bn254g2);
 #    run the daemons for both (e.g. host1:8601 serves s, host1:8602 serves s2)
 #    (or ONE daemon per host holding both shares: `serve --share s.json --share s2.json`, and omit --custodian2)
-# 2. one owner-side step: Q2 = s2*G2 from key 2's custodians, a sealed MAC secret, ONE public bundle
+# 2. one owner-side step: a sealed MAC secret and ONE public bundle (Q2 = key 2's public key); it PRINTS the
+#    BUNDLE FINGERPRINT: compare it out of band and pin it wherever the bundle is loaded
 python -m torussql.custody fhe-keygen-threshold --public public.json --public2 public2.json --token-env CT \
     --custodian host1:8601 --custodian host2:8601 --custodian host3:8601 \
     --out fhe-bundle.json        # add --custodian2 ... only if s2 is served elsewhere
-python -m torussql.custody fhe-open-test ... --bundle fhe-bundle.json    # cells, SUM, DOT, MAC
+python -m torussql.custody fhe-open-test ... --bundle fhe-bundle.json --expect-bundle-fingerprint FP
 torussql --fhe-threshold fhe-bundle.json --custody-public public.json --custody-public2 public2.json \
-         --custodian host1:8601 ... --custodian2 host1:8602 ... --custody-token-env CT -p 8533
+         --custodian host1:8601 ... --custodian2 host1:8602 ... --custody-token-env CT --expect-bundle-fingerprint FP -p 8533
 ```
 ```python
 from torusdb_core.fhe_threshold import ThresholdFheKey
 key = ThresholdFheKey.load("fhe-bundle.json", PublicKey.load("public.json"), custodians1,
-                           PublicKey.load("public2.json"), custodians2)
+                           PublicKey.load("public2.json"), custodians2,
+                           expect_fingerprint=FP)       # without it the load WARNS
 conn = torussql.connect(host, fhe_key=key, authenticated=True)     # the same surface as FheKey
 ```
-Bundle format version 2 (`Q = X1`, `X2`, `Q2`, `key_id`, `key_id2`, optional sealed `mac`). Version-1
-bundles (which assumed `Q2 = s*G2`) are rejected with an explicit error; such data must be re-encrypted under a
-new key. A key may be loaded without `custodians2` (only the bundle's `Q2`): it encrypts and reads cells/SUMs,
-but `DOT` raises "needs the second secret".
+Bundle format version 3: `v, kind, key_id, key_id2, range, Q (= X1), Q2 (= key 2's public key), mac`. There is no
+`X2`. Versions 1 and 2 are rejected with explicit errors. A key may be loaded without `custodians2` (only the
+public keys): it encrypts and reads cells/SUMs, but `DOT` raises "needs the second secret".
+
+**Bundle integrity.** The bundle is public but not harmless to edit: replacing the sealed MAC envelope by one
+wrapped to the PUBLIC key with an attacker-chosen secret would let a lying server forge integrity tags. The
+**bundle fingerprint** (SHA-256 over `key_id`, `key_id2`, `range`, `Q`, `Q2` and the whole MAC envelope) is printed by
+`fhe-keygen-threshold`; pin it with `--expect-bundle-fingerprint` / `expect_fingerprint=` (a mismatch is refused,
+loading without a pin warns). The value range is enforced to be in `[1, 2^40]` when a bundle is loaded (the discrete-log
+table is O(sqrt(range))).
 
 | owner operation | without `s`, `s2` |
 |---|---|
-| encrypt | needs only `Q = X1` and `Q2`. `Q2` is assembled from the second key's G2 shares `y_i*G2` (each checked by the pairing `e(Y_i, G2) = e(G1, Y2_i)` plus a G2 subgroup test), re-checked by `e(X2, G2) = e(G1, Q2)`, and refused if it also equals `s*G2`. It is stored in the public bundle and re-verified at every load. |
+| encrypt | needs only `Q = X1` (key 1's public key) and `Q2` (key 2's public key, a non-identity G2 subgroup point that must not be the G2 image of `Q`). No custodian is contacted. |
 | decrypt a cell / `SUM` / `k*SUM` | the existing threshold decryption on key 1: the owner sends `E = C1`, each custodian answers `y_i*E` with a DLEQ proof, the client combines `s*C1 = sum(lambda_i * y_i*E)`. Batched: a `SELECT` of n cells is one round. |
 | decrypt `DOT` | `M = c11 * c01^-s2 * c10^-s * c00^(s*s2)` by **threshold exponentiation in GT**: custodian i returns `c^(y_i)` with a Chaum-Pedersen proof, the client combines `c^s = prod(D_i^lambda_i)`. Round 1 (key 1): `c00^s`, `c10^s`. Round 2 (key 2): `c01^s2` and `(c00^s)^s2`. `s*s2` is never computed — the second round's input is `c00^s`. |
 | integrity tags | see the MAC trade-off below. |
 
-**Soundness of the GT proof** (`torussql/custody/gt.py`). Statement: `Y_i = y_i*G1` is custodian i's public
+**Soundness of the GT proof** (`torussql/custody/gt.py`). Statement: `Y_i = y_i*B` (`B = G1` for `s`, `G2` for `s2`) is custodian i's public
 verification key and `D = c^(y_i)`. G1 and the order-q subgroup mu_q of GT have the same prime order q, so the
-standard Chaum-Pedersen protocol runs across them: `R1 = k*G1`, `R2 = c^k`, `h = H(ctx, G1, Y_i, c, D, R1, R2)`,
-`z = k + h*y_i`; verify `z*G1 = R1 + h*Y_i` and `c^z = R2 * D^h`. Special soundness: two accepting transcripts with
-the same commitments extract `y = (z-z')/(h-h')` with `Y_i = y*G1` and `D^(h-h') = c^((h-h')*y)`; because `c` and `D`
+standard Chaum-Pedersen protocol runs across them: `R1 = k*B`, `R2 = c^k`, `h = H(ctx, G1, Y_i, c, D, R1, R2)`,
+`z = k + h*y_i`; verify `z*B = R1 + h*Y_i` and `c^z = R2 * D^h`. Special soundness: two accepting transcripts with
+the same commitments extract `y = (z-z')/(h-h')` with `Y_i = y*B` and `D^(h-h') = c^((h-h')*y)`; because `c` and `D`
 lie in mu_q and `gcd(h-h', q) = 1`, `u -> u^(h-h')` is injective there, so `D = c^y` — the same `y` as the
 verification key. **Both `c` and `D` are tested for `u^q = 1`**: without that a hostile server could hand the
 owner a GT element carrying a small-order component, and a custodian that exponentiated it would leak `y_i`
@@ -172,7 +194,7 @@ this is a **decryption oracle for whoever holds a caller token**: any token hold
 identity refused), the `approve(caller, E_hex, ctx)` hook is called for every item with its canonical encoding
 (GT elements as `"gt:" + hex`), and the **rate limit is charged per item**, so a batch is not a way around it.
 A read of n cells is **one request of n items**: the per-request limit (`--rate`, default 30/min) is unchanged
-and a separate item budget (`--item-budget`, default 20000 items/min per caller and key) bounds the throughput;
+and a separate COST-WEIGHTED item budget (`--item-budget`, default 30000 units/min per caller and key; a G1 point costs 1, a G2 point 2, a GT element 100 - a GT item is ~100x the CPU) bounds the throughput (about 30000 cells or 300 GT elements = 60 `DOT` decryptions per minute);
 `--max-batch` (default 2000) caps one request. Treat tokens as decryption capabilities.
 
 **Integrity tags and the MAC secret (trade-off).** Tags need `alpha` and per-cell `gamma`, which for a plain

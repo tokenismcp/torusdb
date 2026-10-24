@@ -17,6 +17,7 @@ selects ``BN_SNARK1`` (= ``alt_bn128``/BN254, the curve ``py_ecc`` uses).
 from __future__ import annotations
 
 import os
+import threading
 
 from py_ecc.fields import optimized_bn128_FQ as _FQ_cls
 from py_ecc.optimized_bn128 import (
@@ -114,6 +115,10 @@ class PyEcc:
         """g ∈ μ_n (the order-n subgroup pairings land in): g^n = 1. (``gt_pow`` reduces its
         exponent mod n, so test with the unreduced exponent.)"""
         return g ** N == self.gt_one()
+
+    def g2_in_subgroup(self, q) -> bool:
+        """[n]Q = O (≈0.1 s in pure Python — done when a cell is written)."""
+        return is_inf(p_mul(q, N)) if not is_inf(q) else True
 
     def gt_from(self, raw: bytes):
         return FQ12(_rd(raw, 12))
@@ -260,8 +265,14 @@ class Mcl:
         return g.serialize()
 
     def gt_in_subgroup(self, g) -> bool:
-        # g^(n-1) · g == 1, avoiding an exponent that the library would reduce to 0
-        return (g.pow(self._fr(N - 1)) * g).serialize() == self.gt_one().serialize()
+        """Exact test: leave the library (its GT pow is only a real exponentiation inside the
+        cyclotomic subgroup, so it can call a small-order non-member "valid") and do g^n == 1 in
+        plain Fp12 arithmetic on the canonical encoding."""
+        py = get("pyecc")
+        return py.gt_in_subgroup(py.gt_from(self.gt_to(g)))
+
+    def g2_in_subgroup(self, q) -> bool:
+        return bool(q.valid_order())
 
     def gt_gen_bytes(self) -> bytes:
         return self.gt_to(self.gt_gen())
@@ -281,10 +292,16 @@ class McLDecodeOnly(PyEcc):
 MCL_GT_GENERATOR = bytes.fromhex("0c498eace9669afdb2ac004a2bc3352ff31fa2b137a520190498891a96af31fb0f7abc6cd882a79148ae975c363201b64294a69c7da04b4dc0fcc4a6b77f99801fa5477cf344c578b943985d188016c90cfed95c39da64d34f7dab3bf29053a4189cc22058b17f919c91a5da449e1130585d76d6c852c08307a7355064d0e6682e5c373f19a914ff641dc62428638e6209a0f8ca64990df7966a7cce65903e150ae359efdcdc3ff0067fb863975a0289d468186d63f62e156aec452863c445d402e02d2cc795a2000a1b1f823879abbd397c4dea0918ed66b49d34b48efb8a4a14d3d6ca72d8a950a31dc10f7b4053c9e9ad9ebb590cb4a60f8215d4b99f2b4a040ba9fa500f1a5c4b31984a74e68659c4b420bd699ce630b130b08a6ea1162b0b53320e5a6488cb98a855ffc837d2a75ab90d61ac16cc1b7ab2cd3ed5e22b971c54a530398c9064bdc662d929e645cadda9a712cc5a8243f9cddbd2d98dd1f000f97b5221474526b601f3730a3afa965ceee1b343940c383e5314859e762c97")
 
 _cache: dict[str, object] = {}
+_lock = threading.RLock()
 
 
 def get(name: str):
     """The back end called ``pyecc`` or ``mcl`` (raises BackendError if unavailable)."""
+    with _lock:                   # mcl initialisation is process-global and not re-entrant
+        return _get(name)
+
+
+def _get(name: str):
     if name not in _cache:
         if name == "pyecc":
             _cache[name] = PyEcc()
