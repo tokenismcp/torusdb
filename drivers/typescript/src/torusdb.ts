@@ -23,6 +23,9 @@ import { randomBytes } from "crypto";
 import { AsyncLocalStorage } from "async_hooks";
 import { TorusError } from "./errors";
 import {
+  Anchor, AnchorManager, AnchorValue, FhePart, FileAnchor, Snapshot, schemaDigest, sha256 as anchorSha,
+} from "./anchor";
+import {
   FheKey, FheBackend, newNonce, FHE_CELL_BYTES, FHE_DOT_BYTES, FHE_SUM_BYTES, addSums as fheAddSums, mulDots as fheMulDots,
 } from "./fhe";
 
@@ -31,6 +34,10 @@ export {
   addSums as fheAddSums, mulDots as fheMulDots,
 } from "./fhe";
 export type { FheBackend } from "./fhe";
+export {
+  FileAnchor, MemoryAnchor, StaleServerError, ANCHOR_FORMAT, ANCHOR_FORMAT_VERSION, canonValue, rowMaterial, schemaDigest,
+} from "./anchor";
+export type { Anchor, Entry as AnchorEntry, Pending as AnchorPending, Change as AnchorChange } from "./anchor";
 
 /** Newest wire protocol this driver speaks. */
 export const PROTOCOL_VERSION = 2;
@@ -181,6 +188,7 @@ export interface ServerLimits {
   maxItems?: number;
   fhe?: {
     maxSumRows?: number;
+    maxScanRows?: number;
     maxDotRows: { pyecc?: number; mcl?: number };
     recommendedDotRows: { pyecc?: number; mcl?: number };
   };
@@ -363,6 +371,14 @@ export interface ConnectOptions {
    *  multiplies/sums the plaintexts itself (verified, O(n) decryptions, no range limit on the result).
    *  "auto" (default): "delegated" unless `authenticated`, in which case "local". */
   fheDotMode?: "auto" | "local" | "delegated";
+  /** Anchored table-state integrity for authenticated FHE tables: a file path (a {@link FileAnchor}, format-compatible
+   *  with the Python and Rust drivers) or an {@link Anchor} object holding the owner-trusted root/count/epoch of every
+   *  table with FHE columns. Closes row-set lies (rows hidden/added/resurrected, COUNT/AVG denominators, hidden
+   *  deletes) and rollback/replay of old table states. Needs `authenticated: true` and `fheKey`. Keep the file where
+   *  the server cannot write; back it up like the key. */
+  integrityAnchor?: string | Anchor;
+  /** Refuse to anchor a table with more row slots than this (default 1 000 000; the owner keeps ~0.5 KB per row). */
+  integrityAnchorMaxRows?: number;
   /** Backward-compatible alias: with `authenticated: true` and mode "auto", selects "delegated". */
   fheAllowUnverifiedDot?: boolean;
 }
@@ -729,6 +745,7 @@ export class Client {
   #alpha = 0n;                                   // SECRET MAC key
   #fhe: FheKey | undefined;                      // SECRET key of the FHE columns
   #fheDotMode: "local" | "delegated";
+  #amgr: AnchorManager | undefined;
   #updateCells = true;                           // false once the server answered "unknown method" for update_cells
   #als = new AsyncLocalStorage<boolean>();
   #tail: Promise<void> = Promise.resolve();
@@ -753,6 +770,13 @@ export class Client {
     this.#fheDotMode = mode !== "auto" ? mode
       : this.#authenticated && o.fheAllowUnverifiedDot !== true ? "local" : "delegated";
     if (this.#authenticated) this.#alpha = 1n + (randScalar() % (N - 1n));
+    if (o.integrityAnchor !== undefined) {
+      if (!this.#authenticated) throw usage("integrityAnchor needs authenticated: true (the anchor protects the authenticated FHE tables)");
+      if (!this.#fhe) throw usage("integrityAnchor needs an FHE key (fheKey): the anchor's leaves are keyed by the owner's MAC secret");
+      const anc = typeof o.integrityAnchor === "string" ? new FileAnchor(o.integrityAnchor) : o.integrityAnchor;
+      if (!anc || typeof (anc as Anchor).beginCommit !== "function") throw usage("integrityAnchor must be a file path or an Anchor");
+      this.#amgr = new AnchorManager(this.anchorHost(), anc, o.integrityAnchorMaxRows);
+    }
   }
 
   static async connect(host = "127.0.0.1", port = 8533, opts: ConnectOptions = {}): Promise<Client> {
@@ -774,6 +798,7 @@ export class Client {
     try {
       if (opts.vaultPath && fs.existsSync(opts.vaultPath)) db.loadVault(opts.vaultPath);
       if (opts.syncSchema !== false) await db.syncSchema();
+      if (db.#amgr) await db.#amgr.settlePending();      // a commit that crashed after "pending": scan, finish or abort
     } catch (e) {
       db.#tr.destroy();
       throw e;
@@ -838,7 +863,7 @@ export class Client {
       const f = l.fhe;
       if (f !== null && typeof f === "object" && !Array.isArray(f)) {
         const pair = (x: any) => (x !== null && typeof x === "object" ? { pyecc: posInt(x.pyecc), mcl: posInt(x.mcl) } : {});
-        lim.fhe = { maxSumRows: posInt(f.max_sum_rows), maxDotRows: pair(f.max_dot_rows), recommendedDotRows: pair(f.recommended_dot_rows) };
+        lim.fhe = { maxSumRows: posInt(f.max_sum_rows), maxScanRows: posInt(f.max_scan_rows), maxDotRows: pair(f.max_dot_rows), recommendedDotRows: pair(f.recommended_dot_rows) };
       }
       info.limits = lim;
     }
@@ -966,6 +991,67 @@ export class Client {
     this.#schema.set(table, { cols: d.cols, trusted: true });
   }
 
+  // — anchored table state (integrityAnchor) —
+  private anchorHost() {
+    return {
+      key: () => this.fheKey(),
+      layout: (table: string) => {
+        const d = this.#schema.get(table);
+        if (!this.#authenticated || !d || !d.cols.some((c) => c.policy === "fhe")) return null;
+        return { plain: d.cols.filter((c) => c.policy === "plain").map((c) => c.name),
+                 fhe: d.cols.filter((c) => c.policy === "fhe").map((c) => c.name), sdig: schemaDigest(table, d.cols) };
+      },
+      fheRows: (table: string, start: number, count: number) => this.call("fhe_rows", [table, start, count], 8 << 20),
+      maxScanRows: () => this.serverInfo.limits?.fhe?.maxScanRows,
+      txStatus: async (txid: string) => str(await this.call("tx_status", [txid], 4096), "tx_status"),
+      hasSchema: (t: string) => this.#schema.has(t),
+      serverTables: async () => arr(await this.call("tables", []), "tables").map((t) => str(t, "tables item")),
+      decodePlain: (w: unknown) => this.plainDecode(w),
+    };
+  }
+
+  private plainDecode(w: unknown): AnchorValue {
+    let v: Value;
+    try { v = uwv(w); } catch (e) { throw new TorusError("IntegrityError", `malformed fhe_rows reply from the server (${(e as Error).message})`); }
+    if (v === null || typeof v === "bigint" || typeof v === "boolean" || typeof v === "string") return v;
+    if (isRational(v)) return v;
+    throw new TorusError("IntegrityError", "malformed fhe_rows reply from the server (plain value)");
+  }
+
+  /** Diagnostics: how many full scans / scanned slots the anchored mode has done (0 without an anchor). */
+  get anchorStats(): { scans: number; scanRows: number } { return this.#amgr ? { ...this.#amgr.stats } : { scans: 0, scanRows: 0 }; }
+
+  /** Is `table` verified against the integrity anchor? */
+  private anchored(table: string): boolean { return !!this.#amgr && this.#amgr.isAnchored(table); }
+
+  /** Trust-on-first-use: scan the server NOW and record that state in the anchor. Only as honest as the server at
+   *  this moment; use it once for tables created before the anchor existed. */
+  adoptTable(table: string, opts: { replace?: boolean } = {}): Promise<{ table: string; rows: number; slots: number; epoch: number }> {
+    return this.exclusive(async () => {
+      if (!this.#amgr) throw usage("no integrityAnchor is configured");
+      return this.#amgr.adopt(table, opts.replace === true);
+    });
+  }
+
+  /** Force a full scan of `table` and check it against the anchor (O(rows)). */
+  verifyTable(table: string): Promise<{ table: string; rows: number; slots: number; epoch: number | null }> {
+    return this.exclusive(async () => {
+      if (!this.#amgr) throw usage("no integrityAnchor is configured");
+      return this.#amgr.verify(table);
+    });
+  }
+
+  /** (plain values, FHE parts) of a row as the server stores it, from the wire cells we sent. */
+  private anchorParts(table: string, wire: Record<string, WireVal>, tagWire: Map<string, WireVal>, snap: Snapshot): [AnchorValue[], FhePart[]] {
+    const hash = (w: WireVal | undefined): Buffer | null => (w && w.t === "x" ? anchorSha(Buffer.from(w.v, "base64")) : null);
+    const vals = snap.plainCols.map((c) => this.plainDecode(wire[c]));
+    const fp: FhePart[] = snap.fheCols.map((c) => {
+      const nw = wire[FNONCE + c];
+      return [nw && nw.t === "i" ? BigInt(nw.v) : null, hash(wire[c]), hash(tagWire.get(c))];
+    });
+    return [vals, fp];
+  }
+
   // — DDL —
   createTable(name: string, columns: Column[], opts: { ifNotExists?: boolean } = {}): Promise<void> {
     return this.exclusive(async () => {
@@ -980,12 +1066,17 @@ export class Client {
         if (!TYPES.includes(c.type)) throw usage(`bad type for ${c.name}: ${c.type}`);
         if (c.policy === "fhe" && c.type !== "int") throw usage(`FHE columns must be INT (column ${c.name})`);
       }
-      const r = await this.call("create", opts.ifNotExists
-        ? [name, columns.map((c) => [c.name, c.type, c.policy]), true]    // atomic IF NOT EXISTS
-        : [name, columns.map((c) => [c.name, c.type, c.policy])]);
-      if (r === false) return;                     // already existed: nothing changed, nothing adopted (syncSchema learns it, untrusted)
-      if (r !== null && r !== undefined) throw proto("create: unexpected reply");
-      this.#schema.set(name, { cols: columns.map((c) => ({ name: c.name, type: c.type, policy: c.policy })), trusted: true });
+      const run = async () => {
+        const r = await this.call("create", opts.ifNotExists
+          ? [name, columns.map((c) => [c.name, c.type, c.policy]), true]    // atomic IF NOT EXISTS
+          : [name, columns.map((c) => [c.name, c.type, c.policy])]);
+        if (r === false) return;                   // already existed: nothing changed, nothing adopted (syncSchema learns it, untrusted)
+        if (r !== null && r !== undefined) throw proto("create: unexpected reply");
+        this.#schema.set(name, { cols: columns.map((c) => ({ name: c.name, type: c.type, policy: c.policy })), trusted: true });
+        if (this.anchored(name)) this.#amgr!.ddlCreate(name);     // a table created here starts at root 0 / count 0
+      };
+      // an anchored table is created inside a transaction: the anchor commits with it
+      if (this.#amgr && this.#authenticated && columns.some((c) => c.policy === "fhe")) await this.atomically(run); else await run();
     });
   }
 
@@ -993,12 +1084,17 @@ export class Client {
   dropTable(name: string, opts: { ifExists?: boolean } = {}): Promise<void> {
     return this.exclusive(async () => {
       this.assertWritable();
-      const r = await this.call("drop", opts.ifExists ? [name, true] : [name]);   // atomic IF EXISTS; a missing table is the server's error
-      if (r === false) return;                     // did not exist: touch nothing locally
-      if (r !== null && r !== undefined) throw proto("drop: unexpected reply");
-      this.#schema.delete(name);
-      const prefix = name + SEP;
-      for (const k of [...this.#masks.keys()]) if (k.startsWith(prefix)) this.delMask(k);
+      const run = async () => {
+        if (this.#amgr && (this.anchored(name) || this.#amgr.anchor.get(name) !== null)) this.#amgr.ddlDrop(name);
+        const r = await this.call("drop", opts.ifExists ? [name, true] : [name]);   // atomic IF EXISTS; a missing table is the server's error
+        if (r === false) return;                   // did not exist: touch nothing locally
+        if (r !== null && r !== undefined) throw proto("drop: unexpected reply");
+        this.#schema.delete(name);
+        this.#amgr?.snaps.delete(name);
+        const prefix = name + SEP;
+        for (const k of [...this.#masks.keys()]) if (k.startsWith(prefix)) this.delMask(k);
+      };
+      if (this.#amgr && this.#amgr.anchor.get(name) !== null) await this.atomically(run); else await run();
     });
   }
 
@@ -1180,15 +1276,25 @@ export class Client {
     return this.exclusive(async () => {
       this.assertWritable();
       const { wire, pending, tags } = this.blindRow(table, row);
+      const anchored = this.anchored(table);
       const run = async (): Promise<number> => {
+        const snap = anchored ? await this.#amgr!.writeSnapshot(table) : null;     // verified state BEFORE the write
         const rowid = rowId(await this.call("insert", [table, wire]), "insert");
         for (const [col, r] of pending) this.setMask(mkey(table, rowid, col), r);
         // authenticated FHE: the tag binds the row id, known only now - same transaction as the INSERT
-        if (tags.length) await this.writeCells(table, this.fheTagItems(table, rowid, tags));
+        const items = tags.length ? this.fheTagItems(table, rowid, tags) : [];
+        if (items.length) await this.writeCells(table, items);
+        if (snap) this.recordInserted(snap, rowid, wire, items);
         return rowid;
       };
       return tags.length ? this.atomically(run) : run();
     });
+  }
+
+  private recordInserted(snap: Snapshot, rowid: number, wire: Record<string, WireVal>, tagItems: Array<[number, string, WireVal]>) {
+    const tagWire = new Map(tagItems.map(([, c, w]) => [c.slice(FMAC.length), w] as [string, WireVal]));
+    const [vals, fp] = this.anchorParts(snap.table, wire, tagWire, snap);
+    this.#amgr!.recordInsert(snap, rowid, vals, fp);
   }
 
   /** Bulk insert: every row is blinded locally and sent in `insert_many` round
@@ -1201,7 +1307,9 @@ export class Client {
       const blinded = rows.map((r) => this.blindRow(table, r));
       const tagged = blinded.some((b) => b.tags.length > 0);
       const per = 50_000;
+      const anchored = this.anchored(table);
       const send = async (): Promise<number[]> => {
+        const snap = anchored ? await this.#amgr!.writeSnapshot(table) : null;
         const all: number[] = [];
         for (let i = 0; i < blinded.length; i += per) {
           const part = blinded.slice(i, i + per);
@@ -1209,8 +1317,10 @@ export class Client {
             part.length * 24 + 4096), "insert_many", part.length).map((x) => rowId(x, "insert_many"));
           part.forEach((b, k) => { for (const [col, r] of b.pending) this.setMask(mkey(table, ids[k], col), r); });
           const items: Array<[number, string, WireVal]> = [];
-          for (let k = 0; k < part.length; k++) items.push(...this.fheTagItems(table, ids[k], part[k].tags));
+          const per_row: Array<Array<[number, string, WireVal]>> = [];
+          for (let k = 0; k < part.length; k++) { const it = this.fheTagItems(table, ids[k], part[k].tags); per_row.push(it); items.push(...it); }
           if (items.length) await this.writeCells(table, items);
+          if (snap) part.forEach((b, k) => this.recordInserted(snap, ids[k], b.wire, per_row[k]));
           all.push(...ids);
         }
         return all;
@@ -1229,24 +1339,42 @@ export class Client {
       for (const col of Object.keys(assignments)) this.col(table, col);
       const pred = wirePred(where);
       return this.atomically(async () => {
+        const asnap = this.anchored(table) ? await this.#amgr!.writeSnapshot(table) : null;
         const idxs = await this.matching(table, pred);
         const fheItems: Array<[number, string, WireVal]> = [];
+        const recs: Array<[number, AnchorValue[], FhePart[]]> = [];
         for (const i of idxs) {
+          let nv: AnchorValue[] | undefined, nfp: FhePart[] | undefined;
+          if (asnap) {
+            const old = asnap.rows.get(i);
+            if (!old) throw new TorusError("IntegrityError", `row ${i} of ${table} is not part of the anchored table state`);
+            nv = [...old.vals]; nfp = [...old.fhe];
+          }
           for (const [col, v] of Object.entries(assignments)) {
             const c = this.col(table, col);
             if (c.policy === "plain") {
               await this.call("update_cell", [table, i, col, wv(v)]);
+              if (asnap) nv![asnap.plainCols.indexOf(col)] = this.plainDecode(wv(v));
             } else if (c.policy === "fhe") {
               // a fresh ciphertext (and tag) per row, never one shared cell
-              for (const [n, w] of this.fheCells(table, c, this.fheInt(v, table, col), newNonce(), i)) fheItems.push([i, n, w]);
+              const cells = this.fheCells(table, c, this.fheInt(v, table, col), newNonce(), i);
+              for (const [n, w] of cells) fheItems.push([i, n, w]);
+              if (asnap) {
+                const m = new Map(cells);
+                const h = (w: WireVal | undefined) => (w && w.t === "x" ? anchorSha(Buffer.from(w.v, "base64")) : null);
+                const nw = m.get(FNONCE + col);
+                nfp![asnap.fheCols.indexOf(col)] = [nw && nw.t === "i" ? BigInt(nw.v) : null, h(m.get(col)), h(m.get(FMAC + col))];
+              }
             } else {
               const b = this.blindCell(table, c, v);
               for (const [n, w] of b.cells) await this.call("update_cell", [table, i, n, w]);
               for (const [n, r] of b.masks) this.setMask(mkey(table, i, n), r);
             }
           }
+          if (asnap) recs.push([i, nv!, nfp!]);
         }
-        if (fheItems.length) await this.writeCells(table, fheItems);   // value + tag of every row, atomically batched
+        if (fheItems.length) await this.writeCells(table, fheItems);   // value + tag + nonce of every row, atomically batched
+        for (const [i, vals, fp] of recs) this.#amgr!.recordUpdate(asnap!, i, vals, fp);
         return idxs.length;
       });
     });
@@ -1258,14 +1386,19 @@ export class Client {
       this.assertWritable();
       this.cols(table);
       const pred = wirePred(where);
-      const idxs = await this.matching(table, pred);
-      let n = 0;
-      for (const part of idxs.length ? chunked(idxs) : []) {
-        const k = safeInt(await this.call("delete_rows", [table, part]), "delete_rows");
-        if (k < 0 || k > part.length) throw proto("delete_rows: implausible count");
-        n += k;
-      }
-      return n;
+      const run = async () => {
+        const snap = this.anchored(table) ? await this.#amgr!.writeSnapshot(table) : null;
+        const idxs = await this.matching(table, pred);
+        let n = 0;
+        for (const part of idxs.length ? chunked(idxs) : []) {
+          const k = safeInt(await this.call("delete_rows", [table, part]), "delete_rows");
+          if (k < 0 || k > part.length) throw proto("delete_rows: implausible count");
+          n += k;
+        }
+        if (snap) for (const i of idxs) this.#amgr!.recordDelete(snap, i);
+        return n;
+      };
+      return this.anchored(table) ? this.atomically(run) : run();
     });
   }
 
@@ -1301,11 +1434,13 @@ export class Client {
       this.#undo = [];
       this.#txSchema = new Map(this.#schema);
       this.#inTx = true;
+      this.#amgr?.begin(txid);
     });
   }
 
   /** The server definitely holds no transaction for us: drop the local one. */
   private abortLocal(): void {
+    this.#amgr?.abort();
     if (this.#undo) this.applyUndo(this.#undo);
     if (this.#txSchema) this.#schema = this.#txSchema;
     this.#undo = null;
@@ -1321,6 +1456,15 @@ export class Client {
     return this.exclusive(async () => {
       if (!this.#inTx) return;
       const txid = this.#txid!;
+      if (this.#amgr) {
+        // the new anchor state is recorded as PENDING before the server is asked to commit: whatever happens
+        // next, the owner can tell which of the two states it is looking at
+        try { this.#amgr.prepare(); } catch (e) {
+          this.abortLocal();
+          await this.bestEffortRollback();
+          throw e;
+        }
+      }
       try {
         await Client.rawCall(this.#tr, "tx_commit", []);
       } catch (e) {
@@ -1337,10 +1481,12 @@ export class Client {
       this.#txSchema = null;
       this.#txid = null;
       this.#inTx = false;
+      this.#amgr?.finish();
     });
   }
 
   private moveToInDoubt(txid: string): void {
+    this.#amgr?.detach();            // the anchor keeps `pending`; the next connect settles it by scanning
     this.#inDoubt.set(txid, { undo: this.#undo ?? [], schema: this.#txSchema ?? new Map(this.#schema) });
     this.#undo = null; this.#txSchema = null; this.#txid = null; this.#inTx = false;
   }
@@ -1375,6 +1521,7 @@ export class Client {
     if (status === "committed") {
       this.#tr = fresh.tr; this.serverInfo = fresh.info;
       this.#undo = null; this.#txSchema = null; this.#txid = null; this.#inTx = false;
+      this.#amgr?.finish();
       return;                                    // it DID commit: keep the new masks
     }
     if (status === "unknown") {
@@ -1415,6 +1562,7 @@ export class Client {
         this.#schema = rec.schema;
       }
       this.#inDoubt.delete(txid);
+      if (this.#amgr) await this.#amgr.settlePending();      // the anchor's pending record is settled by what the server holds
       return committed;
     });
   }
@@ -1460,6 +1608,17 @@ export class Client {
           throw usage(`LIKE needs a STR column ('${a.c}' is ${c.type})`);
         }
       }
+    }
+    if (this.anchored(table)) {
+      // the row set and the PLAIN values come from the snapshot verified against the anchor; the server is never asked
+      // which rows match, so it cannot hide, add or resurrect any
+      const snap = await this.#amgr!.readSnapshot(table);
+      const ids = snap.liveIds();
+      if (!where) return ids;
+      return ids.filter((i) => {
+        const row = snap.rowDict(i);
+        return where.or.some((g) => g.every((a) => atomMatches(row[a.c] as Value, a)));
+      });
     }
     return arr(await this.call("matching_rowids", [table, where ?? null]), "matching_rowids")
       .map((i) => rowId(i, "matching_rowids"));
@@ -1556,7 +1715,9 @@ export class Client {
       }
     }
     const v = this.#authenticated
-      ? key.decryptSumVerified(total!, tags!, table, col, idxs, await this.fetchNonces(table, col, idxs), k)
+      ? key.decryptSumVerified(total!, tags!, table, col, idxs,
+          this.anchored(table) ? (await this.#amgr!.readSnapshot(table)).fhePart(col, idxs).map((p) => p[0])   // the nonces are part of the anchored state
+                               : await this.fetchNonces(table, col, idxs), k)
       : key.decryptSum(total!);
     return BigInt(v);
   }
@@ -1701,7 +1862,10 @@ export class Client {
     const uniq = [...new Set(ids.filter((i): i is number => i !== null))].sort((a, b) => a - b);
     const got = new Map<number, Value>();
     if (uniq.length) {
-      if (c.policy === "plain") {
+      if (c.policy === "plain" && this.anchored(table)) {
+        const snap = await this.#amgr!.readSnapshot(table);
+        uniq.forEach((id, k) => got.set(id, snap.plain(col, [id])[0] as Value));
+      } else if (c.policy === "plain") {
         for (const part of chunked(uniq)) {
           const ws = arr(await this.call("plain_cells", [table, col, part], part.length * (MAX_DIGITS * 2 + 60) + 4096),
             "plain_cells", part.length);
@@ -1749,7 +1913,21 @@ export class Client {
     if (cells.some((c) => c === null)) throw proto(`${table}.${col}: the server returned an empty FHE cell`);
     if (!this.#authenticated) return cells.map((c) => BigInt(key.decryptCell(c!)));
     const tags = await fetch(FMAC + col);
-    const nonces = await this.fetchNonces(table, col, ids);
+    let nonces: Array<bigint | null>;
+    if (this.anchored(table)) {
+      // nonces come from the verified snapshot, never from the server, and the bytes fetched now must be the very
+      // cells/tags the anchored state was built from
+      const parts = (await this.#amgr!.readSnapshot(table)).fhePart(col, ids);
+      nonces = parts.map((p) => p[0]);
+      parts.forEach((p, k) => {
+        const hc = cells[k] === null ? null : anchorSha(cells[k]!), ht = tags[k] === null ? null : anchorSha(tags[k]!);
+        if (!p[1] || !hc || !p[1].equals(hc) || !p[2] || !ht || !p[2].equals(ht)) {
+          throw new TorusError("IntegrityError", `${table}.${col} row ${ids[k]}: the cell or its tag differs from the anchored table state (altered or replayed by the server)`);
+        }
+      });
+    } else {
+      nonces = await this.fetchNonces(table, col, ids);
+    }
     return cells.map((c, k) => BigInt(key.decryptCellVerified(c, tags[k], table, col, ids[k], nonces[k])));
   }
 

@@ -1253,6 +1253,16 @@ impl FheKey {
     pub fn alpha(&self) -> BigInt {
         BigInt::from(self.alpha_u().clone())
     }
+    /// Leaf of one row for the anchored table state (`anchor.rs`): a PRF of the table, the row id and the
+    /// canonical row material, under a key derived from the MAC secret with its own label ("anchor-leaf").
+    pub fn anchor_leaf(&self, table: &str, rowid: i64, material: &[u8]) -> BigInt {
+        let k = hmac_sha256(&self.0.secret, b"torussql/fhe/anchor-leaf");
+        let mut msg = (table.len() as u32).to_be_bytes().to_vec();
+        msg.extend_from_slice(table.as_bytes());
+        msg.extend_from_slice(&(rowid as u64).to_be_bytes());
+        msg.extend_from_slice(material);
+        BigInt::from(BigUint::from_bytes_be(&hmac_sha512(&k, &msg)) % group_order())
+    }
     /// The per-cell tweak `gamma = PRF("gamma", table, column, row id)`.
     pub fn gamma(&self, table: &str, col: &str, rowid: i64, nonce: &BigInt) -> BigInt {
         BigInt::from(self.prf(

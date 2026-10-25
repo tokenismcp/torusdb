@@ -63,7 +63,7 @@ COST_G1, COST_G2, COST_GT = 1, 2, 100      # item-budget units per answered item
 PRE_AUTH_FRAME = 4096
 PRE_AUTH_MAX_FRAMES = 16          # frames a connection may send before authenticating
 _LOOPBACK = {"127.0.0.1", "::1", "localhost"}
-ALL_PERMS = frozenset({"key", "mask_write", "mask_read", "mask_admin"})
+ALL_PERMS = frozenset({"key", "mask_write", "mask_read", "mask_admin", "anchor", "anchor_read"})
 _REQUIRES = {
     "partial": "key", "partial_batch": "key", "gt_partial_batch": "key",
     "mask_put": "mask_write",
@@ -73,6 +73,8 @@ _REQUIRES = {
     "mask_drop_table": "mask_admin", "mask_drop_gen": "mask_admin",
     "mask_meta_put": "mask_admin", "mask_freeze": "mask_admin",
     "mask_stats": "mask_admin", "mask_compact": "mask_admin",
+    # integrity-anchor service: its own permissions, apart from key shares and masks
+    "anchor_get": ("anchor", "anchor_read"), "anchor_cas": "anchor", "anchor_repair": "anchor",
 }
 
 
@@ -113,6 +115,7 @@ class Custodian:
     def __init__(self, share, tokens: dict[str, str], *,
                  permissions: dict[str, set] | None = None,
                  masks: MaskShareStore | None = None, limits: Limits | None = None,
+                 anchors=None,
                  approve=None, audit_path: str | None = None,
                  rate_per_minute: int = 30, audit_max_bytes: int = 64 * 1024 * 1024,
                  audit_keep: int = 7, unauth_audit_per_minute: int = 20,
@@ -134,8 +137,8 @@ class Custodian:
         for name, tok in tokens.items():
             _check_token_strength(name, tok)
         shares = [] if share is None else ([share] if isinstance(share, KeyShare) else list(share))
-        if not shares and masks is None:
-            raise CustodyError("a custodian needs a key share, a mask store, or both")
+        if not shares and masks is None and anchors is None:
+            raise CustodyError("a custodian needs a key share, a mask store, an anchor store, or a combination")
         if len({sh.public.key_id for sh in shares}) != len(shares):
             raise CustodyError("two shares of the same key")
         self._shares = {sh.public.key_id: sh for sh in shares}
@@ -161,6 +164,7 @@ class Custodian:
                 raise CustodyError(f"bad permissions for {name!r}: {sorted(p)}")
         self._perms = {name: frozenset(perms.get(name, {"key"})) for name in tokens}
         self.masks = masks
+        self.anchors = anchors
         self.limits = limits or Limits()
         self._approve = approve
         self._audit_path = audit_path
@@ -242,7 +246,7 @@ class Custodian:
     def info(self) -> dict:
         s = self._share
         out = {"auth_required": True, "has_key": bool(self._shares),
-               "has_masks": self.masks is not None,
+               "has_masks": self.masks is not None, "has_anchors": self.anchors is not None,
                "keys": [{"key_id": k, "epoch": v.epoch, "index": v.index, "group": v.public.group,
                          "k": v.public.k, "n": v.public.n} for k, v in self._shares.items()]}
         if s is not None:                                  # single-key daemons keep the old fields
@@ -381,9 +385,10 @@ class Custodian:
         need = _REQUIRES.get(method)
         if need is None:
             raise CustodyError("unknown method")
-        if need not in self._perms.get(caller, frozenset()):
-            self._audit(caller, peer, method, {}, f"denied: lacks {need}")
-            raise CustodyError(f"caller {caller!r} lacks permission {need!r}")
+        needs = need if isinstance(need, tuple) else (need,)
+        if not any(n in self._perms.get(caller, frozenset()) for n in needs):
+            self._audit(caller, peer, method, {}, f"denied: lacks {needs[0]}")
+            raise CustodyError(f"caller {caller!r} lacks permission {needs[0]!r}")
         if not isinstance(args, list):
             raise CustodyError("arguments must be a list")
         try:
@@ -607,6 +612,28 @@ class Custodian:
     def _m_mask_compact(self, caller, peer):
         self._store().compact()
         return True
+
+    # — integrity-anchor service —
+    def _anchors(self):
+        if self.anchors is None:
+            raise CustodyError("this custodian has no anchor store")
+        return self.anchors
+
+    def _m_anchor_get(self, caller, peer, aid):
+        seq, val = self._anchors().get(aid)
+        return {"s": seq, "v": val}
+
+    def _m_anchor_cas(self, caller, peer, aid, expect_seq, value):
+        ok, seq, val = self._anchors().cas(aid, expect_seq, value)
+        self._audit(caller, peer, "anchor_cas", {"id": str(aid)[:64], "expect": expect_seq, "seq": seq},
+                    "stored" if ok else "conflict")
+        return {"ok": ok, "s": seq, "v": val}
+
+    def _m_anchor_repair(self, caller, peer, aid, seq, value):
+        ok = self._anchors().repair(aid, seq, value)
+        if ok:
+            self._audit(caller, peer, "anchor_repair", {"id": str(aid)[:64], "seq": seq}, "stored")
+        return ok
 
 
 class _Handler(socketserver.StreamRequestHandler):

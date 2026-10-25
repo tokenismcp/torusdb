@@ -37,7 +37,8 @@ Both remaining server lies need owner-held state to detect, so the fix is a smal
 | ID | Severity | Finding | Status |
 |---|---|---|---|
 | F11 | Info | `ENC`/`PAIRED` columns, delegated `DOT`, metadata and availability are outside the anchor. | Documented. |
-| F12 | Info | The anchor is itself a rollback target; `adopt_table` is trust-on-first-use; an anchor store that colludes with the server defeats the mode. | Documented; a custodian-quorum-backed `Anchor` is the intended hardening (interface ready, not implemented). |
+| F12 | Info | The anchor is itself a rollback target; `adopt_table` is trust-on-first-use; an anchor store that colludes with the server defeats the mode. | **Single-store case FIXED by `QuorumAnchor`** (k-of-n custodian-replicated, highest version with k identical answers, read-repair, CAS writes needing W acks). Condition: ≥ k honest, reachable custodians holding the latest value and ≤ k-1 faulty/rolled-back/colluding; k colluding custodians (or anchor store on the server's host) still defeat it. `adopt_table` stays trust on first use. Tests: `tests/test_fhe_quorum_anchor.py`. |
+| F13 | Info | A cached snapshot could keep answering while the server silently rolled back data the owner never reads. | Mitigated by the optional `integrity_recheck_seconds` (bounded by the period; default off). |
 
 ## Known residual limits (inherent to the design)
 
@@ -46,8 +47,9 @@ Both remaining server lies need owner-held state to detect, so the fix is a smal
   counters.
 * **Row-set integrity** (F3): without an anchor, plain columns and the row-id lists the server returns are not
   authenticated. **FIXED in anchor mode**, for tables with FHE columns, PLAIN and FHE columns only.
-* **The anchor itself**: loss, rollback or collusion with the server defeats anchor mode; `adopt_table` is trust on
-  first use.
+* **The anchor itself**: with a `FileAnchor`, loss, rollback or collusion with the server defeats anchor mode. A
+  `QuorumAnchor` tolerates up to `k-1` faulty custodians and `n-k` unavailable ones (conditions in `fhe-columns.md`);
+  `adopt_table` is trust on first use.
 * **Delegated `DOT`** has no integrity check; `local` mode (default when authenticated) verifies operands instead.
 * **Not constant time** in pure Python, and GT exponentiation is never constant time (only split-randomised).
 * **Security level** ≈ 100 bit (BN254), SXDH assumed. **No independent human review yet.**

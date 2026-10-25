@@ -38,6 +38,15 @@ pub enum Kind {
     UntrustedSchema,
     /// A COMMIT whose outcome could not be determined (see `Error::txid`).
     TransactionInDoubt,
+    /// Anchored mode: the server presents an OLDER table state than the anchor records (a lagging
+    /// replica, or a rollback). Never accepted silently.
+    StaleServer,
+    /// The anchor file is unusable (symlink, lax permissions, corrupt, unknown version).
+    AnchorFile,
+    /// A compare-and-swap on the anchor failed: another owner advanced the epoch, or a commit is pending.
+    AnchorConflict,
+    /// The table has FHE columns but the anchor has no entry for it (see `Client::adopt_table`).
+    AnchorMissing,
 }
 
 /// The error type of every fallible call.
@@ -106,6 +115,10 @@ impl Error {
             Kind::Integrity => "IntegrityError".into(),
             Kind::UntrustedSchema => "UntrustedSchema".into(),
             Kind::TransactionInDoubt => "TransactionInDoubt".into(),
+            Kind::StaleServer => "StaleServerError".into(),
+            Kind::AnchorFile => "AnchorFileError".into(),
+            Kind::AnchorConflict => "AnchorConflict".into(),
+            Kind::AnchorMissing => "AnchorMissingError".into(),
         }
     }
 }

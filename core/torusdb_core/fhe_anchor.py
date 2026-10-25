@@ -35,6 +35,7 @@ import os
 import secrets
 import stat
 import threading
+import time
 from dataclasses import dataclass
 from fractions import Fraction
 from typing import Any, Callable, Iterable
@@ -60,6 +61,11 @@ class AnchorFileError(ExecError):
 class AnchorConflict(ExecError):
     """A compare-and-swap on the anchor failed: another owner advanced the epoch, or a commit
     is already pending."""
+
+
+class AnchorQuorumError(ExecError):
+    """A quorum-backed anchor could not read or write with enough custodians (unreachable, split
+    votes, or too few matching answers). The caller fails SAFE: nothing is accepted or committed."""
 
 
 class AnchorMissingError(ExecError):
@@ -458,6 +464,7 @@ class Snapshot:
         self.rows: dict[int, RowRec] = {}
         self.nslots = 0
         self.epoch: int | None = None
+        self.checked_at = 0.0                  # clock() when the server was last scanned for this snapshot
         self.base_root = self.base_count = 0
         self.root = self.count = 0
         self._pidx = {c: i for i, c in enumerate(plain_cols)}
@@ -515,11 +522,16 @@ class AnchorManager:
 
     DEFAULT_MAX_ROWS = 1_000_000
 
-    def __init__(self, client, anchor: Anchor, max_rows: int | None = None):
+    def __init__(self, client, anchor: Anchor, max_rows: int | None = None,
+                 recheck_seconds: float | None = None, clock=time.monotonic):
         if not isinstance(anchor, Anchor):
             raise TypeError("integrity_anchor must be an Anchor (or a file path)")
         self.c, self.anchor = client, anchor
         self.max_rows = int(max_rows or self.DEFAULT_MAX_ROWS)
+        if recheck_seconds is not None and not recheck_seconds > 0:
+            raise PlanError("integrity_recheck_seconds must be a positive number (or None)")
+        self.recheck = recheck_seconds
+        self.clock = clock
         self.snaps: dict[str, Snapshot] = {}
         self.tx: _Tx | None = None
         self.auto = False                         # the open tx was started implicitly by a statement
@@ -586,6 +598,7 @@ class AnchorManager:
         snap.nslots = n
         snap.root, snap.count = root % N, count
         snap.base_root, snap.base_count = snap.root, snap.count
+        snap.checked_at = self.clock()
         self.stats["scans"] += 1
         self.stats["scan_rows"] += n
         return snap
@@ -597,7 +610,8 @@ class AnchorManager:
             f"call adopt_table({table!r}) once (trust on first use: only as honest as the server "
             f"at that moment); a table created through this connection is anchored automatically")
 
-    def snapshot(self, table: str, *, force: bool = False, for_write: bool = False) -> Snapshot:
+    def snapshot(self, table: str, *, force: bool = False, for_write: bool = False,
+                 _wait: float = 5.0) -> Snapshot:
         """The verified table state (cached per anchor epoch)."""
         tt = self.tx.tables.get(table) if self.tx else None
         snap = self.snaps.get(table)
@@ -607,7 +621,8 @@ class AnchorManager:
         if a is None:
             raise self._missing(table)
         if (not force and snap is not None and snap.epoch == a.epoch and a.pending is None
-                and snap.base_root == a.root and snap.base_count == a.count):
+                and snap.base_root == a.root and snap.base_count == a.count
+                and not (self.recheck is not None and self.clock() - snap.checked_at >= self.recheck)):
             return snap
         fresh = self._scan(table)
         dr, dc = (tt.droot, tt.dcount) if tt else (0, 0)
@@ -621,6 +636,11 @@ class AnchorManager:
         if volatile:
             fresh.epoch = None                                       # never cached while a commit is in flight
             if for_write:
+                # another owner's commit is on its way (its server transaction ended before ours may
+                # begin, so this is short): wait for it to settle instead of failing the statement
+                if _wait > 0:
+                    time.sleep(0.05)
+                    return self.snapshot(table, force=True, for_write=True, _wait=_wait - 0.05)
                 raise AnchorConflict(f"anchor: {table!r} has a commit in flight from another owner")
         self.snaps[table] = fresh
         if tt is not None:

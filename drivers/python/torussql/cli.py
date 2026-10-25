@@ -167,6 +167,16 @@ def _parser() -> argparse.ArgumentParser:
     ap.add_argument("--integrity-anchor", metavar="PATH",
                     help="owner-trusted anchor file (needs --authenticated and an FHE key): verifies "
                          "the row set and freshness of FHE tables; keep it away from the server")
+    ap.add_argument("--anchor-custodian", action="append", metavar="HOST:PORT", default=[],
+                    help="replicate the anchor over custodians that run `serve --anchor-store` (repeat n times; "
+                         "replaces the anchor file; token from --anchor-token-env, TLS flags --custody-tls/"
+                         "--custody-cafile); no single store to lose")
+    ap.add_argument("--anchor-token-env", metavar="VAR", help="env var with the custodian token ('anchor' permission)")
+    ap.add_argument("--anchor-threshold", type=int, metavar="K", help="custodians that must agree on a read (k)")
+    ap.add_argument("--anchor-write-quorum", type=int, metavar="W", help="custodians that must accept a write")
+    ap.add_argument("--anchor-id", default="default", help="name of this anchor on the custodians")
+    ap.add_argument("--integrity-recheck-seconds", type=float, metavar="S",
+                    help="re-scan a cached verified table state older than S seconds before answering")
     ap.add_argument("--adopt-table", metavar="TABLE", action="append", default=[],
                     help="trust-on-first-use: record TABLE's current server state in the anchor, "
                          "then continue (repeatable)")
@@ -274,13 +284,34 @@ def main(argv=None) -> int:
     if a.vault_pass_env and not passphrase:
         print(f"error: ${a.vault_pass_env} is not set", file=sys.stderr)
         return 2
+    anchor = a.integrity_anchor
+    if a.anchor_custodian:
+        from torussql.custody.anchor import QuorumAnchor
+        from torussql.custody.net import RemoteCustodian
+        atok = os.environ.get(a.anchor_token_env) if a.anchor_token_env else None
+        if anchor or not atok or not a.anchor_threshold:
+            print("error: --anchor-custodian needs --anchor-token-env (set) and --anchor-threshold, and "
+                  "excludes --integrity-anchor", file=sys.stderr)
+            return 2
+        nodes = []
+        for spec in a.anchor_custodian:
+            host, _, port = spec.rpartition(":")
+            nodes.append(RemoteCustodian(host.strip("[]"), int(port), atok, tls=a.custody_tls,
+                                         cafile=a.custody_cafile))
+        try:
+            anchor = QuorumAnchor(nodes, threshold=a.anchor_threshold,
+                                  write_quorum=a.anchor_write_quorum, anchor_id=a.anchor_id)
+        except Exception as exc:                                # noqa: BLE001
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
     try:
         conn = nokey.connect(a.host, a.port, tls=a.tls, cafile=a.cafile,
                              tls_insecure=a.tls_insecure, token=token,
                              vault_path=a.vault, vault_passphrase=passphrase,
                              authenticated=a.authenticated,
                              trust_server_schema=a.trust_server_schema, fhe_key=fhe_key,
-                             integrity_anchor=a.integrity_anchor)
+                             integrity_anchor=anchor,
+                             integrity_recheck_seconds=a.integrity_recheck_seconds)
     except Exception as exc:                                    # noqa: BLE001
         print(f"torussql: could not connect to {a.host}:{a.port}: {exc}", file=sys.stderr)
         return 1

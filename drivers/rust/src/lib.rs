@@ -23,12 +23,17 @@
 //! Cargo feature `tls` (off by default) adds TLS via rustls; certificates and
 //! hostnames are verified unless [`ConnectOptions::tls_insecure`] is set.
 
+mod anchor;
 mod conn;
 mod error;
 mod field;
 mod fhe;
 mod hash;
 
+pub use anchor::{
+    canon_value, row_material, schema_digest, Anchor, AnchorInfo, AnchorSpec, Change as AnchorChange, Entry as AnchorEntry,
+    FhePart, FileAnchor, MemoryAnchor, Pending as AnchorPending, ANCHOR_FORMAT, ANCHOR_FORMAT_VERSION,
+};
 pub use error::{Error, Kind};
 pub use fhe::{
     new_nonce as fhe_new_nonce,
@@ -292,6 +297,13 @@ pub struct ConnectOptions {
     pub fhe_dot_mode: FheDotMode,
     /// Backward-compatible alias: with `authenticated` and mode `Auto`, selects `Delegated`.
     pub fhe_allow_unverified_dot: bool,
+    /// Anchored table-state integrity for authenticated FHE tables: a file path (a [`FileAnchor`], format-compatible
+    /// with the Python and TypeScript drivers) or an [`Anchor`] object holding the owner-trusted root/count/epoch
+    /// of every table with FHE columns. Closes row-set lies (rows hidden/added/resurrected, COUNT/AVG
+    /// denominators, hidden deletes) and rollback/replay of old table states. Needs `authenticated` and `fhe_key`.
+    pub integrity_anchor: Option<AnchorSpec>,
+    /// Refuse to anchor a table with more row slots than this (default 1 000 000; ~0.5 KB of owner memory per row).
+    pub integrity_anchor_max_rows: Option<usize>,
 }
 
 impl Default for ConnectOptions {
@@ -310,6 +322,8 @@ impl Default for ConnectOptions {
             fhe_key: None,
             fhe_dot_mode: FheDotMode::Auto,
             fhe_allow_unverified_dot: false,
+            integrity_anchor: None,
+            integrity_anchor_max_rows: None,
         }
     }
 }
@@ -330,6 +344,8 @@ impl fmt::Debug for ConnectOptions {
             .field("fhe_key", &self.fhe_key)
             .field("fhe_dot_mode", &self.fhe_dot_mode)
             .field("fhe_allow_unverified_dot", &self.fhe_allow_unverified_dot)
+            .field("integrity_anchor", &self.integrity_anchor)
+            .field("integrity_anchor_max_rows", &self.integrity_anchor_max_rows)
             .finish()
     }
 }
@@ -392,6 +408,8 @@ impl BackendRows {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct FheLimits {
     pub max_sum_rows: Option<usize>,
+    /// rows per `fhe_rows` scan call (anchored mode)
+    pub max_scan_rows: Option<usize>,
     pub max_dot_rows: BackendRows,
     pub recommended_dot_rows: BackendRows,
 }
@@ -413,6 +431,7 @@ fn parse_limits(l: &Value) -> Option<ServerLimits> {
     let rows = |v: &Value| BackendRows { pyecc: pos(&v["pyecc"]), mcl: pos(&v["mcl"]) };
     let fhe = l.get("fhe").filter(|f| f.is_object()).map(|f| FheLimits {
         max_sum_rows: pos(&f["max_sum_rows"]),
+        max_scan_rows: pos(&f["max_scan_rows"]),
         max_dot_rows: rows(&f["max_dot_rows"]),
         recommended_dot_rows: rows(&f["recommended_dot_rows"]),
     });
@@ -542,6 +561,7 @@ pub struct Client {
     opts: ConnectOptions, // holds the token: private, redacted in Debug
     alpha: BigInt,        // SECRET MAC key
     update_cells_ok: bool, // false once the server answered "unknown method" for update_cells
+    amgr: Option<anchor::AnchorMgr>, // anchored table-state mode (integrity_anchor)
 }
 
 impl fmt::Debug for Client {
@@ -704,7 +724,29 @@ impl Client {
             opts: o.clone(),
             alpha: BigInt::zero(),
             update_cells_ok: true,
+            amgr: None,
         };
+        if let Some(spec) = &o.integrity_anchor {
+            if !o.authenticated {
+                c.conn.close();
+                return Err(Error::interface("integrity_anchor needs authenticated (the anchor protects the authenticated FHE tables)"));
+            }
+            if o.fhe_key.is_none() {
+                c.conn.close();
+                return Err(Error::interface("integrity_anchor needs an FHE key (fhe_key): the anchor's leaves are keyed by the owner's MAC secret"));
+            }
+            let a: std::sync::Arc<dyn Anchor> = match spec {
+                AnchorSpec::File(p) => match FileAnchor::new(p) {
+                    Ok(f) => std::sync::Arc::new(f),
+                    Err(e) => {
+                        c.conn.close();
+                        return Err(e);
+                    }
+                },
+                AnchorSpec::Custom(a) => a.clone(),
+            };
+            c.amgr = Some(anchor::AnchorMgr::new(a, o.integrity_anchor_max_rows));
+        }
         if o.authenticated {
             c.alpha = BigInt::from(1) + md(&rand_scalar()).mod_floor(&(n() - 1));
         }
@@ -716,6 +758,9 @@ impl Client {
             }
             if o.sync_schema {
                 c.sync_schema()?;
+            }
+            if c.amgr.is_some() {
+                c.a_settle_pending()?; // a commit that crashed after "pending": scan, finish or abort
             }
             Ok(())
         })();
@@ -879,14 +924,27 @@ impl Client {
         }
         let wire: Vec<Value> = cols.iter().map(|c| json!([c.name, c.ty, c.policy])).collect();
         let args = if if_not_exists { json!([name, wire, true]) } else { json!([name, wire]) };
-        match self.call("create", args)? {
-            // already existed: nothing changed and nothing adopted (sync_schema learns it, untrusted)
-            Value::Bool(false) => return Ok(()),
-            Value::Null => {}
-            _ => return Err(proto("create: unexpected reply")),
+        let fhe_table = self.amgr.is_some() && self.opts.authenticated && cols.iter().any(|c| c.policy == "fhe");
+        let run = |db: &mut Client| -> Result<()> {
+            match db.call("create", args)? {
+                // already existed: nothing changed and nothing adopted (sync_schema learns it, untrusted)
+                Value::Bool(false) => return Ok(()),
+                Value::Null => {}
+                _ => return Err(proto("create: unexpected reply")),
+            }
+            db.schema.insert(name.to_string(), TableDef { cols, trusted: true });
+            if db.anchored(name) {
+                let (plain, fhe, sdig) = db.layout(name).unwrap();
+                db.amgr.as_mut().unwrap().ddl_create(name, plain, fhe, sdig)?; // a table created here starts at root 0 / count 0
+            }
+            Ok(())
+        };
+        // an anchored table is created inside a transaction: the anchor commits with it
+        if fhe_table {
+            self.atomically(run)
+        } else {
+            run(self)
         }
-        self.schema.insert(name.to_string(), TableDef { cols, trusted: true });
-        Ok(())
     }
 
     /// `CREATE TABLE IF NOT EXISTS` (atomic on the server): a no-op when the table already
@@ -926,17 +984,34 @@ impl Client {
     fn drop_table_impl(&mut self, name: &str, if_exists: bool) -> Result<()> {
         self.assert_writable()?;
         let args = if if_exists { json!([name, true]) } else { json!([name]) };
-        match self.call("drop", args)? {
-            Value::Bool(false) => return Ok(()), // did not exist: touch nothing locally
-            Value::Null => {}
-            _ => return Err(proto("drop: unexpected reply")),
+        let known = match &self.amgr {
+            Some(m) => m.anchor.get(name)?.is_some(),
+            None => false,
+        };
+        let run = |db: &mut Client| -> Result<()> {
+            if known {
+                db.amgr.as_mut().unwrap().ddl_drop(name)?;
+            }
+            match db.call("drop", args)? {
+                Value::Bool(false) => return Ok(()), // did not exist: touch nothing locally
+                Value::Null => {}
+                _ => return Err(proto("drop: unexpected reply")),
+            }
+            db.schema.remove(name);
+            if let Some(m) = db.amgr.as_mut() {
+                m.snaps.remove(name);
+            }
+            let keys: Vec<MaskKey> = db.masks.keys().filter(|k| k.0 == name).cloned().collect();
+            for k in keys {
+                db.del_mask(&k);
+            }
+            Ok(())
+        };
+        if known {
+            self.atomically(run)
+        } else {
+            run(self)
         }
-        self.schema.remove(name);
-        let keys: Vec<MaskKey> = self.masks.keys().filter(|k| k.0 == name).cloned().collect();
-        for k in keys {
-            self.del_mask(&k);
-        }
-        Ok(())
     }
 
     fn def(&self, table: &str) -> Result<&TableDef> {
@@ -1174,14 +1249,44 @@ impl Client {
         Ok(BlindedRow { wire, pending, tags })
     }
 
+    /// `(plain values, FHE parts)` of a row as the server stores it, from the wire cells we sent.
+    fn a_parts(&self, table: &str, wire: &serde_json::Map<String, Value>, tags: &HashMap<String, Value>) -> Result<(Vec<CellIn>, Vec<FhePart>)> {
+        let (plain, fhe, _) = self.layout(table).ok_or_else(|| Error::interface("not an anchored table"))?;
+        let hash = |w: Option<&Value>| -> Option<[u8; 32]> {
+            let b = fhe::b64_decode(w?.get("v")?.as_str()?)?;
+            Some(hash::sha256(&b))
+        };
+        let vals = plain
+            .iter()
+            .map(|c| uwv(wire.get(c).unwrap_or(&Value::Null)).map_err(|e| Error::new(Kind::Integrity, e.message)))
+            .collect::<Result<Vec<_>>>()?;
+        let fp = fhe
+            .iter()
+            .map(|c| {
+                let nonce = wire.get(&format!("{}{}", FNONCE, c)).and_then(|n| n.get("v")).and_then(|v| v.as_str()).and_then(|v| v.parse::<BigInt>().ok());
+                (nonce, hash(wire.get(c)), hash(tags.get(c)))
+            })
+            .collect();
+        Ok((vals, fp))
+    }
+
+    fn a_tag_map(items: &[(i64, String, Value)]) -> HashMap<String, Value> {
+        items.iter().map(|(_, c, w)| (c.trim_start_matches(FMAC).to_string(), w.clone())).collect()
+    }
+
     /// INSERT: blind encrypted cells, keep the masks locally. Returns the row id. With
     /// authenticated FHE columns the row-bound tags are written in the same transaction.
     pub fn insert(&mut self, table: &str, row: Vec<(&str, CellIn)>) -> Result<i64> {
         self.assert_writable()?;
         let b = self.blind_row(table, &row)?;
         let tagged = !b.tags.is_empty();
+        let anchored = self.anchored(table);
         let table_s = table.to_string();
         let run = move |db: &mut Client| -> Result<i64> {
+            if anchored {
+                db.a_write_snapshot(&table_s)?; // the verified state BEFORE the write
+            }
+            let wire_c = if anchored { Some(b.wire.clone()) } else { None };
             let v = db.call_max("insert", json!([table_s, Value::Object(b.wire)]), 4096)?;
             let rowid = row_id(&v, "insert")?;
             for (col, r) in b.pending {
@@ -1191,6 +1296,10 @@ impl Client {
             let items = db.fhe_tag_items(&table_s, rowid, &b.tags)?;
             if !items.is_empty() {
                 db.write_cells(&table_s, &items)?;
+            }
+            if let Some(w) = wire_c {
+                let (vals, fp) = db.a_parts(&table_s, &w, &Self::a_tag_map(&items))?;
+                db.a_record(&table_s, rowid, vals, fp, 0)?;
             }
             Ok(rowid)
         };
@@ -1214,9 +1323,13 @@ impl Client {
             blinded.push(self.blind_row(table, r)?);
         }
         let tagged = blinded.iter().any(|b| !b.tags.is_empty());
+        let anchored = self.anchored(table);
         const PER: usize = 50_000;
         let table = table.to_string();
         let send = move |db: &mut Client, blinded: Vec<BlindedRow>| -> Result<Vec<i64>> {
+            if anchored {
+                db.a_write_snapshot(&table)?;
+            }
             let mut all = vec![];
             let mut it = blinded.into_iter().peekable();
             while it.peek().is_some() {
@@ -1228,20 +1341,29 @@ impl Client {
                     .map(|x| row_id(x, "insert_many"))
                     .collect::<Result<Vec<i64>>>()?;
                 let mut items = vec![];
+                let mut per_row = vec![];
                 for (rid, b) in ids.iter().zip(part) {
                     for (col, r) in b.pending {
                         db.set_mask((table.clone(), *rid, col), r);
                     }
-                    items.extend(db.fhe_tag_items(&table, *rid, &b.tags)?);
+                    let it = db.fhe_tag_items(&table, *rid, &b.tags)?;
+                    items.extend(it.clone());
+                    per_row.push((b.wire, it));
                 }
                 if !items.is_empty() {
                     db.write_cells(&table, &items)?;
+                }
+                if anchored {
+                    for (rid, (w, it)) in ids.iter().zip(per_row) {
+                        let (vals, fp) = db.a_parts(&table, &w, &Self::a_tag_map(&it))?;
+                        db.a_record(&table, *rid, vals, fp, 0)?;
+                    }
                 }
                 all.extend(ids);
             }
             Ok(all)
         };
-        if blinded.len() > PER || tagged {
+        if blinded.len() > PER || tagged || anchored {
             self.atomically(|db| send(db, blinded))
         } else {
             send(self, blinded)
@@ -1257,18 +1379,45 @@ impl Client {
             self.col(table, c)?;
         }
         let pred = wire_pred(&pred)?;
+        let anchored = self.anchored(table);
         self.atomically(|db| {
+            if anchored {
+                db.a_write_snapshot(table)?;
+            }
             let idxs = db.matching(table, pred)?;
             let mut fhe_items: Vec<(i64, String, Value)> = vec![];
+            let mut recs: Vec<(i64, Vec<CellIn>, Vec<FhePart>)> = vec![];
             for i in &idxs {
+                let (mut nv, mut nfp) = (vec![], vec![]);
+                if anchored {
+                    let old = db.a_snap(table).rows.get(i).cloned().ok_or_else(|| {
+                        Error::new(Kind::Integrity, format!("row {} of {} is not part of the anchored table state", i, table))
+                    })?;
+                    nv = old.vals;
+                    nfp = old.fhe;
+                }
                 for (col, v) in &set {
                     let policy = db.policy(table, col)?;
                     if policy == "plain" {
                         db.call_max("update_cell", json!([table, i, col, wv(v)?]), 4096)?;
+                        if anchored {
+                            let k = db.a_snap(table).plain_cols.iter().position(|c| c == col).unwrap();
+                            nv[k] = uwv(&wv(v)?).map_err(|e| Error::new(Kind::Integrity, e.message))?;
+                        }
                     } else if policy == "fhe" {
                         // a fresh ciphertext (and tag) per row, never one shared cell
                         let x = Self::fhe_int(v, table, col)?;
-                        for (n, w) in db.fhe_cells(table, col, x, &fhe_new_nonce(), Some(*i))? {
+                        let cells = db.fhe_cells(table, col, x, &fhe_new_nonce(), Some(*i))?;
+                        if anchored {
+                            let m: HashMap<String, Value> = cells.iter().cloned().collect();
+                            let hash = |w: Option<&Value>| -> Option<[u8; 32]> {
+                                Some(hash::sha256(&fhe::b64_decode(w?.get("v")?.as_str()?)?))
+                            };
+                            let nonce = m.get(&format!("{}{}", FNONCE, col)).and_then(|n| n["v"].as_str()).and_then(|v| v.parse::<BigInt>().ok());
+                            let k = db.a_snap(table).fhe_cols.iter().position(|c| c == col).unwrap();
+                            nfp[k] = (nonce, hash(m.get(*col)), hash(m.get(&format!("{}{}", FMAC, col))));
+                        }
+                        for (n, w) in cells {
                             fhe_items.push((*i, n, w));
                         }
                     } else {
@@ -1281,9 +1430,15 @@ impl Client {
                         }
                     }
                 }
+                if anchored {
+                    recs.push((*i, nv, nfp));
+                }
             }
             if !fhe_items.is_empty() {
-                db.write_cells(table, &fhe_items)?; // value + tag of every row, atomically batched
+                db.write_cells(table, &fhe_items)?; // value + tag + nonce of every row, atomically batched
+            }
+            for (i, vals, fp) in recs {
+                db.a_record(table, i, vals, fp, 1)?;
             }
             Ok(idxs.len())
         })
@@ -1294,17 +1449,33 @@ impl Client {
         self.assert_writable()?;
         self.cols(table)?;
         let pred = wire_pred(&pred)?;
-        let idxs = self.matching(table, pred)?;
-        let mut n = 0;
-        for part in chunks(&idxs) {
-            let k = self
-                .call_max("delete_rows", json!([table, part]), 4096)?
-                .as_i64()
-                .filter(|k| *k >= 0 && *k as usize <= part.len())
-                .ok_or_else(|| proto("delete_rows: implausible count"))?;
-            n += k;
+        let anchored = self.anchored(table);
+        let run = |db: &mut Client| -> Result<i64> {
+            if anchored {
+                db.a_write_snapshot(table)?;
+            }
+            let idxs = db.matching(table, pred)?;
+            let mut n = 0;
+            for part in chunks(&idxs) {
+                let k = db
+                    .call_max("delete_rows", json!([table, part]), 4096)?
+                    .as_i64()
+                    .filter(|k| *k >= 0 && *k as usize <= part.len())
+                    .ok_or_else(|| proto("delete_rows: implausible count"))?;
+                n += k;
+            }
+            if anchored {
+                for i in &idxs {
+                    db.a_record(table, *i, vec![], vec![], 2)?;
+                }
+            }
+            Ok(n)
+        };
+        if anchored {
+            self.atomically(run)
+        } else {
+            run(self)
         }
-        Ok(n)
     }
 
     fn atomically<T>(&mut self, f: impl FnOnce(&mut Client) -> Result<T>) -> Result<T> {
@@ -1352,11 +1523,17 @@ impl Client {
         self.undo = Some(vec![]);
         self.tx_schema = Some(self.schema.clone());
         self.in_tx = true;
+        if let Some(m) = self.amgr.as_mut() {
+            m.begin(self.txid.clone())?;
+        }
         Ok(())
     }
 
     /// The server definitely holds no transaction for us: drop the local one.
     fn abort_local(&mut self) {
+        if let Some(m) = self.amgr.as_mut() {
+            m.abort();
+        }
         if let Some(u) = self.undo.take() {
             Self::apply_undo(&mut self.masks, u);
         }
@@ -1383,10 +1560,22 @@ impl Client {
             return Ok(());
         }
         let txid = self.txid.clone().unwrap_or_default();
+        if let Some(m) = self.amgr.as_mut() {
+            // the new anchor state is recorded as PENDING before the server is asked to commit: whatever happens
+            // next, the owner can tell which of the two states it is looking at
+            if let Err(e) = m.prepare() {
+                self.abort_local();
+                let _ = self.conn.call("tx_rollback", json!([]), 4096);
+                return Err(e);
+            }
+        }
         match self.conn.call("tx_commit", json!([]), 4096) {
             Ok(_) => {
                 self.end_local();
-                Ok(())
+                match self.amgr.as_mut() {
+                    Some(m) => m.finish(),
+                    None => Ok(()),
+                }
             }
             Err(e) if matches!(e.kind, Kind::Connection | Kind::Timeout | Kind::Protocol) => {
                 self.settle_lost_commit(&txid, e)
@@ -1401,6 +1590,9 @@ impl Client {
     }
 
     fn move_to_in_doubt(&mut self, txid: &str) {
+        if let Some(m) = self.amgr.as_mut() {
+            m.detach(); // the anchor keeps `pending`; the next connect settles it by scanning
+        }
         let undo = self.undo.take().unwrap_or_default();
         let schema = self.tx_schema.take().unwrap_or_else(|| self.schema.clone());
         self.in_doubt.insert(txid.to_string(), (undo, schema));
@@ -1451,7 +1643,10 @@ impl Client {
                 self.conn = conn;
                 self.info = info;
                 self.end_local(); // it DID commit: keep the new masks
-                Ok(())
+                match self.amgr.as_mut() {
+                    Some(m) => m.finish(),
+                    None => Ok(()),
+                }
             }
             "unknown" => {
                 self.conn = conn;
@@ -1512,6 +1707,9 @@ impl Client {
             Self::apply_undo(&mut self.masks, undo);
             self.schema = schema;
         }
+        if self.amgr.is_some() {
+            self.a_settle_pending()?; // the anchor's pending record is settled by what the server holds
+        }
         Ok(committed)
     }
 
@@ -1567,6 +1765,11 @@ impl Client {
                     }
                 }
             }
+        }
+        if self.anchored(table) {
+            // the row set and the PLAIN values come from the snapshot verified against the anchor; the server is
+            // never asked which rows match, so it cannot hide, add or resurrect any
+            return self.a_match(table, &pred);
         }
         let v = self.call("matching_rowids", json!([table, pred]))?;
         ids_from(&v, "matching_rowids")
@@ -1699,7 +1902,12 @@ impl Client {
         }
         let total = total.unwrap();
         if self.opts.authenticated {
-            let nonces = self.fetch_nonces(table, col, idxs)?;
+            let nonces: Vec<Option<BigInt>> = if self.anchored(table) {
+                // the nonces are part of the anchored state
+                self.a_fhe_part(table, col, idxs)?.into_iter().map(|p| p.0).collect()
+            } else {
+                self.fetch_nonces(table, col, idxs)?
+            };
             key.decrypt_sum_verified(&total, &tags.unwrap(), table, col, idxs, &nonces, k)
         } else {
             key.decrypt_sum(&total)
@@ -1796,7 +2004,27 @@ impl Client {
                 .collect();
         }
         let tags = fetch(self, &format!("{}{}", FMAC, col))?;
-        let nonces = self.fetch_nonces(table, col, ids)?;
+        let nonces: Vec<Option<BigInt>> = if self.anchored(table) {
+            // nonces come from the verified snapshot, never from the server, and the bytes fetched now must be the
+            // very cells/tags the anchored state was built from
+            let parts = self.a_fhe_part(table, col, ids)?;
+            for (k, p) in parts.iter().enumerate() {
+                let hc = cells[k].as_ref().map(|c| hash::sha256(c));
+                let ht = tags[k].as_ref().map(|t| hash::sha256(t));
+                if p.1.is_none() || p.1 != hc || p.2.is_none() || p.2 != ht {
+                    return Err(Error::new(
+                        Kind::Integrity,
+                        format!(
+                            "{}.{} row {}: the cell or its tag differs from the anchored table state (altered or replayed by the server)",
+                            table, col, ids[k]
+                        ),
+                    ));
+                }
+            }
+            parts.into_iter().map(|p| p.0).collect()
+        } else {
+            self.fetch_nonces(table, col, ids)?
+        };
         cells
             .iter()
             .zip(&tags)
@@ -1977,7 +2205,12 @@ impl Client {
         uniq.dedup();
         let mut got: HashMap<i64, CellIn> = HashMap::new();
         if !uniq.is_empty() {
-            if policy == "plain" {
+            if policy == "plain" && self.anchored(table) {
+                let vs = self.a_plain(table, col, &uniq)?;
+                for (v, i) in vs.into_iter().zip(&uniq) {
+                    got.insert(*i, v);
+                }
+            } else if policy == "plain" {
                 for part in chunks(&uniq) {
                     let v = self.call_max(
                         "plain_cells",

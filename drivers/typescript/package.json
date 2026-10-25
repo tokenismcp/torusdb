@@ -28,6 +28,8 @@
     "dist/torusdb.d.ts",
     "dist/fhe.js",
     "dist/fhe.d.ts",
+    "dist/anchor.js",
+    "dist/anchor.d.ts",
     "dist/errors.js",
     "dist/errors.d.ts",
     "README.md",

@@ -168,3 +168,25 @@ pub fn run_peer(host: &str, port: u16, spec: &serde_json::Value) -> serde_json::
     assert!(out.status.success(), "fhe_peer failed: {}", String::from_utf8_lossy(&out.stderr));
     serde_json::from_slice(&out.stdout).expect("peer output")
 }
+
+// ── raw access (what a hostile server operator or a buggy client can do) ─────
+use std::io::{Read, Write};
+use std::net::TcpStream;
+
+pub fn read_frame(s: &mut TcpStream) -> Option<Vec<u8>> {
+    let mut h = [0u8; 4];
+    s.read_exact(&mut h).ok()?;
+    let mut b = vec![0u8; u32::from_be_bytes(h) as usize];
+    s.read_exact(&mut b).ok()?;
+    Some(b)
+}
+pub fn write_frame(s: &mut TcpStream, b: &[u8]) -> bool {
+    s.write_all(&(b.len() as u32).to_be_bytes()).is_ok() && s.write_all(b).is_ok()
+}
+/// One raw RPC on its own connection.
+pub fn raw_rpc(addr: &str, method: &str, args: serde_json::Value) -> serde_json::Value {
+    let mut s = TcpStream::connect(addr).unwrap();
+    s.set_read_timeout(Some(std::time::Duration::from_secs(120))).unwrap();
+    write_frame(&mut s, serde_json::json!({"m": method, "a": args}).to_string().as_bytes());
+    serde_json::from_slice(&read_frame(&mut s).unwrap()).unwrap()
+}

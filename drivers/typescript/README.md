@@ -201,6 +201,33 @@ await db.dot("emp", "rate", "hours", null, "pyecc");                // sum(rate_
   about 4-8 ms per cell decryption, DOT-result decryption about 20-60 ms; the GT baby-step table for range
   10^6 builds in roughly 0.3 s. BigInt arithmetic is **not constant-time**.
 
+## Anchored table-state integrity (`integrityAnchor`)
+
+Tags make a changed *value* detectable; they cannot tell you **which rows exist** or **whether the table is current**
+(both are facts only the server states), and a server can replay an old consistent state. The anchor is a small
+owner-trusted record per table, `{epoch, root, count, pending}`, where `root = sum of PRF(K_anchor, table, rowid, canonical
+row) mod n` over the live rows (`K_anchor` derives from the key like alpha/gamma; the server never sees a leaf). Configure
+`integrityAnchor: "/secure/anchor.json"` (or an `Anchor` object) together with `authenticated` and `fheKey`:
+
+* Reads/WHERE/COUNT/AVG denominators and PLAIN values are answered from a **snapshot** built by scanning the server (`fhe_rows`)
+  and checked against the anchor (sum of leaves and row count); cell and tag bytes fetched later must hash to what the scan
+  reported. The snapshot is cached per anchor epoch (rescanned when another owner advanced it) and updated in place by your
+  own writes (`db.anchorStats` counts scans). A server that hides, adds, resurrects, swaps or replays rows, hides a delete, or serves
+  another cell after the scan raises an integrity error; a state equal to an *older* epoch is `StaleServerError` (`kind: "StaleServerError"`) ("the server is behind
+  the anchor": a lagging replica or a rollback; never accepted silently).
+* Every write to an anchored table runs in a transaction: the new `(root, count)` is recorded as `pending` in the anchor
+  BEFORE `tx_commit` (compare-and-swap on the epoch, all touched tables in one atomic anchor write), then finished or aborted. A
+  crash or lost COMMIT reply leaves `pending`; the next connect (or `tx_status`) settles it by scanning the server.
+* A table created through this connection is anchored from the first byte; a table that existed earlier is refused
+  (`AnchorMissing`) until `db.adoptTable(t)` / `db.verifyTable(t)`: **trust on first use**, only as honest as the server at that moment. `verifyTable` forces a
+  full rescan. `integrityAnchorMaxRows` (default 1 000 000 slots) bounds the owner's memory (~0.5 KB per row).
+* `FileAnchor` is **format-compatible with the Python implementation** (`torusdb_core.fhe_anchor.FileAnchor`): JSON, mode 0600,
+  temp file + fsync + rename, epoch CAS, `pending` with txid, last 8 roots; refuses symlinks, other owners, lax permissions,
+  corrupt files and unknown versions. Python, TypeScript and Rust owners can alternate on one anchor file and one key.
+* **Locking.** Python and Rust serialise owner processes with `flock(<path>.lock)`. Node has no `flock`: on macOS/BSD `FileAnchor` takes the very same lock via `O_EXLOCK`; on **Linux** it can only exclude other TypeScript processes (O_EXCL sidecar `<path>.lock.ts`), so do not run a Python/Rust WRITER and a TypeScript writer at the same moment on Linux (sequential use is fine; the epoch compare-and-swap still turns a lost update into an `AnchorConflict` at the next commit).
+* Keep the anchor where the server cannot write, back it up like the FHE key (losing it loses row-set integrity). Not covered:
+  an anchor shared by owners running concurrently on a network file system; a custodian-quorum anchor is the same `Anchor` trait/interface (not provided).
+
 ## Admin / introspection
 
 `ping()`, `tables()`, `tableInfo(t)`, `stats()`, `checkpoint()`, `backup()`,

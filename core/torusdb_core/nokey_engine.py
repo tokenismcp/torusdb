@@ -437,6 +437,9 @@ class NoKeyClient:
     # None = today's behaviour: NO row-set integrity and NO freshness for FHE tables.
     integrity_anchor: Any = None
     integrity_anchor_max_rows: int | None = None
+    # re-scan a cached snapshot older than this many seconds before answering (None = only when the
+    # anchor epoch changes): bounds how long a silent server rollback of unread data can go unnoticed
+    integrity_recheck_seconds: float | None = None
     _amgr: Any = field(default=None, init=False, repr=False)
     # Tables whose column policies were learned from the (untrusted) server
     # rather than created/vaulted by this owner. A malicious server could relabel
@@ -474,7 +477,8 @@ class NoKeyClient:
             if not isinstance(anc, Anchor):
                 anc = FileAnchor(str(anc))
             self.integrity_anchor = anc
-            self._amgr = AnchorManager(self, anc, self.integrity_anchor_max_rows)
+            self._amgr = AnchorManager(self, anc, self.integrity_anchor_max_rows,
+                                       self.integrity_recheck_seconds)
 
     # — anchored mode: statement wrapper (implicit commit when no transaction manager drives us) —
     def _anchored_stmt(self, fn):

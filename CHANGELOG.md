@@ -11,6 +11,18 @@ Versioning: [Versioning Policy](docs/versioning.md).
 Hardening release: SQL joins completed, server and drivers made operable, a
 cryptographic self-audit, and the open repository made self-contained.
 
+### Added — QuorumAnchor, threshold-key anchor tests, periodic re-verification (late 0.5.0)
+
+- `torussql.custody.anchor.QuorumAnchor`: the integrity anchor replicated over k-of-n custodians (new custodian RPCs
+  `anchor_get` / `anchor_cas` / `anchor_repair`, new permissions `anchor` / `anchor_read`, durable `AnchorStore`
+  register on a RecordLog, `custody serve --anchor-store`); reads need k identical answers (liars and rolled-back
+  custodians are outvoted, laggards repaired), writes need W acknowledgements, failures are safe. CLI
+  `--anchor-custodian/--anchor-token-env/--anchor-threshold/--anchor-write-quorum/--anchor-id`. The `FileAnchor`
+  format and the leaf encoding are unchanged.
+- `integrity_recheck_seconds` (connect / CLI `--integrity-recheck-seconds`): periodic re-scan of the cached snapshot.
+- A statement that finds another owner's commit in flight now waits briefly instead of failing.
+- Tests: `tests/test_fhe_quorum_anchor.py`, `tests/test_fhe_threshold_anchor.py`.
+
 ### Added — anchored table-state integrity for FHE tables (late 0.5.0)
 
 - `connect(..., integrity_anchor=<path|Anchor>)` (needs `authenticated=True` and an FHE key): an owner-held,

@@ -106,6 +106,7 @@ _ENGINE_TYPE_MAP = {
     "ExecError":       DataError,
     "AnchorMissingError": ProgrammingError,
     "AnchorConflict":  OperationalError,
+    "AnchorQuorumError": OperationalError,
     "AnchorFileError": OperationalError,
 }
 
@@ -639,6 +640,7 @@ class Connection:
                  fhe_dot_mode: str = "auto",
                  integrity_anchor=None,
                  integrity_anchor_max_rows: int | None = None,
+                 integrity_recheck_seconds: float | None = None,
                  timeout: float | None = 30.0):
         if integrity_anchor is not None and not authenticated:
             raise ProgrammingError("integrity_anchor needs authenticated=True")
@@ -673,7 +675,8 @@ class Connection:
                                       fhe_allow_unverified_dot=fhe_allow_unverified_dot,
                                       fhe_dot_mode=fhe_dot_mode,
                                       integrity_anchor=integrity_anchor,
-                                      integrity_anchor_max_rows=integrity_anchor_max_rows)
+                                      integrity_anchor_max_rows=integrity_anchor_max_rows,
+                                      integrity_recheck_seconds=integrity_recheck_seconds)
             self._amgr = self.client._amgr
             if self._amgr is not None:
                 self._amgr.managed = True
@@ -1203,6 +1206,7 @@ def connect(host: str = "127.0.0.1", port: int = 8533, *,
             fhe_dot_mode: str = "auto",
             integrity_anchor=None,
             integrity_anchor_max_rows: int | None = None,
+            integrity_recheck_seconds: float | None = None,
             timeout: float | None = 30.0) -> Connection:
     """Open a PEP 249 connection to a no-key TorusDB server.
 
@@ -1234,12 +1238,16 @@ def connect(host: str = "127.0.0.1", port: int = 8533, *,
             multiplies the plaintexts: verified, O(n) decryptions) or ``"auto"`` (default:
             delegated without ``authenticated``, local with it)
         fhe_allow_unverified_dot: legacy; with ``authenticated=True`` it selects ``"delegated"``
-        integrity_anchor: a file path (or a ``torusdb_core.fhe_anchor.Anchor``) holding the owner-trusted
+        integrity_anchor: a file path, or an ``Anchor`` object (``QuorumAnchor`` in ``torussql.custody.anchor``
+            replicates it over k-of-n custodians: no single store to lose), holding the owner-trusted
             root/count/epoch of every table with FHE columns. Needs ``authenticated=True`` and ``fhe_key``.
             It makes row sets (WHERE results, COUNT/AVG denominators, deleted rows) and freshness
             (rollback / replay of a complete old row or table) verifiable, at the cost of an O(rows)
             scan per anchor epoch and ~0.5 KB of owner memory per row. Without it there is NO row-set
             integrity and NO freshness for FHE tables. See docs/fhe-columns.md.
+        integrity_recheck_seconds: re-scan a cached verified snapshot older than this many seconds before
+            answering (default None = only when the anchor epoch changes). Bounds how long a silent server
+            rollback of data the owner does not read can stay unnoticed; costs one O(rows) scan per period.
         integrity_anchor_max_rows: refuse to anchor a table with more slots than this
             (default 1,000,000: the verified snapshot lives in memory, ~0.6 KB per row)
         trust_server_schema: allow INSERT/UPDATE on tables whose column policies
@@ -1258,4 +1266,5 @@ def connect(host: str = "127.0.0.1", port: int = 8533, *,
                       sync_schema=sync_schema, trust_server_schema=trust_server_schema,
                       fhe_key=fhe_key, fhe_allow_unverified_dot=fhe_allow_unverified_dot,
                       fhe_dot_mode=fhe_dot_mode, integrity_anchor=integrity_anchor,
-                      integrity_anchor_max_rows=integrity_anchor_max_rows, timeout=timeout)
+                      integrity_anchor_max_rows=integrity_anchor_max_rows,
+                      integrity_recheck_seconds=integrity_recheck_seconds, timeout=timeout)

@@ -185,7 +185,9 @@ the entry (so does a re-CREATE). A table that exists but has no anchor entry is 
 and writes with a message pointing at `adopt_table`.
 
 **Operating it.**
-* The anchor is the owner's trust root. **Keep it where the server cannot write**, with the FHE key's care: `FileAnchor`
+* The anchor is the owner's trust root. **Keep it where the server cannot write**, with the FHE key's care. A single
+  file is a single point of failure (lose or roll it back and the mode is void) — use a **`QuorumAnchor`** (next
+  bullet) when that matters. `FileAnchor`
   writes a `0600` JSON file (versioned, atomic rename + fsync, advisory `flock` between owner processes) and refuses
   symlinks, files that are not ours, lax permissions, corrupt content and unknown versions. It holds no key and no
   plaintext (roots are PRF sums), but whoever can *roll it back* defeats it.
@@ -193,7 +195,27 @@ and writes with a message pointing at `adopt_table`.
 * Several owner processes may share one anchor file on a local file system (several `FileAnchor` objects, one file);
   if another owner advances the epoch while you hold a snapshot you rescan; a transaction whose base epoch moved is
   rolled back with an explicit error. The `Anchor` interface (`get`, `begin_commit`, `finish_commit`, `abort`, `set`,
-  `remove`; CAS on the epoch) is what a custodian-quorum-backed anchor would implement — not provided yet.
+  `remove`; CAS on the epoch) is what `QuorumAnchor` implements.
+* **`QuorumAnchor` (no single store).** `connect(..., integrity_anchor=QuorumAnchor(nodes, threshold=k))` keeps the
+  very same anchor document on `n` custodians (the daemon of `docs/custody.md`, started with `--anchor-store`; the owner's
+  token needs the new `anchor` permission, readers `anchor_read` — separate from key-share and mask permissions).
+  Each custodian holds one versioned compare-and-swap register per anchor id (RecordLog: append-only, checksummed,
+  fsync per write, optional passphrase sealing, survives restarts). **Read:** ask all; the value is the highest version
+  that at least `k` custodians report identically — a liar, a lagging or a rolled-back custodian is outvoted while fewer
+  than `k` do the same, and lagging copies are repaired (version only moves forward). **Write:** the CAS goes to all and
+  counts only if `write_quorum` (default `max(k, n-k+1)`; constraint `n - W < k`) accept; otherwise the owner does
+  not commit (fails closed; if the write nevertheless landed, the normal pending-settlement aborts it by scanning).
+  Racing owners are serialised by the per-custodian CAS. Pending/finish/abort/settlement are the same code as with
+  `FileAnchor`. CLI: `torussql --anchor-custodian HOST:PORT ... --anchor-token-env VAR --anchor-threshold K
+  [--anchor-write-quorum W] [--anchor-id NAME]`. **Exact condition:** at least `k` custodians are honest, reachable and
+  hold the latest value, and at most `k-1` lie, are rolled back or are compromised. With `k` colluding/rolled-back
+  custodians the old or forged state wins (tested as the stated limit); with fewer than `k` reachable the owner gets
+  `AnchorQuorumError` and nothing is accepted or committed. Residual: a *partial* write by a crashed owner can briefly
+  lower availability (copies at a version that is not vouched for) until the next successful write repairs them; an
+  operator who loses more than `n-k` custodians' disks loses the anchor.
+* **Periodic re-verification.** `integrity_recheck_seconds=S` (CLI `--integrity-recheck-seconds`, default off) re-scans a
+  cached snapshot older than `S` seconds before the next query, so a silent server rollback or tampering of data the
+  owner does not read is noticed within `S` seconds (cost: one O(rows) scan per period).
 * Replicas and standbys serve the same reads (`fhe_rows` is a read RPC). A replica that lags the anchor is refused
   with the "behind the anchor" error until it catches up.
 
@@ -206,9 +228,10 @@ measured bulk INSERT of 2000 rows: 8.9 s without vs 9.3 s with the anchor (withi
 native encryption dominates).
 
 **What it still does NOT cover.**
-* An **owner who loses the anchor** (or restores an older copy of it): the anchor is itself subject to rollback, and
-  without it the table can only be re-adopted on trust. **Collusion of the anchor store and the server** (e.g. both on
-  one compromised host) defeats it.
+* An **owner who loses the anchor** (or restores an older copy of it) with a `FileAnchor`: the anchor is then itself
+  subject to rollback, and without it the table can only be re-adopted on trust. A `QuorumAnchor` removes that single
+  point of failure *only under its condition* (≥ k honest, reachable custodians holding the latest value; ≤ k-1 faulty
+  or colluding — k colluding custodians, or the anchor store sharing a host with the server, defeat it).
 * **Trust on first use** (`adopt_table`) and everything before the anchor existed.
 * Only tables with at least one FHE column are anchored, and only their **PLAIN and FHE** columns: `ENC`/`PAIRED`
   columns of the same table keep their own SPDZ MAC/mask-version protection and are not part of the leaf.
@@ -218,7 +241,7 @@ native encryption dominates).
   scan fails), not tolerated.
 * **Freshness between rescans**: between epoch changes the owner answers from its cached snapshot. A server that
   silently rolls back *data the owner does not read* is noticed on the next fetch of that data, on `verify_table()`,
-  or when another owner (or a restart) triggers a rescan — not instantly.
+  when another owner (or a restart) triggers a rescan, or — if you set `integrity_recheck_seconds` — within that period.
 * Python driver only (the TypeScript and Rust drivers do not implement the anchor yet); the O(rows) scan and
   per-row memory do not suit very large tables.
 

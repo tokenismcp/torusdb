@@ -247,8 +247,10 @@ def cmd_serve(a):
         kid, _, names = spec.partition(":")
         access[kid] = set(filter(None, names.split(",")))
     masks = MaskShareStore(a.mask_store, share_pass) if a.mask_store else None
+    from .anchorstore import AnchorStore
+    anchors = AnchorStore(a.anchor_store, share_pass) if a.anchor_store else None
     tokens, perms = _read_tokens(a.token_file)
-    cust = Custodian(shares or None, tokens, permissions=perms, masks=masks, audit_path=a.audit,
+    cust = Custodian(shares or None, tokens, permissions=perms, masks=masks, anchors=anchors, audit_path=a.audit,
                      rate_per_minute=a.rate, item_budget_per_minute=a.item_budget or None,
                      max_batch=a.max_batch, audit_keep=a.audit_keep,
                      audit_max_bytes=int(a.audit_max_mb * 1024 * 1024),
@@ -268,7 +270,8 @@ def cmd_serve(a):
         raise SystemExit("refusing a non-loopback listen without --tls (tokens are bearer secrets)")
     srv = CustodianServer(host, port, cust, ssl_ctx=ctx)
     what = [f"key share {s.index}/{s.public.n} epoch {s.epoch} key {s.public.key_id}"
-            for s in shares] + (["mask store"] if masks else [])
+            for s in shares] + (["mask store"] if masks else []) \
+        + (["anchor store"] if anchors else [])
     print(f"custodian [{', '.join(what)}] on {srv.address[0]}:{srv.address[1]}", flush=True)
 
     def reload(*_):                      # SIGHUP: pick up refreshed share files
@@ -293,6 +296,8 @@ def cmd_serve(a):
         srv.server_close()
         if masks:
             masks.close()
+        if anchors:
+            anchors.close()
 
 
 # ── mask cluster administration ──────────────────────────────────────────────
@@ -523,6 +528,9 @@ def main(argv=None):
     p.add_argument("--audit-keep", type=int, default=7, help="rotated audit files to keep")
     p.add_argument("--audit-max-mb", type=float, default=64, help="rotate the audit log at this size")
     p.add_argument("--mask-store", help="mask share store file (enables the mask service)")
+    p.add_argument("--anchor-store", metavar="PATH",
+                   help="integrity-anchor register file (enables the anchor service; callers need the "
+                        "'anchor' / 'anchor_read' permissions in the token file)")
     p.add_argument("--min-aggregate-rows", type=int, default=1)
     p.add_argument("--reveal-quota", type=int, default=None,
                    help="max mask cells returned per caller per minute")

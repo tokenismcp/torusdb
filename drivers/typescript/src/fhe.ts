@@ -845,6 +845,17 @@ export class FheKey {
   }
   /** The MAC key alpha = PRF("alpha") (or 1). */
   alpha(): bigint { return (this.#alpha ??= this.prf("alpha") || 1n); }
+  /** Leaf of one row for the anchored table state (src/anchor.ts): a PRF of the table, the row id and the
+   *  canonical row material, under a key derived from the MAC secret with its own label ("anchor-leaf"). */
+  anchorLeaf(table: string, rowid: number, material: Uint8Array): bigint {
+    const k = createHmac("sha256", this.#secret).update("torussql/fhe/anchor-leaf").digest();
+    const t = Buffer.from(table, "utf8");
+    const head = Buffer.alloc(4); head.writeUInt32BE(t.length);
+    const rid = Buffer.alloc(8); rid.writeBigUInt64BE(BigInt(rowid));
+    const d = createHmac("sha512", k).update(Buffer.concat([head, t, rid, material])).digest("hex");
+    return BigInt("0x" + d) % N;
+  }
+
   /** The per-WRITE tweak gamma = PRF("gamma", table, column, row id, nonce): `nonce` is the fresh random
    *  integer stored next to the cell in `__fnonce__<col>`. A missing or non-integer nonce is an IntegrityError. */
   gamma(table: string, col: string, rowid: number, nonce: bigint | null): bigint {

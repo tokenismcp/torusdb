@@ -235,6 +235,18 @@ probability 1/q). `reshare-start` now needs `--old-ids` and `--new-ids` and `res
 the digests of both committees' identity lists are signed into every reshare broadcast, so a dealing cannot be
 replayed to a different set of recipients; broadcasts in the old format are refused with an explicit message.
 
+### 2.6 Replicated integrity anchor (`serve --anchor-store`)
+
+A custodian can also store the data owner's **integrity anchor** (`docs/fhe-columns.md`, "Anchored table-state
+integrity") so that it is not a single file: `serve --anchor-store anchors.log` (sealed with the share passphrase unless
+`--no-passphrase`). Token-file permissions: `name:token:anchor` (read and write), `name:token:anchor_read` (read only);
+they are separate from `key`, `mask_*` (an `anchor` token cannot ask for partial decryptions or mask shares and vice
+versa). RPCs: `anchor_get(id)`, `anchor_cas(id, expect_seq, value)`, `anchor_repair(id, seq, value)`; each custodian keeps
+one `(seq, value)` register per anchor id (append-only checksummed log, fsync per write, compaction). It never
+interprets the value and one custodian is never trusted alone: the client (`QuorumAnchor(nodes, threshold=k)`) believes
+the highest `seq` that k custodians report identically. Run n custodians on separate hosts/disks; the condition for the
+guarantee is ≥ k honest, reachable custodians that hold the latest value and ≤ k-1 faulty ones.
+
 ## 3. What it protects — and what it does not
 
 **Protects**
