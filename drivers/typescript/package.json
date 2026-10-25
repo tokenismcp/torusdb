@@ -4,14 +4,14 @@
   "description": "No-key TorusDB client for Node/TypeScript \u2014 the server holds no keys and never decrypts",
   "license": "Apache-2.0",
   "author": "J1729 Labs <jlabsrd@gmail.com>",
-  "homepage": "https://github.com/j1729labs/torusdb",
+  "homepage": "https://github.com/tokenismcp/torusdb",
   "repository": {
     "type": "git",
-    "url": "https://github.com/j1729labs/torusdb.git",
-    "directory": "torussql/drivers/typescript"
+    "url": "https://github.com/tokenismcp/torusdb.git",
+    "directory": "drivers/typescript"
   },
   "bugs": {
-    "url": "https://github.com/j1729labs/torusdb/issues"
+    "url": "https://github.com/tokenismcp/torusdb/issues"
   },
   "keywords": [
     "torusdb",

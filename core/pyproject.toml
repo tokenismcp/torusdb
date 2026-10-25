@@ -27,7 +27,7 @@ fhe-native = ["py_ecc>=6.0.0,<9.0.0", "mclbn256>=1.3"]   # ... ~150x faster (nat
 
 [project.urls]
 Homepage = "https://torusdb.io"
-Repository = "https://github.com/j1729labs/torusdb"
+Repository = "https://github.com/tokenismcp/torusdb"
 
 [tool.setuptools]
 packages = ["torusdb_core"]

@@ -35,8 +35,8 @@ torussql-custody = "torussql.custody.__main__:main"
 
 [project.urls]
 Homepage    = "https://torusdb.io"
-Repository  = "https://github.com/j1729labs/torusdb"
-"Bug Tracker" = "https://github.com/j1729labs/torusdb/issues"
+Repository  = "https://github.com/tokenismcp/torusdb"
+"Bug Tracker" = "https://github.com/tokenismcp/torusdb/issues"
 
 [tool.setuptools.packages.find]
 where   = ["."]
