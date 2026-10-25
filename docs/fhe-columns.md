@@ -47,7 +47,7 @@ conn = torussql.connect(host, fhe_key=key, authenticated=True)   # authenticated
 | UPDATE/DELETE/crash/orphans | mask-first ordering, gc, repair | nothing to repair |
 | speed | fast | native back end: encrypt 0.3 ms/cell, `SUM` 0.4 ms/row, `DOT` 1.4 ms/row; pure Python: 33 ms, 0.1 ms, 200 ms |
 | result range | ≈ ±2^126 exact rationals | integers only, results within the key's range (default ±10^6) |
-| integrity vs a lying server | optional SPDZ MACs | optional tags for cells / `SUM` / `k*SUM` (see below); **none for `DOT`** |
+| integrity vs a lying server | optional SPDZ MACs | optional tags for cells / `SUM` / `k*SUM`; with `integrity_anchor=` also the row set and freshness (see below); **none for delegated `DOT`** |
 
 ## Scheme (EC-FHE on the BN254 pairing groups; implemented in `torusdb_core/fhe.py`)
 
@@ -68,13 +68,16 @@ variants are broken.
 
 ## Limits — read before relying on it
 
-* **Integrity is partial** (`authenticated=True`). Each FHE cell gets a second ciphertext, a
+* **Integrity is partial** (`authenticated=True`) — and with an **integrity anchor** (next section) the two
+  biggest gaps below, *row-set lies* and *replay/rollback*, are closed. Without an anchor there is NO row-set
+  integrity and NO freshness. Each FHE cell gets a second ciphertext, a
   *tag* `Enc(α·v + γ(table, column, row id))` where `α` and the per-cell tweak `γ` are PRF
   outputs of the owner's secret. For any set of rows the owner checks, in the exponent and
   without a discrete log, `tag-sum = α·value-sum + k·Σγ`. This catches a changed value, a
   dropped, duplicated or swapped row, a result scaled by the server, and cells written without
   tags (soundness ≈ 1/n per attempt). **Not covered:** replay of an older version of the same
-  cell, and **`DOT`** — a ciphertext product cannot be tag-checked, so an authenticated
+  cell or of a whole table, the **set of rows** (WHERE results, COUNT/AVG denominators, deleted/dead rows —
+  all come from the server), and **`DOT`** — a ciphertext product cannot be tag-checked, so an authenticated
   connection refuses `DOT` unless you pass `fhe_allow_unverified_dot=True`. Without
   `authenticated=True` a malicious server can return a wrong ciphertext and the owner decrypts
   a wrong number (or fails with *out of range*); use `ENC` + `authenticated=True` when
@@ -108,6 +111,116 @@ variants are broken.
   independent review. Treat it as experimental.
 * Python, TypeScript and Rust drivers support FHE columns (same wire format; known-answer vectors
   in `proto/fhe-vectors.json` and cross-language tests).
+
+## Anchored table-state integrity (`integrity_anchor=`)
+
+Tags (above) make a changed *value* detectable. They cannot tell the owner **which rows exist** or **whether the
+table is current**, because both are facts only the server states. Closing them needs a small piece of
+owner-trusted state. That state is the **anchor**: per table `{epoch, root, count, pending}`.
+
+```python
+conn = torussql.connect(host, fhe_key=key, authenticated=True,
+                        integrity_anchor="/secure/place/anchor.json")     # or an Anchor object
+conn.execute("CREATE TABLE emp (id INT PLAIN, dept INT PLAIN, rate INT FHE)")   # anchored from the first byte
+conn.adopt_table("old_table")     # one-off, for a table that existed before the anchor (trust on first use)
+conn.verify_table("emp")          # explicit audit: full rescan against the anchor
+```
+```bash
+torussql --authenticated --fhe-key fhe.key --integrity-anchor anchor.json [--adopt-table emp] ...
+```
+
+**What it protects (conditions in the last paragraph of this list).** With the anchor configured, a server that
+lies about
+* the **set of rows** — adds, drops or resurrects rows, flips dead/live flags, hides a DELETE, or tampers with a
+  PLAIN column (the data a WHERE runs on) — is detected (F3 of the review log);
+* **time** — serves a whole table rolled back to an older, internally consistent state, replays one old version of
+  a row (value + tag + nonce together), or swaps rows — is detected (the "known residual limit" of the review log);
+* **COUNT / AVG denominators and DELETE/UPDATE target sets** cannot be lied about: the owner evaluates the WHERE
+  itself on the verified table state and never asks the server which rows match.
+
+**How it works.**
+* `leaf(row) = PRF(K_anchor, table, rowid, canonical(row))  mod n`. `K_anchor` derives from the MAC secret exactly
+  like α/γ, under its own domain label (`anchor-leaf`). The canonical row is the schema digest, every PLAIN column
+  value with a type tag, and for each FHE column the write nonce, SHA-256(cell) and SHA-256(tag).
+* `root = Σ_{live rows} leaf (mod n)`, `count = #live rows`. Dead rows contribute nothing. The root is additive:
+  INSERT adds a leaf, DELETE subtracts one, UPDATE does both — the owner keeps the root current **at statement
+  time** without rescanning.
+* New read RPC `fhe_rows(table, start, count)` (≤ 2000 slots per call; see `proto/fhe-wire.md`) returns, per slot,
+  dead/live, the PLAIN values and, per FHE column, nonce and the two hashes. **The server computes the hashes — it is
+  untrusted and its hashes are used only through the root check.**
+* `verify`: the owner scans all slots, recomputes every leaf, requires `Σ leaf == anchor.root` (plus the open
+  transaction's uncommitted delta) and the same count; on success it keeps the verified snapshot
+  `{rowid → plain values, nonces, hashes}`. Anything else raises `IntegrityError("table state … does not match the
+  anchor …")`; a state equal to an *older* epoch raises `StaleServerError` ("the server is behind the anchor": a lagging
+  replica or a rollback — never a silent pass).
+* While the snapshot is valid for the anchor epoch the owner answers WHERE, COUNT, AVG denominators, PLAIN-column
+  reads, DELETE/UPDATE targets **from the snapshot**; the nonces of the tag check come from the snapshot; the cell and
+  tag bytes fetched for a read must hash to the snapshot's SHA-256 values. The tag check stays as the second layer
+  (`SUM`/`k*SUM` cannot be hash-checked cell by cell — the server adds them — but they are bound to the anchored
+  nonces, so only the current version of every cell can satisfy the tag equation).
+* The snapshot is cached per anchor epoch, updated in place by the owner's own writes, and rescanned when another
+  owner advanced the epoch (or a commit by another owner is pending).
+
+**Soundness argument.** Let `S` be the anchored live set and `S' ≠ S` what a server presents. The two sums differ by
+`Σ ± leaf(x)` over the symmetric difference, where every `x = (table, rowid, material)` is a distinct PRF input.
+The server never sees `K_anchor` or any leaf; the leaves of distinct inputs are indistinguishable from independent
+uniform elements of Z_n; so a non-empty ±combination vanishes with probability ≈ 1/n (≈ 2^-254) plus the PRF
+advantage. Hence a presented state whose leaves sum to `R` is exactly the anchored one: same rows at the same slots
+(the rowid is part of the leaf and the scan must be gap-free), same PLAIN values, same nonces, same cell/tag hashes.
+The owner's accept/reject is an equality oracle for *whole states* only (a changed state is rejected regardless of
+K), so it leaks nothing about the leaves. Cell and tag bytes fetched later must hash to the verified SHA-256 values
+(collision resistance, 2^-128). Nonces and hashes are taken from the verified snapshot, never from the server's
+later answers. Schema (names, types, policies) is part of every leaf, so a server cannot relabel a column.
+
+**Commit protocol (atomic with the server transaction).** Statement time: leaf deltas accumulate per table. At
+COMMIT the owner first records `pending = {root_new, count_new, epoch+1, txid}` in the anchor (compare-and-swap on
+the epoch; all touched tables in one atomic anchor write), **then** sends `tx_commit`, then `finish_commit` (answer
+"committed") or `abort` (rolled back / error). Lost reply: the existing `tx_status` resolution decides. Crash with a
+`pending` in the anchor: on the next connect the owner scans the server and settles it by what it finds — state
+sum == `root_new` → finish, == old root → abort, neither → `IntegrityError`. A reader that meets another owner's pending
+commit settles it the same way (it never aborts a commit that `tx_status` says is still on its way). Autocommit
+statements that were not transactional before (UPDATE, DELETE, DDL on FHE tables) run in an implicit transaction in
+this mode. ROLLBACK discards the delta. Tables created through the connection start at root 0 / count 0; DROP removes
+the entry (so does a re-CREATE). A table that exists but has no anchor entry is refused for authenticated FHE reads
+and writes with a message pointing at `adopt_table`.
+
+**Operating it.**
+* The anchor is the owner's trust root. **Keep it where the server cannot write**, with the FHE key's care: `FileAnchor`
+  writes a `0600` JSON file (versioned, atomic rename + fsync, advisory `flock` between owner processes) and refuses
+  symlinks, files that are not ours, lax permissions, corrupt content and unknown versions. It holds no key and no
+  plaintext (roots are PRF sums), but whoever can *roll it back* defeats it.
+* `adopt_table(t)` is **trust on first use**: it records whatever the server shows at that moment, lies included.
+* Several owner processes may share one anchor file on a local file system (several `FileAnchor` objects, one file);
+  if another owner advances the epoch while you hold a snapshot you rescan; a transaction whose base epoch moved is
+  rolled back with an explicit error. The `Anchor` interface (`get`, `begin_commit`, `finish_commit`, `abort`, `set`,
+  `remove`; CAS on the epoch) is what a custodian-quorum-backed anchor would implement — not provided yet.
+* Replicas and standbys serve the same reads (`fhe_rows` is a read RPC). A replica that lags the anchor is refused
+  with the "behind the anchor" error until it catches up.
+
+**Cost (measured, Apple-silicon laptop under load, native back end).** O(rows) once per anchor epoch and per
+process: a full scan is ≈ **0.2 s per 10 000 rows** at the owner (leaf PRF + hashing; the server side adds ≈ 20 ms
+per 2000-slot call); the verified snapshot costs ≈ **0.6 KB of owner memory per row** (≈ 1.1 KB peak while scanning);
+default cap `integrity_anchor_max_rows=1_000_000` (≈ 0.6 GB). A local WHERE over the snapshot is a Python loop
+(≈ 13 ms per 10 000 rows). Writes cost one extra hash and PRF per row and the anchor file is rewritten (with fsyncs) once per COMMIT;
+measured bulk INSERT of 2000 rows: 8.9 s without vs 9.3 s with the anchor (within noise on a loaded machine; the
+native encryption dominates).
+
+**What it still does NOT cover.**
+* An **owner who loses the anchor** (or restores an older copy of it): the anchor is itself subject to rollback, and
+  without it the table can only be re-adopted on trust. **Collusion of the anchor store and the server** (e.g. both on
+  one compromised host) defeats it.
+* **Trust on first use** (`adopt_table`) and everything before the anchor existed.
+* Only tables with at least one FHE column are anchored, and only their **PLAIN and FHE** columns: `ENC`/`PAIRED`
+  columns of the same table keep their own SPDZ MAC/mask-version protection and are not part of the leaf.
+* **Delegated `DOT`** (`fhe_dot_mode="delegated"`) is still unverified (the default `local` mode verifies operands).
+* **Availability and metadata**: the server can still refuse service, make a connection fail with `IntegrityError` at
+  will, and see row counts, access patterns and PLAIN data. Writers that bypass the anchor are detected (the next
+  scan fails), not tolerated.
+* **Freshness between rescans**: between epoch changes the owner answers from its cached snapshot. A server that
+  silently rolls back *data the owner does not read* is noticed on the next fetch of that data, on `verify_table()`,
+  or when another owner (or a restart) triggers a rescan — not instantly.
+* Python driver only (the TypeScript and Rust drivers do not implement the anchor yet); the O(rows) scan and
+  per-row memory do not suit very large tables.
 
 ## Threshold custody of the FHE key (`ThresholdFheKey`)
 
@@ -217,5 +330,7 @@ Refresh/reshare of either key's shares keeps `Q`, `Q2` and the bundle valid (key
 A cell is 384 bytes: `C1 ‖ C2` (G1, 64 bytes each, big-endian affine, all-zero = ∞) then
 `D1 ‖ D2` (G2, 128 bytes each). RPCs `fhe_sum(table, col, ids)` and
 `fhe_dot(ltable, lcol, lids, rtable, rcol, rids)` return base64 blobs (128 bytes / 4×384 bytes).
+`fhe_rows(table, start, count)` (anchored mode) returns per-slot dead/live flags, PLAIN values, write nonces and
+SHA-256 hashes of cells and tags — see `proto/fhe-wire.md`.
 The server validates length and curve membership of every stored cell and rejects plaintext
 or binary values in other columns.

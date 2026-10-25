@@ -11,6 +11,20 @@ Versioning: [Versioning Policy](docs/versioning.md).
 Hardening release: SQL joins completed, server and drivers made operable, a
 cryptographic self-audit, and the open repository made self-contained.
 
+### Added — anchored table-state integrity for FHE tables (late 0.5.0)
+
+- `connect(..., integrity_anchor=<path|Anchor>)` (needs `authenticated=True` and an FHE key): an owner-held,
+  per-table `{epoch, root, count, pending}` anchor (`torusdb_core.fhe_anchor`: `Anchor`, `FileAnchor`, `MemoryAnchor`)
+  closes F3 (the row set: WHERE results, COUNT/AVG denominators, dead flags, plain-column tampering) and the
+  rollback/replay limit of the authenticated FHE mode. WHERE/COUNT/targets are evaluated at the owner on a verified,
+  cached snapshot; the owner scans O(rows) once per anchor epoch (≈ 0.2 s and ≈ 0.6 KB per row per 10 000 rows).
+  New read RPC `fhe_rows` (`hello.limits.fhe.max_scan_rows`), `Connection.adopt_table()` (trust on first use) and
+  `verify_table()`, CLI `--integrity-anchor`, `--adopt-table`. The anchor is committed with the server transaction
+  (`pending` before `tx_commit`, settled by `tx_status` or by scanning after a crash). UPDATE/DELETE/DDL on FHE
+  tables run in an implicit transaction in this mode. **Default unchanged: without an anchor there is still no
+  row-set integrity and no freshness.** Details and limits: `docs/fhe-columns.md`; tests:
+  `tests/test_fhe_table_integrity.py`.
+
 ### Added — threshold custody of the FHE key (unreleased)
 
 - `torusdb_core.fhe_threshold.ThresholdFheKey`: the FHE secret `s` lives only as a k-of-n custodian sharing

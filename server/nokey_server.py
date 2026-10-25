@@ -79,7 +79,7 @@ log = logging.getLogger("torusdb.server")
 READ_RPCS = frozenset({
     "schema", "tables", "table_info", "matching_rowids", "plain_cells", "blinded_cell",
     "blinded_cells", "blinded_sum", "blinded_scaled_sum",
-    "blinded_per_row_scaled", "mult_combine_batch", "fhe_sum", "fhe_dot",
+    "blinded_per_row_scaled", "mult_combine_batch", "fhe_sum", "fhe_dot", "fhe_rows",
 })
 WRITE_RPCS = frozenset({
     "create", "insert", "insert_many", "update_cell", "update_cells", "delete_rows",
@@ -135,6 +135,7 @@ class ServerConfig:
     fhe_max_sum_rows: int = 5000      # rows per fhe_sum call
     fhe_max_dot_rows: int = 300       # rows per fhe_dot call with the pure-Python back end
     fhe_max_dot_rows_native: int = 6000   # ... with the native (mcl) back end
+    fhe_max_scan_rows: int = 2000     # slots per fhe_rows call (anchored-table scan)
     fhe_allow_client_backend: bool = False   # may a client force a different pairing back end?
     tx_ring: int = 100_000            # committed transaction ids remembered
     storage: str = "memory"           # "memory" | "disk" (heap files in <db>.data/)
@@ -957,6 +958,7 @@ class Engine:
         have_native = importlib.util.find_spec("mclbn256") is not None
         return {"max_items": self.cfg.max_items,
                 "fhe": {"max_sum_rows": self.cfg.fhe_max_sum_rows,
+                        "max_scan_rows": self.cfg.fhe_max_scan_rows,
                         "max_dot_rows": {"pyecc": self.cfg.fhe_max_dot_rows,
                                          "mcl": self.cfg.fhe_max_dot_rows_native},
                         # sizes that finish well inside a 30 s client timeout
@@ -1350,6 +1352,23 @@ class Engine:
         except KeyError:
             raise BadRequest(f"rows of {table!r} have no {col!r} cells (integrity tag missing)") from None
         return lambda: _b64e(repl_fhe().sum_cells(cells, None, k))   # ... computed outside it
+
+    def _rpc_fhe_rows(self, table, start, count):
+        """Scan for the owner's anchored table state: slots ``start .. start+count-1`` as
+        ``[rowid, dead]`` or ``[rowid, 0, [plain wire values], [[nonce, sha256(cell) hex,
+        sha256(tag) hex], ...]]`` plus the slot count (see ``NoKeyServer.fhe_rows``)."""
+        self._store(table)
+        for v in (start, count):
+            if isinstance(v, bool) or not isinstance(v, int) or v < 0:
+                raise BadRequest("fhe_rows takes non-negative integers (start, count)")
+        if count > self.cfg.fhe_max_scan_rows:
+            raise BadRequest(f"fhe_rows takes at most {self.cfg.fhe_max_scan_rows} slots per call")
+        n, rows = self.srv.fhe_rows(table, start, count)
+        hx = lambda b: None if b is None else b.hex()          # noqa: E731
+        return {"n": n, "rows": [
+            [rid, 1] if dead else [rid, 0, [w.wv(v) for v in plain],
+                                   [[w.wv(nonce), hx(hc), hx(ht)] for nonce, hc, ht in fp]]
+            for rid, dead, plain, fp in rows]}
 
     def _rpc_fhe_dot(self, lt, lc, lids, rt, rc, rids, backend=None):
         self._fhe_col(lt, lc)

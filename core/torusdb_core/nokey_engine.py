@@ -183,6 +183,30 @@ class NoKeyServer:
         return fhe.dot_cells(self._rows[ltable].cells(lcol, lids),
                              self._rows[rtable].cells(rcol, rids), backend)
 
+    def fhe_rows(self, table: str, start: int, count: int):
+        """Anchored-table scan (``fhe_anchor``): for the slots ``start .. start+count-1`` return
+        ``(slots, [(rowid, dead, plain_values, [(nonce, sha256(cell), sha256(tag)), ...])])`` —
+        the PLAIN columns in schema order and, per FHE column, the write nonce and the hashes of
+        the cell and its tag. Dead slots carry no data. The hashes are computed HERE, by the
+        untrusted side: the owner uses them only through the anchored root (a server cannot
+        produce hashes that satisfy it except the true ones)."""
+        from .fhe_anchor import sha256
+        store = self._rows[table]
+        cols = self._schema[table]
+        plain = [c for (c, _t, p) in cols if p == "plain"]
+        fcols = [c for (c, _t, p) in cols if p == "fhe"]
+        n = len(store)
+        out = []
+        for i in range(max(0, start), min(n, start + count)):
+            if store.is_dead(i):
+                out.append((i, True, None, None))
+                continue
+            row = store.row(i)
+            out.append((i, False, [row.get(c) for c in plain],
+                        [(row.get(_fnonce_col(c)), sha256(row.get(c)), sha256(row.get(_fmac_col(c))))
+                         for c in fcols]))
+        return n, out
+
     # — selection over the PLAINTEXT predicate (encrypted cols never tested) —
     def matching_rowids(self, table: str, where) -> list[int]:
         store = self._rows[table]
@@ -408,6 +432,12 @@ class NoKeyClient:
     # O(n) decryptions); "auto" = delegated without authentication, local with it.
     fhe_dot_mode: str = "auto"
     _batch_ok: bool = True                     # does the server know update_cells?
+    # Anchored table-state mode (fhe_anchor.py): an ``Anchor`` (or a path -> FileAnchor) holding the
+    # owner-trusted root/count/epoch of every table with FHE columns. Needs authenticated=True.
+    # None = today's behaviour: NO row-set integrity and NO freshness for FHE tables.
+    integrity_anchor: Any = None
+    integrity_anchor_max_rows: int | None = None
+    _amgr: Any = field(default=None, init=False, repr=False)
     # Tables whose column policies were learned from the (untrusted) server
     # rather than created/vaulted by this owner. A malicious server could relabel
     # an encrypted column "plain" and receive plaintext, so writes to such
@@ -432,19 +462,94 @@ class NoKeyClient:
             self._alpha = int(cfg["alpha"])
         if self.authenticated and self._alpha == 0:
             self._alpha = secrets.randbelow(N - 1) + 1
+        if self.integrity_anchor is not None:
+            from .fhe_anchor import Anchor, AnchorManager, FileAnchor
+            if not self.authenticated:
+                raise PlanError("integrity_anchor needs authenticated=True (the anchor protects "
+                                "the authenticated FHE tables)")
+            if self.fhe is None:
+                raise PlanError("integrity_anchor needs an FHE key (fhe_key=...): the anchor's "
+                                "leaves are keyed by the owner's MAC secret")
+            anc = self.integrity_anchor
+            if not isinstance(anc, Anchor):
+                anc = FileAnchor(str(anc))
+            self.integrity_anchor = anc
+            self._amgr = AnchorManager(self, anc, self.integrity_anchor_max_rows)
+
+    # — anchored mode: statement wrapper (implicit commit when no transaction manager drives us) —
+    def _anchored_stmt(self, fn):
+        m = self._amgr
+        if m is None:
+            return fn()
+        try:
+            r = fn()
+        except BaseException:
+            if m.auto:
+                m.abort()
+            raise
+        if m.auto:
+            m.autocommit()
+        return r
+
+    def _an(self, table: str) -> bool:
+        """Is ``table`` verified against the integrity anchor?"""
+        return self._amgr is not None and self._amgr.is_anchored(table)
+
+    def adopt_table(self, table: str, replace: bool = False) -> dict:
+        """Trust-on-first-use: scan the server NOW and record that state in the anchor. Only
+        as honest as the server at this moment; use it once for tables created before the anchor
+        existed."""
+        if self._amgr is None:
+            raise PlanError("no integrity anchor is configured")
+        return self._amgr.adopt(table, replace)
+
+    def verify_table(self, table: str) -> dict:
+        """Force a full scan of ``table`` and check it against the anchor (O(rows))."""
+        if self._amgr is None:
+            raise PlanError("no integrity anchor is configured")
+        return self._amgr.verify(table)
+
+    def _guard(self, table: str, fn):
+        """Anchored tables: the server refusing rows the verified state contains (out of range,
+        missing cells) contradicts the anchor — that is an integrity failure, not a user error."""
+        try:
+            return fn()
+        except Exception as exc:                                      # noqa: BLE001
+            if self._an(table) and type(exc).__name__ in ("DataError", "ExecError", "KeyError",
+                                                          "IndexError"):
+                raise IntegrityError(f"{table!r}: the server cannot serve rows that the anchored "
+                                     f"table state contains ({exc})") from None
+            raise
+
+    def _matching_ids(self, table: str, where) -> list[int]:
+        if self._an(table):
+            return self._amgr.match_ids(table, where)
+        return self.server.matching_rowids(table, where)
+
+    def _plain_cells(self, table: str, col: str, ids: list) -> list:
+        if self._an(table) and self._colpolicy.get((table, col)) == "plain":
+            return self._amgr.plain(table, col, ids)
+        return self.server.plain_cells(table, col, ids)
 
     # — entry point —
     def execute(self, sql: str) -> Any:
+        return self._anchored_stmt(lambda: self._execute(sql))
+
+    def _execute(self, sql: str) -> Any:
         plan = plan_query(parse(sql), _CatalogView(self._schema))
         if plan.kind == "noop":                  # IF [NOT] EXISTS that has nothing to do
             return 0
         if plan.kind == "drop_if_exists":        # unknown to this client: ask the server
+            if self._amgr is not None and self._amgr.anchor.get(plan.table) is not None:
+                self._amgr.ddl_drop(plan.table)
             if self.server.drop_if_exists(plan.table):
                 self._forget_table(plan.table)
             return 0
         if plan.kind == "create":
             return self._create(plan)
         if plan.kind == "drop":
+            if self._an(plan.table):
+                self._amgr.ddl_drop(plan.table)
             self.server.drop(plan.table)
             self._forget_table(plan.table)
             return 0
@@ -478,6 +583,8 @@ class NoKeyClient:
         for (name, typ, pol) in cols:
             self._coltype[(q.name, name)] = typ
             self._colpolicy[(q.name, name)] = pol
+        if self._an(q.name) and q.name not in self._untrusted:
+            self._amgr.ddl_create(q.name)            # a table created here starts at root 0 / count 0
         return 0
 
     # — INSERT: blind encrypted cells, keep masks, send only blinded —
@@ -511,16 +618,19 @@ class NoKeyClient:
         q = plan.raw
         self._require_trusted(q.table)
         row, masks = self._blind_row(q)
+        snap = self._amgr.write_snapshot(q.table) if self._an(q.table) else None
         # masks first, row second: a crash in between leaves an orphan MASK
         # (harmless), never a server cell with no mask (unreadable forever)
         extras = self.maskstore.stage_insert(q.table, [masks])[0]
         row.update(extras)
         rowid = self.server.insert(q.table, row)
         self.maskstore.commit_insert(q.table, [rowid], [masks], [extras])
-        self._fhe_tag_rows(q.table, [(rowid, q, row)])
+        tags = self._fhe_tag_rows(q.table, [(rowid, q, row)])
+        if snap is not None:
+            self._anchor_inserted(snap, rowid, row, tags)
         return 1
 
-    def insert_many(self, sqls: list[str]) -> int:
+    def _insert_many(self, sqls: list[str]) -> int:
         """Bulk-load: every statement must be an INSERT into one table. The
         rows are blinded locally and sent in a single round trip."""
         plans = [plan_query(parse(s), _CatalogView(self._schema)) for s in sqls]
@@ -530,6 +640,7 @@ class NoKeyClient:
         if any(p.kind != "insert" or p.table != table for p in plans):
             raise PlanError("insert_many requires INSERTs into a single table")
         self._require_trusted(table)
+        snap = self._amgr.write_snapshot(table) if self._an(table) else None
         blinded = [self._blind_row(p.raw) for p in plans]
         all_masks = [m for _, m in blinded]
         extras = self.maskstore.stage_insert(table, all_masks)
@@ -539,26 +650,49 @@ class NoKeyClient:
             rows.append(row)
         rowids = self.server.insert_many(table, rows)
         self.maskstore.commit_insert(table, rowids, all_masks, extras)
-        self._fhe_tag_rows(table, [(rid, p.raw, r) for rid, p, r in zip(rowids, plans, rows)])
+        tags = self._fhe_tag_rows(table, [(rid, p.raw, r) for rid, p, r in zip(rowids, plans, rows)])
+        if snap is not None:
+            for rid, r in zip(rowids, rows):
+                self._anchor_inserted(snap, rid, r, tags)
         return len(rowids)
 
-    def _fhe_tag_rows(self, table: str, rows: list) -> None:
+    def insert_many(self, sqls: list[str]) -> int:
+        return self._anchored_stmt(lambda: self._insert_many(sqls))
+
+    def _anchor_parts(self, table: str, row: dict, tags: dict, rid: int):
+        """(plain values, [(nonce, sha256(cell), sha256(tag))]) of a row as the server stores it."""
+        from .fhe_anchor import sha256
+        cols = self._schema[table]
+        vals = tuple(row.get(c) for (c, _t, p) in cols if p == "plain")
+        fp = tuple((row.get(_fnonce_col(c)), sha256(row.get(c)), sha256(tags.get((rid, c))))
+                   for (c, _t, p) in cols if p == "fhe")
+        return vals, fp
+
+    def _anchor_inserted(self, snap, rid: int, row: dict, tags: dict) -> None:
+        vals, fp = self._anchor_parts(snap.table, row, tags, rid)
+        self._amgr.record_insert(snap, rid, vals, fp)
+
+    def _fhe_tag_rows(self, table: str, rows: list) -> dict:
         """Authenticated FHE columns: now that the row ids are known, replace each
         placeholder tag by the row-id-bound one (the driver runs this inside a
         transaction, so a crash cannot leave a half-tagged row)."""
         if not self.authenticated:
-            return
+            return {}
         fcols = [c for (c, _t, p) in self._schema[table] if p == "fhe"]
         if not fcols:
-            return
+            return {}
         key = self._fhe_key()
         items = []
+        tags = {}
         for rowid, q, row in rows:
             given = dict(zip(q.columns, q.values))
             for c in fcols:
                 v = self._fhe_int(_literal_to_value(given[c], self._coltype[(table, c)]), c)
-                items.append((rowid, _fmac_col(c), key.tag(v, table, c, rowid, row[_fnonce_col(c)])))
+                tag = key.tag(v, table, c, rowid, row[_fnonce_col(c)])
+                items.append((rowid, _fmac_col(c), tag))
+                tags[(rowid, c)] = tag
         self._write_cells(table, items)
+        return tags
 
     def _write_cells(self, table: str, items: list) -> None:
         """One round trip for a batch of cell updates (falls back to one call per cell for
@@ -578,16 +712,29 @@ class NoKeyClient:
 
     def needs_transaction(self, sql: str) -> bool:
         """True when executing ``sql`` takes more than one server write that must be atomic
-        (INSERT into a table with authenticated FHE columns)."""
+        (INSERT into a table with authenticated FHE columns) — and, in anchored mode, every
+        write to a table with FHE columns (the anchor is committed with the transaction)."""
         if not self.authenticated:
             return False
         try:
             plan = plan_query(parse(sql), _CatalogView(self._schema))
         except Exception:                                # noqa: BLE001 — the real run reports it
             return False
-        return plan.kind == "insert" and any(p == "fhe" for (_c, _t, p) in self._schema[plan.table])
+        if plan.kind == "insert" and any(p == "fhe" for (_c, _t, p) in self._schema[plan.table]):
+            return True
+        if self._amgr is None:
+            return False
+        if plan.kind in ("update", "delete", "drop"):
+            return self._an(plan.table)
+        if plan.kind == "drop_if_exists":
+            return self._amgr.anchor.get(plan.table) is not None
+        if plan.kind == "create":
+            return any(c.policy == "fhe" for c in _spec_columns(plan.raw))
+        return False
 
     def _forget_table(self, table: str) -> None:
+        if self._amgr is not None:
+            self._amgr.snaps.pop(table, None)
         self._schema.pop(table, None)
         for d in (self._coltype, self._colpolicy):
             for k in [k for k in d if k[0] == table]:
@@ -599,7 +746,8 @@ class NoKeyClient:
         q = plan.raw
         table = q.table
         self._require_trusted(table)
-        idxs = self.server.matching_rowids(table, plan.where)
+        asnap = self._amgr.write_snapshot(table) if self._an(table) else None
+        idxs = self._matching_ids(table, plan.where)
         per_row = []                                  # (rowid, masks, [(col, cell)])
         for i in idxs:
             masks: dict[str, int] = {}
@@ -625,6 +773,7 @@ class NoKeyClient:
                         cells.append((_mac_col(col), mblind))
                         masks[_mac_col(col)] = mr
             per_row.append((i, masks, cells))
+        new_recs = self._anchor_updated(asnap, table, per_row) if asnap is not None else []
         items = [(i, m) for i, m, _ in per_row if m]
         # new masks are persisted (under a new version) BEFORE any cell changes
         extras = self.maskstore.stage_update(table, items) if items else []
@@ -636,10 +785,41 @@ class NoKeyClient:
         self._write_cells(table, batch)
         if items:
             self.maskstore.commit_update(table, items, extras)
+        for i, vals, fp in new_recs:
+            self._amgr.record_update(asnap, i, vals, fp)
         return len(idxs)
+
+    def _anchor_updated(self, snap, table: str, per_row: list) -> list:
+        """New (plain values, FHE parts) of every updated row, from the verified snapshot plus
+        the assignments (computed before anything is written)."""
+        from .fhe_anchor import sha256
+        pidx = {c: k for k, c in enumerate(snap.plain_cols)}
+        fidx = {c: k for k, c in enumerate(snap.fhe_cols)}
+        out = []
+        for i, _masks, cells in per_row:
+            old = snap.rows.get(i)
+            if old is None:
+                raise IntegrityError(f"row {i} of {table!r} is not part of the anchored table state")
+            vals, fp = list(old.vals), list(old.fhe)
+            got = dict(cells)
+            for col, v in cells:
+                if col in pidx and self._colpolicy[(table, col)] == "plain":
+                    vals[pidx[col]] = v
+            for col, k in fidx.items():
+                if col in got:
+                    fp[k] = (got[_fnonce_col(col)], sha256(got[col]), sha256(got[_fmac_col(col)]))
+            out.append((i, tuple(vals), tuple(fp)))
+        return out
 
     # — DELETE: tombstone the matched rows (rowids/masks stay stable) —
     def _delete(self, plan: Plan) -> int:
+        if self._an(plan.table):
+            snap = self._amgr.write_snapshot(plan.table)
+            idxs = self._matching_ids(plan.table, plan.where)
+            self.server.delete_rows(plan.table, idxs)
+            for i in idxs:
+                self._amgr.record_delete(snap, i)
+            return len(idxs)
         idxs = self.server.matching_rowids(plan.table, plan.where)
         return self.server.delete_rows(plan.table, idxs)
 
@@ -692,13 +872,13 @@ class NoKeyClient:
     def _base_tuples(self, plan, inst, names, loc, qualified):
         first = names[0]
         push, post = self._split_where(plan.where, first, qualified)
-        left_ids = self.server.matching_rowids(inst[first], push)
+        left_ids = self._matching_ids(inst[first], push)
         tuples: list[tuple] = [(i,) for i in left_ids]
         pos = {a: k for k, a in enumerate(names)}
 
         for j in plan.joins or []:
-            right_ids = self.server.matching_rowids(j.table, None)
-            right_keys = self.server.plain_cells(j.table, j.right_col, right_ids)
+            right_ids = self._matching_ids(j.table, None)
+            right_keys = self._plain_cells(j.table, j.right_col, right_ids)
             right_map: dict = {}
             for ridx, rkey in zip(right_ids, right_keys):
                 if rkey is not None:                # NULL never equals NULL
@@ -762,7 +942,7 @@ class NoKeyClient:
     # — fetch a plain column for (possibly None) rowids, batched + deduped —
     def _ids_to_cells(self, table: str, col: str, ids: list) -> list:
         uniq = sorted({i for i in ids if i is not None})
-        got = dict(zip(uniq, self.server.plain_cells(table, col, uniq))) \
+        got = dict(zip(uniq, self._plain_cells(table, col, uniq))) \
             if uniq else {}
         return [got.get(i) if i is not None else None for i in ids]
 
@@ -778,18 +958,30 @@ class NoKeyClient:
     def _reveal_many(self, table: str, col: str, idxs: list[int]) -> list:
         policy = self._colpolicy[(table, col)]
         if policy == "plain":
-            return self.server.plain_cells(table, col, idxs)
+            return self._plain_cells(table, col, idxs)
         if policy == "fhe":
             key = self._fhe_key()
-            cells = self.server.plain_cells(table, col, idxs)
+            cells = self._guard(table, lambda: self.server.plain_cells(table, col, idxs))
             # batch entry points (threshold keys open many cells in few quorum rounds);
             # keys without them are driven cell by cell
             if not self.authenticated:
                 if hasattr(key, "decrypt_cells"):
                     return key.decrypt_cells(cells)
                 return [key.decrypt_cell(c) for c in cells]
-            tags = self.server.plain_cells(table, _fmac_col(col), idxs)
-            nonces = self.server.plain_cells(table, _fnonce_col(col), idxs)
+            tags = self._guard(table, lambda: self.server.plain_cells(table, _fmac_col(col), idxs))
+            if self._an(table):
+                # nonces come from the verified snapshot, never from the server, and the bytes
+                # fetched now must be the very cells/tags the anchored state was built from
+                from .fhe_anchor import sha256
+                parts = self._amgr.snapshot(table).fhe_part(col, idxs)
+                nonces = [p[0] for p in parts]
+                for j, (c, t, p) in enumerate(zip(cells, tags, parts)):
+                    if sha256(c) != p[1] or sha256(t) != p[2]:
+                        raise IntegrityError(
+                            f"{table}.{col} row {idxs[j]}: the cell or its tag differs from the "
+                            f"anchored table state (altered or replayed by the server)")
+            else:
+                nonces = self.server.plain_cells(table, _fnonce_col(col), idxs)
             if hasattr(key, "decrypt_cells_verified"):
                 return key.decrypt_cells_verified(cells, tags, table, col, idxs, nonces)
             return [key.decrypt_cell_verified(c, t, table, col, i, n)
@@ -885,7 +1077,7 @@ class NoKeyClient:
             return self._reveal_col(table, bare, all_ids)
         if isinstance(p, (PMin, PMax)):
             table, bare, lv = live(p.column)
-            vals = [v for v in self.server.plain_cells(table, bare, lv)
+            vals = [v for v in self._plain_cells(table, bare, lv)
                     if v is not None] if lv else []
             if not vals:
                 return None
@@ -900,7 +1092,7 @@ class NoKeyClient:
             if self._colpolicy[(table, bare)] == "fhe":
                 return Fraction(self._fhe_sum(table, bare, lv), len(lv)) if lv else None
             if self._colpolicy[(table, bare)] == "plain":
-                vals = [v for v in self.server.plain_cells(table, bare, lv)
+                vals = [v for v in self._plain_cells(table, bare, lv)
                         if v is not None] if lv else []
                 if not vals:
                     return None
@@ -975,11 +1167,11 @@ class NoKeyClient:
         step = min(self._FHE_SUM_CHUNK, int(self._fhe_limits().get("max_sum_rows") or 10**9))
         for i in range(0, len(idxs), step):
             part_ids = idxs[i:i + step]
-            part = self.server.fhe_sum(table, col, part_ids, k)
+            part = self._guard(table, lambda: self.server.fhe_sum(table, col, part_ids, k))
             total = part if total is None else fhe.add_sums(total, part)
             if self.authenticated:
                 try:
-                    tpart = self.server.fhe_sum(table, _fmac_col(col), part_ids, k)
+                    tpart = self._guard(table, lambda: self.server.fhe_sum(table, _fmac_col(col), part_ids, k))
                 except Exception as exc:                       # noqa: BLE001
                     if "integrity tag" in str(exc):
                         raise IntegrityError(f"{table}.{col} has no integrity tags — it was "
@@ -988,7 +1180,10 @@ class NoKeyClient:
                 tags = tpart if tags is None else fhe.add_sums(tags, tpart)
         if not self.authenticated:
             return key.decrypt_sum(total)
-        nonces = self.server.plain_cells(table, _fnonce_col(col), idxs)
+        if self._an(table):                       # the nonces are part of the anchored state
+            nonces = [p[0] for p in self._amgr.snapshot(table).fhe_part(col, idxs)]
+        else:
+            nonces = self.server.plain_cells(table, _fnonce_col(col), idxs)
         return key.decrypt_sum_verified(total, tags, table, col, idxs, k, nonces)
 
     def _fhe_dot(self, lt, lc, lids, rt, rc, rids) -> int:

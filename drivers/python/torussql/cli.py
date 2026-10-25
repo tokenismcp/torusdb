@@ -164,6 +164,12 @@ def _parser() -> argparse.ArgumentParser:
     ap.add_argument("--trust-server-schema", action="store_true",
                     help="allow writes to tables whose schema was learned from the server")
     ap.add_argument("--authenticated", action="store_true", help="enable integrity MACs")
+    ap.add_argument("--integrity-anchor", metavar="PATH",
+                    help="owner-trusted anchor file (needs --authenticated and an FHE key): verifies "
+                         "the row set and freshness of FHE tables; keep it away from the server")
+    ap.add_argument("--adopt-table", metavar="TABLE", action="append", default=[],
+                    help="trust-on-first-use: record TABLE's current server state in the anchor, "
+                         "then continue (repeatable)")
     ap.add_argument("--fhe-key", metavar="PATH", help="FHE key file (for FHE columns)")
     ap.add_argument("--fhe-pass-env", metavar="VAR", help="env var with the FHE key passphrase")
     ap.add_argument("--fhe-keygen", metavar="PATH",
@@ -273,10 +279,20 @@ def main(argv=None) -> int:
                              tls_insecure=a.tls_insecure, token=token,
                              vault_path=a.vault, vault_passphrase=passphrase,
                              authenticated=a.authenticated,
-                             trust_server_schema=a.trust_server_schema, fhe_key=fhe_key)
+                             trust_server_schema=a.trust_server_schema, fhe_key=fhe_key,
+                             integrity_anchor=a.integrity_anchor)
     except Exception as exc:                                    # noqa: BLE001
         print(f"torussql: could not connect to {a.host}:{a.port}: {exc}", file=sys.stderr)
         return 1
+    for t in a.adopt_table:
+        try:
+            info = conn.adopt_table(t)
+        except Exception as exc:                                # noqa: BLE001
+            print(f"torussql: adopt_table({t}): {exc}", file=sys.stderr)
+            conn.close()
+            return 1
+        print(f"adopted {t}: {info['rows']} rows at epoch {info['epoch']} (trust on first use)",
+              file=sys.stderr)
     sh = Shell(conn, timing=a.timing)
     try:
         if a.command or a.file:

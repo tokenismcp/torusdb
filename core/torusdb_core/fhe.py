@@ -215,7 +215,8 @@ class _OwnerOps:
     #       tag-sum point  ==  α · value-sum point  +  k · (Σ_{i∈I} γᵢ)·P
     # (k = public scalar multiplier). A server that alters a value, drops/duplicates/swaps a
     # row, or scales a result cannot satisfy it without α and γ (soundness ≈ 1/n per attempt).
-    # Not covered: replaying an older version of the same cell; ct×ct (DOT) results.
+    # Not covered by the tags alone: replaying an older version of the same cell, the set of rows,
+    # and ct×ct (DOT) results — the first two are covered in anchored mode (fhe_anchor.py).
     def _prf(self, label: bytes, *parts) -> int:
         h = hmac.new(self._mac_secret(), b"torussql/fhe/" + label, hashlib.sha256).digest()
         msg = b"\x00".join(str(p).encode() for p in parts)
@@ -224,6 +225,16 @@ class _OwnerOps:
     @property
     def alpha(self) -> int:
         return self._prf(b"alpha") or 1
+
+    def anchor_leaf(self, table: str, rowid: int, material: bytes) -> int:
+        """Leaf of one row for the anchored table state (``fhe_anchor``): a PRF of the table,
+        the row id and the canonical row material, under a key derived from the MAC secret with
+        its own domain label (``anchor-leaf``) — independent of α and γ. The server cannot
+        compute it, so it cannot present a table state other than the anchored one."""
+        k = hmac.new(self._mac_secret(), b"torussql/fhe/anchor-leaf", hashlib.sha256).digest()
+        t = table.encode("utf-8")
+        msg = len(t).to_bytes(4, "big") + t + int(rowid).to_bytes(8, "big") + material
+        return int.from_bytes(hmac.new(k, msg, hashlib.sha512).digest(), "big") % N
 
     def gamma(self, table: str, col: str, rowid: int, nonce: int) -> int:
         """Per-WRITE tweak: ``nonce`` is a fresh random number stored next to the cell and

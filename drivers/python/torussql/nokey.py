@@ -104,6 +104,9 @@ _ENGINE_TYPE_MAP = {
     "IntegrityError":  IntegrityError,
     "OutOfBudget":     DataError,
     "ExecError":       DataError,
+    "AnchorMissingError": ProgrammingError,
+    "AnchorConflict":  OperationalError,
+    "AnchorFileError": OperationalError,
 }
 
 
@@ -112,9 +115,9 @@ def _translate_error(exc: Exception) -> DatabaseError:
     if isinstance(exc, DatabaseError):
         return exc
     # Local engine raises (ParseError / PlanError / ...) — match by class name
-    type_name = type(exc).__name__
-    if type_name in _ENGINE_TYPE_MAP:
-        return _ENGINE_TYPE_MAP[type_name](str(exc))
+    for klass in type(exc).__mro__:                  # subclasses (StaleServerError, ...) map like their base
+        if klass.__name__ in _ENGINE_TYPE_MAP:
+            return _ENGINE_TYPE_MAP[klass.__name__](str(exc))
     # Wire-level errors arrive as OperationalError with "TypeName: msg" text
     msg = str(exc)
     prefix = msg.split(":")[0].strip()
@@ -283,6 +286,42 @@ class RemoteNoKeyServer:
     def fhe_dot(self, lt, lc, lids, rt, rc, rids, backend=None):
         args = [lt, lc, lids, rt, rc, rids] + ([backend] if backend else [])
         return _b64d(self._c.call("fhe_dot", args))
+
+    def fhe_rows(self, table, start, count):
+        """Scan of an anchored table (see ``torusdb_core.fhe_anchor``): -> (slots, rows) exactly
+        like ``NoKeyServer.fhe_rows``. The reply is parsed strictly; anything malformed is
+        reported as an integrity failure (a lying server is the only source)."""
+        r = self._c.call("fhe_rows", [table, start, count])
+
+        def bad(why):
+            return IntegrityError(f"malformed fhe_rows reply from the server ({why})")
+
+        def h(x):
+            if x is None:
+                return None
+            if not isinstance(x, str) or len(x) != 64:
+                raise bad("cell hash")
+            try:
+                return bytes.fromhex(x)
+            except ValueError:
+                raise bad("cell hash") from None
+        try:
+            n, rows = r["n"], r["rows"]
+            if not isinstance(rows, list):
+                raise bad("rows")
+            out = []
+            for ent in rows:
+                if len(ent) == 2:
+                    out.append((ent[0], True, None, None))
+                else:
+                    rid, _dead, plain, fp = ent
+                    out.append((rid, False, [w.uwv(v) for v in plain],
+                                [(w.uwv(a), h(b), h(c)) for a, b, c in fp]))
+            return n, out
+        except IntegrityError:
+            raise
+        except (KeyError, TypeError, ValueError, AttributeError) as exc:
+            raise bad(str(exc)) from None
 
     def create_index(self, table, col):
         self._c.call("create_index", [table, col])
@@ -598,7 +637,14 @@ class Connection:
                  fhe_key=None,
                  fhe_allow_unverified_dot: bool = False,
                  fhe_dot_mode: str = "auto",
+                 integrity_anchor=None,
+                 integrity_anchor_max_rows: int | None = None,
                  timeout: float | None = 30.0):
+        if integrity_anchor is not None and not authenticated:
+            raise ProgrammingError("integrity_anchor needs authenticated=True")
+        if integrity_anchor is not None and fhe_key is None:
+            raise ProgrammingError("integrity_anchor needs fhe_key=... (the anchor is keyed by "
+                                   "the owner's MAC secret)")
         if mask_cluster is not None and (vault_path or vault_passphrase or vault_custody):
             raise ProgrammingError(
                 "mask_cluster replaces the local vault — do not combine it with "
@@ -619,12 +665,19 @@ class Connection:
         self._tx_failed: str | None = None       # set when a statement failed mid-transaction
         self._vault = None
         self.client = None
+        self._amgr = None
         try:
             self.client = NoKeyClient(RemoteNoKeyServer(self._wire),
                                       authenticated=authenticated,
                                       maskstore=mask_cluster, fhe=fhe_key,
                                       fhe_allow_unverified_dot=fhe_allow_unverified_dot,
-                                      fhe_dot_mode=fhe_dot_mode)
+                                      fhe_dot_mode=fhe_dot_mode,
+                                      integrity_anchor=integrity_anchor,
+                                      integrity_anchor_max_rows=integrity_anchor_max_rows)
+            self._amgr = self.client._amgr
+            if self._amgr is not None:
+                self._amgr.managed = True
+                self._amgr.tx_status = lambda txid: self._wire.call("tx_status", [txid])
             if mask_cluster is not None:
                 if authenticated and not self.client.authenticated:
                     raise ProgrammingError(
@@ -642,6 +695,13 @@ class Connection:
                 self._settle(txid)
             if sync_schema:
                 self.sync_schema()
+            if self._amgr is not None:
+                try:
+                    self._amgr.settle_pending()  # a commit that crashed after "pending": scan, finish or abort
+                except DatabaseError:
+                    raise
+                except Exception as exc:         # noqa: BLE001
+                    raise _translate_error(exc) from exc
         except BaseException:
             self._cleanup()
             raise
@@ -750,12 +810,16 @@ class Connection:
             self._vault.tx_rollback(self.client)       # tx_begin failed ⇒ no tx exists
             raise
         self._in_tx, self._txid, self._tx_failed = True, txid, None
+        if self._amgr is not None:
+            self._amgr.begin(txid)
 
     def _abort_local(self) -> None:
         """The server has (definitively) rolled the transaction back."""
         if self._in_tx:
             self._in_tx, self._txid, self._tx_failed = False, None, None
             self._vault.tx_rollback(self.client)
+            if self._amgr is not None:
+                self._amgr.abort()
 
     @_synchronized
     def _end_tx(self, *, commit: bool) -> None:
@@ -765,6 +829,16 @@ class Connection:
             self._rollback_best_effort()
             raise ProgrammingError(f"the transaction was aborted by an earlier error "
                                    f"({reason}); it has been rolled back")
+        if commit and self._amgr is not None:
+            # the new anchor state is recorded as PENDING before the server is asked to commit:
+            # whatever happens next, the owner can tell which of the two states it is looking at
+            try:
+                self._amgr.prepare()
+            except BaseException as exc:
+                self._rollback_best_effort()
+                if isinstance(exc, Exception):
+                    raise _translate_error(exc) from exc
+                raise
         try:
             self._wire.call("tx_commit" if commit else "tx_rollback", [])
         except ConnectionLost as exc:
@@ -778,8 +852,18 @@ class Connection:
         self._in_tx, self._txid, self._tx_failed = False, None, None
         if commit:
             self._vault.tx_commit()
+            if self._amgr is not None:
+                self._finish_anchor()
         else:
             self._vault.tx_rollback(self.client)
+            if self._amgr is not None:
+                self._amgr.abort()
+
+    def _finish_anchor(self) -> None:
+        try:
+            self._amgr.finish()
+        except Exception as exc:                                     # noqa: BLE001
+            raise _translate_error(exc) from exc
 
     def _rollback_best_effort(self) -> None:
         try:
@@ -799,6 +883,8 @@ class Connection:
         except Error:
             self._in_tx = False
             self._vault.tx_in_doubt()
+            if self._amgr is not None:
+                self._amgr.detach()       # the anchor keeps `pending`; the next connect settles it by scanning
             self._closed = True
             self._vault.close()           # leaves the open `txb`; next connect settles it
             raise TransactionInDoubt(
@@ -811,6 +897,8 @@ class Connection:
             fresh.close()
             self._in_tx = False
             self._vault.tx_in_doubt()
+            if self._amgr is not None:
+                self._amgr.detach()
             self._closed = True
             self._vault.close()
             raise TransactionInDoubt(
@@ -821,8 +909,12 @@ class Connection:
         self._in_tx, self._txid, self._tx_failed = False, None, None
         if status == "committed":
             self._vault.tx_commit()       # it did commit: keep the new masks
+            if self._amgr is not None:
+                self._finish_anchor()
             return
         self._vault.tx_rollback(self.client)
+        if self._amgr is not None:
+            self._amgr.abort()
         raise OperationalError(f"COMMIT of transaction {txid} did not take effect "
                                f"(connection lost before it was processed); rolled back") from exc
 
@@ -855,8 +947,7 @@ class Connection:
         try:
             if kind == "Select":
                 return self.client.execute(sql)
-            implicit = ((kind == "Update"
-                         or (kind == "Insert" and self.client.needs_transaction(sql)))
+            implicit = ((kind == "Update" or self.client.needs_transaction(sql))
                         and not self._in_tx)
             if implicit:
                 self.begin()
@@ -914,6 +1005,40 @@ class Connection:
             if isinstance(exc, Exception):
                 raise _translate_error(exc) from exc
             raise
+
+    # ── anchored table state (integrity_anchor=) ──────────────────────────
+    def _need_anchor(self):
+        self._check_open()
+        if self._amgr is None:
+            raise ProgrammingError("no integrity_anchor is configured for this connection")
+        return self.client
+
+    @_synchronized
+    def adopt_table(self, table: str, replace: bool = False) -> dict:
+        """Trust-on-first-use: scan ``table`` on the server now and record that state in the
+        integrity anchor. Only as honest as the server at this moment — use it once, for a table
+        that existed before the anchor did."""
+        c = self._need_anchor()
+        if self._in_tx:
+            raise ProgrammingError("finish the transaction first")
+        try:
+            return c.adopt_table(table, replace)
+        except DatabaseError:
+            raise
+        except Exception as exc:
+            raise _translate_error(exc) from exc
+
+    @_synchronized
+    def verify_table(self, table: str) -> dict:
+        """Rescan ``table`` and check it against the anchor (O(rows)); raises IntegrityError
+        when rows were added, dropped, rolled back or altered."""
+        c = self._need_anchor()
+        try:
+            return c.verify_table(table)
+        except DatabaseError:
+            raise
+        except Exception as exc:
+            raise _translate_error(exc) from exc
 
     # ── convenience / legacy API ──────────────────────────────────────────
 
@@ -1076,6 +1201,8 @@ def connect(host: str = "127.0.0.1", port: int = 8533, *,
             fhe_key=None,
             fhe_allow_unverified_dot: bool = False,
             fhe_dot_mode: str = "auto",
+            integrity_anchor=None,
+            integrity_anchor_max_rows: int | None = None,
             timeout: float | None = 30.0) -> Connection:
     """Open a PEP 249 connection to a no-key TorusDB server.
 
@@ -1107,6 +1234,14 @@ def connect(host: str = "127.0.0.1", port: int = 8533, *,
             multiplies the plaintexts: verified, O(n) decryptions) or ``"auto"`` (default:
             delegated without ``authenticated``, local with it)
         fhe_allow_unverified_dot: legacy; with ``authenticated=True`` it selects ``"delegated"``
+        integrity_anchor: a file path (or a ``torusdb_core.fhe_anchor.Anchor``) holding the owner-trusted
+            root/count/epoch of every table with FHE columns. Needs ``authenticated=True`` and ``fhe_key``.
+            It makes row sets (WHERE results, COUNT/AVG denominators, deleted rows) and freshness
+            (rollback / replay of a complete old row or table) verifiable, at the cost of an O(rows)
+            scan per anchor epoch and ~0.5 KB of owner memory per row. Without it there is NO row-set
+            integrity and NO freshness for FHE tables. See docs/fhe-columns.md.
+        integrity_anchor_max_rows: refuse to anchor a table with more slots than this
+            (default 1,000,000: the verified snapshot lives in memory, ~0.6 KB per row)
         trust_server_schema: allow INSERT/UPDATE on tables whose column policies
             were learned from the server (default: they are read-only, because a
             malicious server could relabel an encrypted column "plain"). Tables
@@ -1122,4 +1257,5 @@ def connect(host: str = "127.0.0.1", port: int = 8533, *,
                       vault_custody=vault_custody, mask_cluster=mask_cluster,
                       sync_schema=sync_schema, trust_server_schema=trust_server_schema,
                       fhe_key=fhe_key, fhe_allow_unverified_dot=fhe_allow_unverified_dot,
-                      fhe_dot_mode=fhe_dot_mode, timeout=timeout)
+                      fhe_dot_mode=fhe_dot_mode, integrity_anchor=integrity_anchor,
+                      integrity_anchor_max_rows=integrity_anchor_max_rows, timeout=timeout)

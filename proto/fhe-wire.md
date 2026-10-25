@@ -55,6 +55,7 @@ cell    = C1 ‖ C2 ‖ D1 ‖ D2                                       384 byte
 | `plain_cells` | `[table, col, ids]` (also `__fmac__<col>`) | list of binary values |
 | `fhe_sum` | `[table, col, ids, k?]` (col may be `__fmac__<col>`; ≤ 5000 ids) | base64 SUM blob |
 | `fhe_dot` | `[ltable, lcol, lids, rtable, rcol, rids, backend?]` (≤ 300 ids pyecc / 6000 mcl) | base64 DOT blob |
+| `fhe_rows` | `[table, start, count]` (read role; `0 ≤ count ≤ 2000`, advertised as `hello.limits.fhe.max_scan_rows`) | `{"n": slots, "rows": [...]}` — see below |
 
 Details clients must know:
 * `fhe_sum`'s `k` is an integer with |k| ≤ 2^40 (server-enforced); `fhe_sum` / `fhe_dot` return a plain
@@ -68,3 +69,23 @@ Details clients must know:
 
 Column policy is `fhe` (`INT` only). The server accepts only valid 384-byte cells in FHE columns and never
 binary values elsewhere. Clients must chunk requests below the caps and combine partial blobs themselves.
+
+## `fhe_rows` — scan for the anchored table state (optional; Python driver)
+
+Used only when the owner is configured with an integrity anchor (`docs/fhe-columns.md`, "Anchored table-state
+integrity"). `n` is the number of row slots in the table (live and dead; slot ids are never reused). `rows` lists the
+slots `start .. min(n, start+count)-1` in order, each as
+
+* `[rowid, 1]` — a dead (deleted) slot, no data; or
+* `[rowid, 0, [plain…], [[nonce, h_cell, h_tag], …]]` — a live row: `plain` are the wire values of the table's PLAIN
+  columns in schema order; for every FHE column in schema order `nonce` is the wire value of `__fnonce__<col>`
+  (`{"t":"n"}` if absent) and `h_cell`, `h_tag` are the lowercase-hex SHA-256 of the stored cell and of
+  `__fmac__<col>` (`null` if absent).
+
+The answer is computed by the untrusted server and is never trusted by itself: the owner recomputes
+`leaf = PRF(K_anchor, "leaf", table, rowid, material) mod n` per live row and compares `Σ leaf` and the row count with
+its anchor. `material` is the canonical byte string `b"torussql/anchor/row/v1" ‖ SHA-256(JSON([table, schema])) ‖
+fields`, where each field is `tag(1) ‖ len(4, big-endian) ‖ payload`: per PLAIN value `n`/`i`/`s`/`f`/`x` (`i` =
+decimal integer — also for bool and for a fraction with denominator 1; `f` = `num/den`; `s` UTF-8; `x` bytes) and per
+FHE column the nonce (as a PLAIN value), `c` = h_cell (32 raw bytes or empty) and `t` = h_tag. `leaf`'s PRF is
+`HMAC-SHA512(HMAC-SHA256(mac_secret, "torussql/fhe/anchor-leaf"), len(table)(4) ‖ table ‖ rowid(8) ‖ material)`.
