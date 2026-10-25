@@ -9,24 +9,30 @@ use torusdb::*;
 mod common;
 use common::*;
 
+/// Run `openssl` with `args`; false when it is missing or fails.
+fn openssl(args: &[&str]) -> bool {
+    Command::new("openssl").args(args).output().map(|o| o.status.success()).unwrap_or(false)
+}
+
+/// A throw-away CA that signs a separate server certificate (as in production):
+/// a CA certificate used directly as the server certificate is refused by rustls.
 fn tls_server() -> Option<(Server, Vec<u8>)> {
     let dir = tmpdir("tls");
-    let (cert, key) = (dir.join("c.pem"), dir.join("k.pem"));
-    let ok = Command::new("openssl")
-        .args(["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout"])
-        .arg(&key)
-        .arg("-out")
-        .arg(&cert)
-        .args(["-days", "2", "-subj", "/CN=localhost", "-addext", "subjectAltName=DNS:localhost,IP:127.0.0.1"])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
+    let p = |n: &str| dir.join(n).to_str().unwrap().to_string();
+    let (ca_key, ca_crt, key, csr, crt, ext) =
+        (p("ca.key"), p("ca.pem"), p("k.pem"), p("s.csr"), p("c.pem"), p("ext.cnf"));
+    std::fs::write(&ext, "subjectAltName=DNS:localhost,IP:127.0.0.1\nbasicConstraints=CA:FALSE\n").unwrap();
+    let ok = openssl(&["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", &ca_key, "-out", &ca_crt,
+                       "-days", "2", "-subj", "/CN=torusdb-test-ca"])
+        && openssl(&["req", "-newkey", "rsa:2048", "-nodes", "-keyout", &key, "-out", &csr, "-subj", "/CN=localhost"])
+        && openssl(&["x509", "-req", "-in", &csr, "-CA", &ca_crt, "-CAkey", &ca_key, "-CAcreateserial",
+                     "-out", &crt, "-days", "2", "-extfile", &ext]);
     if !ok {
         eprintln!("SKIP: openssl cannot generate a certificate");
         return None;
     }
-    let s = Server::start(&["--tls", "--cert", cert.to_str().unwrap(), "--key", key.to_str().unwrap()])?;
-    Some((s, std::fs::read(&cert).unwrap()))
+    let s = Server::start(&["--tls", "--cert", &crt, "--key", &key])?;
+    Some((s, std::fs::read(&ca_crt).unwrap()))
 }
 
 fn opts() -> ConnectOptions {
