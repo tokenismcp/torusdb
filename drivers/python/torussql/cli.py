@@ -211,8 +211,8 @@ def _parser() -> argparse.ArgumentParser:
     ap.add_argument("-c", "--command", action="append", metavar="SQL")
     ap.add_argument("-f", "--file", metavar="PATH")
     ap.add_argument("--timing", action="store_true")
-    ap.add_argument("--version", action="version", version=f"torussql {nokey.__version__}"
-                    if hasattr(nokey, "__version__") else "torussql")
+    from . import __version__ as _ver
+    ap.add_argument("--version", action="version", version=f"torussql {_ver}")
     return ap
 
 
@@ -244,6 +244,14 @@ def _threshold_key(a):
 
 
 def main(argv=None) -> int:
+    try:
+        return _main(argv)
+    except ImportError as exc:        # e.g. FHE columns without the optional py_ecc package
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+
+def _main(argv=None) -> int:
     a = _parser().parse_args(argv)
     fhe_pass = os.environ.get(a.fhe_pass_env) if a.fhe_pass_env else None
     if a.fhe_pass_env and not fhe_pass:

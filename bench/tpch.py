@@ -12,9 +12,9 @@ monetary (price, discount, tax) and quantity columns are encrypted; the
 categorical and date-like columns remain PLAIN for WHERE/GROUP BY filtering.
 
 Usage:
-    python torussql/bench/tpch.py                  # default 1000 rows
-    python torussql/bench/tpch.py --rows 10000
-    python torussql/bench/tpch.py --rows 100 --json results_tpch.json
+    python bench/tpch.py                  # default 1000 rows
+    python bench/tpch.py --rows 10000
+    python bench/tpch.py --rows 100 --json results_tpch.json
 """
 from __future__ import annotations
 

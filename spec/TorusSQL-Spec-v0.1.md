@@ -404,7 +404,7 @@ typed error from a fixed set (parse / policy-violation / unsupported-
 capability / range). It MUST NOT, under any input this spec admits, produce
 a result by decrypting an `ENC`/`PAIRED` value server-side.
 
-The conformance test suite lives at `torussql/spec/conformance/` (TBD) and
+The conformance test suite lives at `spec/conformance/` and
 is the normative definition where this prose is ambiguous.
 
 ---

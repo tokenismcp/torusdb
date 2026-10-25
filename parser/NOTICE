@@ -1,0 +1,14 @@
+TorusSQL
+Copyright 2026 J1729 Labs
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+SCOPE. The Apache-2.0 license covers everything in THIS repository: the
+TorusSQL dialect (spec/), the open parser and static validator (parser/), the
+keyless engine (core/), the client drivers (drivers/) including the `torussql`
+shell, the keyless server (server/), the wire protocol (proto/), benchmarks,
+fuzz/conformance suites and docs.
+
+Nothing in this repository requires any proprietary component. TorusDB's
+separate commercial products (e.g. the full homomorphic-encryption engine) are
+not part of, and not needed by, this software.

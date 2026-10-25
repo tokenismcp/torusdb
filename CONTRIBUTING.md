@@ -6,7 +6,8 @@ Thanks for helping. A few ground rules keep the project safe to depend on.
 
 ```bash
 git clone <repo> && cd torussql
-pip install pytest "py_ecc>=6,<9"
+python3.12 -m venv .venv && source .venv/bin/activate            # Python >= 3.11 (3.10 for the parser alone)
+pip install pytest "py_ecc>=6,<9"                                # optional: mclbn256 for the native FHE back end
 pytest                                           # everything; pure Python, no proprietary parts
 (cd drivers/typescript && npm ci && npm test)
 (cd drivers/rust && cargo test && cargo clippy --all-targets -- -D warnings)

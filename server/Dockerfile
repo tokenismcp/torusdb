@@ -3,11 +3,18 @@
 #
 # Everything in this image is Apache-2.0 and built from this repository.
 #
-#   docker build -f server/Dockerfile -t torusdb-server:0.5.0 .
+#   docker build -f server/Dockerfile -t torusdb-server:0.5.0 .     # run from the repository root
 #
 # Run (a non-loopback bind REQUIRES authentication; this image binds 0.0.0.0):
-#   docker run -p 8533:8533 -v /host/data:/data -v /host/secrets:/secrets:ro \
+#   mkdir -p data secrets
+#   python3 -c "import secrets; print('admin:' + secrets.token_urlsafe(32))" > secrets/tokens
+#   docker run -d --name torusdb -p 8533:8533 -v "$PWD/data:/data" -v "$PWD/secrets:/secrets:ro" \
 #       torusdb-server:0.5.0 --db /data/main.db --token-file /secrets/tokens
+#   # the server runs as uid 1001: on Linux `chown 1001 data` (and make secrets/tokens readable
+#   # by it, e.g. chmod 644 or chown 1001), or use a named volume: -v torusdb-data:/data
+#   # connect from the host (token = the part after "admin:"):
+#   #   export TORUSDB_TOKEN=...; torussql -p 8533 --token-env TORUSDB_TOKEN --vault ./owner.vault
+#   # health: `docker inspect --format '{{.State.Health.Status}}' torusdb` becomes "healthy"
 #   # add TLS:   --tls --cert /secrets/server.crt --key /secrets/server.key
 #   # metrics:   --metrics-port 9433 --metrics-host 0.0.0.0   (publish 9433)
 #   # local dev only:  --insecure-no-auth

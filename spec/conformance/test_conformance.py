@@ -6,8 +6,8 @@ this suite passes against it. Each test cites the spec section it pins.
 
 Two kinds of checks:
   • Engine semantics — the exact result / typed error the spec requires.
-  • Open/closed agreement — the open `torussql_parser` validator and the
-    closed engine accept and reject exactly the same statements.
+  • Validator/engine agreement — the open `torussql_parser` validator and the
+    engine accept and reject exactly the same statements.
 """
 from fractions import Fraction
 

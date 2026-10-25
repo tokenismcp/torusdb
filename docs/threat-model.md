@@ -100,9 +100,13 @@ tables (`trust_server_schema`). Details and limits: `masks.md`.
 
 For `FHE` columns the server holds ciphertexts and public parameters only; it can compute
 sums and inner products of them (that is the feature) but cannot decrypt, and it cannot test
-guessed values (independent halves; SXDH). Not covered: **integrity** (a lying server can
-return a wrong ciphertext), malleability (any sum/product of stored cells), and the
-construction itself has had no independent review. Details: `fhe-columns.md`.
+guessed values (independent halves; SXDH). **Integrity is opt-in and partial:** with
+`authenticated=True` cells, `SUM`/`AVG`/`k*SUM` carry row-bound tags and `DOT` is verified by
+re-multiplying at the owner (`fhe_dot_mode="local"`, the default there; a *delegated* `DOT` is
+unverified); with an `integrity_anchor` the row set and freshness are verified too. Without
+`authenticated=True` a lying server can return a wrong ciphertext undetected. Not covered
+either way: malleability (any sum/product of stored cells), and the construction itself has had
+no independent review. Details: `fhe-columns.md`.
 
 ### 2.4 Owner-process adversary
 

@@ -6,8 +6,8 @@ TorusSQL text into an AST and statically enforces the dialect's
 capability/policy/type rules ([spec](../spec/TorusSQL-Spec-v0.1.md) §2, §4).
 
 Drivers use it to reject illegal queries client-side before anything reaches
-the closed TorusDB engine; the engine's planner enforces the same rules
-server-side. This package is the canonical statement of those rules.
+the server; the keyless engine's planner (`torusdb-core`) enforces the same rules
+server-side. This package is the canonical statement of those rules. Python 3.10 or newer.
 
 ```python
 from torussql_parser import parse, Schema, ValidationError
@@ -21,22 +21,23 @@ schema.validate(parse("SELECT rate * hours FROM payroll"))       # ok
 try:
     schema.validate(parse("SELECT id FROM payroll WHERE rate = 5"))
 except ValidationError as e:
-    print(e)   # WHERE on encrypted columns is not supported in v0.1
+    print(e)   # WHERE on encrypted columns is not supported; use a PLAIN column for predicates (column 'rate' is paired)
 ```
 
 ## What it checks
 
-- Grammar (CREATE / DROP / INSERT / SELECT) per the spec.
+- Grammar (CREATE / DROP / INSERT / UPDATE / DELETE / SELECT with joins, GROUP BY, ORDER BY, indexes,
+  transactions) per the current spec, [v0.5](../spec/TorusSQL-Spec-v0.5.md).
 - Policy rules: `SUM`/`k*col` need `ENC`/`PAIRED`; `*` and `DOT` need
   `PAIRED`; `WHERE` only on `PLAIN`.
-- Type rules: `DOT` is `INT`-only in v0.1; `STR` must be `PLAIN`.
+- Type rules: `DOT` is `INT`-only; `STR` must be `PLAIN`.
 
-What it does **not** do: execute, encrypt, decrypt, or talk to an engine.
-That is the closed core's job.
+What it does **not** do: execute, encrypt, decrypt, or talk to an engine or server.
+That is `torusdb-core`'s job (and the `torussql` driver's).
 
 ## Develop
 
 ```bash
-pip install -e ".[test]"
+pip install -e ".[test]"       # from this directory
 pytest
 ```

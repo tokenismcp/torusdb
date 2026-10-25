@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
-// Start a keyless server first:
-//   python torussql/server/nokey_server.py --port 8533
-// then:  cargo run --example demo
+// Start a keyless server first (pip install ./parser ./core ./drivers/python ./server, see
+// docs/GETTING_STARTED.md):
+//   torusdb-server --port 8533
+// then, in drivers/rust:  cargo run --example demo
+// (creates table `emp`; start a fresh server to run it again)
 use num_bigint::BigInt;
 use torusdb::{all, eq_int, CellIn, Client, Column, ConnectOptions, JoinOptions, JoinStep};
 

@@ -21,7 +21,8 @@ weakness we found in shared-randomness paired ciphertexts (a public-key value or
 Which mode to use: `ENC`/`PAIRED` for information-theoretic confidentiality, MAC integrity and
 speed, at the price of a mask vault and owner-side multiplication; `FHE` when you need the
 server to compute products/inner products without owner state, accepting computational
-security, no integrity yet, and slow pairings.
+security, opt-in (tag-based, partial) integrity rather than information-theoretic MACs, and
+slower pairings (`docs/fhe-columns.md`, "Limits").
 
 ## What an "EC-FHE DBMS" means here
 

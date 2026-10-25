@@ -452,8 +452,9 @@ class NoKeyClient:
             raise PlanError(
                 f"table {table!r}: its schema was learned from the server, which could "
                 f"mislabel an encrypted column as plain; refusing to write. Create the "
-                f"table through this vault, or pass trust_server_schema=True after "
-                f"verifying the schema yourself")
+                f"table through this vault (reuse the same vault file that created it: "
+                f"--vault PATH in the shell), or pass trust_server_schema=True "
+                f"(shell: --trust-server-schema) after verifying the schema yourself")
 
     def __post_init__(self):
         if self.maskstore is None:
@@ -1142,7 +1143,8 @@ class NoKeyClient:
     def _fhe_key(self):
         if self.fhe is None:
             raise ExecError("this table has FHE columns but no FHE key is loaded "
-                            "(connect with fhe_key=…)")
+                            "(Python: connect(..., fhe_key=key); shell: torussql --fhe-key PATH "
+                            "— create one once with torussql --fhe-keygen PATH)")
         return self.fhe
 
     @staticmethod

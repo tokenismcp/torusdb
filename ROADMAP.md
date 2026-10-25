@@ -12,7 +12,8 @@ This file states what is *not* done as plainly as what is.
 | Exactness contract with loud overflow errors | ✅ |
 | Open parser + validator, engine-agreement tests | ✅ |
 | Keyless server: auth/roles, TLS, WAL + checkpoints, backup/restore, transactions, metrics, Docker | ✅ single node |
-| Drivers: Python (DB-API 2.0), TypeScript, Rust | ✅ (MAC integrity, vault log/sealing: Python only) |
+| Drivers: Python (DB-API 2.0), TypeScript, Rust | ✅ (MAC integrity and FHE columns in all three; vault log/passphrase sealing and custody: Python only) |
+| Replication (async + sync WAL shipping, manual promotion), disk storage engine, secondary indexes, pooling | ✅ ([`docs/replication.md`](docs/replication.md), [`docs/storage.md`](docs/storage.md)) |
 | Durable, sealed, tamper-evident mask-vault log | ✅ Python driver |
 | **Threshold key custody**: dealerless DKG, k-of-n verifiable key use, refresh/reshare, daemon, CLI | ✅ Python (`torussql.custody`) |
 | Internal cryptographic audit + review packet | ✅ (findings F-1…F-12) |
@@ -24,11 +25,12 @@ This file states what is *not* done as plainly as what is.
    F-3 (Π_mult offload), F-4 (make authenticated mode the default?), F-10 (standard AEAD for the vault).
 2. ⬜ **CI evidence**: the workflow is committed but has not yet run on a hosted
    runner; first green run + required checks on `main`.
-3. ⬜ **Authenticated (MAC) mode and vault log in the TypeScript and Rust drivers.**
-4. ⬜ **Replication / hot standby** for the server (today: restore from backup).
-5. ⬜ Publish packages (PyPI parser; npm; crates.io) — needs registry tokens (the
-   engine is now in-repo, so the wheels are self-contained).
-6. ⬜ Connection pooling and a thread-safe connection in the Python driver.
+3. ⬜ **Vault log with passphrase sealing in the TypeScript and Rust drivers** (their MAC mode exists; their vault
+   is a JSON snapshot saved on demand).
+4. ⬜ **Automatic fail-over** (replication and manual promotion exist: `docs/replication.md`).
+5. ⬜ Publish packages (PyPI: parser, core, driver, server; npm; crates.io) — needs registry tokens (the
+   engine is in-repo, so the wheels are self-contained). Until then install from a checkout
+   ([`docs/GETTING_STARTED.md`](docs/GETTING_STARTED.md)).
 
 ## Later
 
@@ -38,10 +40,9 @@ This file states what is *not* done as plainly as what is.
 * ⬜ Custody in the TypeScript / Rust drivers; Pedersen/GJKR DKG; P-256 and Ed25519 groups;
   a post-quantum-safe threshold-use option.
 
-* ⬜ Multi-column `ORDER BY`, `IS NULL`, `HAVING` on aggregates other than COUNT.
+* ⬜ Multi-column `ORDER BY`, `HAVING` on aggregates other than COUNT (`IS NULL` shipped).
 * ⬜ Non-equi and `RIGHT`/`FULL` joins; subqueries.
 * ⬜ Streaming result cursors (today results are fully materialised at the owner).
-* ⬜ Secondary indexes on PLAIN columns (server scans today).
 * ⬜ Multi-owner deployments (needs MPC triple preprocessing).
 * ⬜ Schema migration tooling (ALTER TABLE).
 * 🔬 Encrypted predicates / ordering (needs an FHE comparison circuit).

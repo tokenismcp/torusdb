@@ -4,6 +4,14 @@ Encrypted SQL over the **no-key delegation protocol**: the server holds no key.
 The driver is the data owner — it blinds on INSERT, keeps the mask vault, and
 unblinds + decodes results.
 
+```bash
+pip install torussql torusdb-server      # Python >= 3.11; from a checkout: pip install ./parser ./core ./drivers/python ./server
+torusdb-server --db ./demo.db &          # loopback server, no token needed there
+torussql --vault ./demo.vault            # interactive shell (psql-style), console script of this package
+```
+
+New to it? `docs/GETTING_STARTED.md` in the repository is the tested 10-minute path.
+
 ```python
 import torussql
 
@@ -23,7 +31,11 @@ with conn.transaction():                    # atomic, rolls back vault + server
     cur.execute("UPDATE emp SET salary = FRAC(9500,1) WHERE id = 2")
 ```
 
-* Pure Python (>= 3.11); depends only on `torusdb-core` (Apache-2.0). Ships the `torussql` shell.
+* Pure Python (>= 3.11); depends only on `torusdb-core` (Apache-2.0). Ships the `torussql` shell
+  and the `torussql-custody` / `python -m torussql.custody` threshold-key tools.
+* Optional extras: `pip install "torussql[custody]"` (threshold key custody, needs `py_ecc`); `FHE`
+  columns need `py_ecc` too (`pip install "torusdb-core[fhe]"`, or `[fhe-native]` for the native pairing
+  library). Without them the tools stop with the exact command to run.
 * TLS verifies the server certificate by default; `tls_insecure=True` is a
   development-only escape hatch.
 * The mask vault is the only copy of your data's keys-to-readability — back it

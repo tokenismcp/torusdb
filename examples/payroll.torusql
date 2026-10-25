@@ -1,5 +1,8 @@
 -- TorusSQL example: encrypted payroll
--- Run with:  torussql -f examples/payroll.torusql
+-- Start a server first (torusdb-server), then run from the repository root:
+--     torussql -f examples/payroll.torusql
+-- The file creates table `payroll`; to run it again use a fresh server (or `DROP TABLE payroll;`).
+-- Pass --vault PATH if you want to read the encrypted data again from a later session.
 --
 -- Every value in `rate`/`hours`/`salary` stays encrypted on the server.
 -- The aggregates and products below are all computed over ciphertext.
@@ -18,11 +21,11 @@ INSERT INTO payroll (id, rate, hours, salary) VALUES (3, 45, 40, FRAC(7000,1));
 -- Encrypted aggregation: total payroll, never decrypted server-side.
 SELECT SUM(salary) FROM payroll;
 
--- Public scalar x encrypted aggregate: 12 x the encrypted salary total
--- = 12 * (8000 + 9000 + 7000) = 288000.
+-- Public scalar x encrypted column, per row: each salary times 12
+-- -> [96000, 108000, 84000]  (use `12 * SUM(salary)` for the scaled total, 288000).
 SELECT 12 * salary FROM payroll;
 
--- Encrypted x encrypted, per row (depth-1): each person's gross pay.
+-- Encrypted x encrypted, per row (depth-1): each person's gross pay -> [2000, 2100, 1800].
 SELECT id, rate * hours FROM payroll;
 
 -- Encrypted inner product (INT PAIRED): total gross across everyone,

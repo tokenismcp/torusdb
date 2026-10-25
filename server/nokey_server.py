@@ -1689,6 +1689,7 @@ def _is_loopback(host: str) -> bool:
 
 def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser(description="No-key TorusDB server (keyless)")
+    ap.add_argument("--version", action="version", version=f"torusdb-server {SERVER_VERSION}")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8533)
     ap.add_argument("--db", default=None, help="database path (enables durability)")
@@ -1795,6 +1796,10 @@ def main(argv: list[str] | None = None) -> None:
                              config=cfg)
     except dur.DatabaseLocked as exc:
         raise SystemExit(str(exc))
+    except OSError as exc:                       # port in use, bad --host, no permission
+        raise SystemExit(f"cannot listen on {args.host}:{args.port}: {exc.strerror or exc} "
+                         f"— is another torusdb-server already running? "
+                         f"Pick a free port with --port")
     except dur.CorruptDatabase as exc:
         raise SystemExit(f"{exc} — refusing to start on damaged data; restore from a "
                          f"backup with --restore-from")

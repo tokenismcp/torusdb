@@ -3,7 +3,7 @@
 
 This is the OPEN half of the dialect: the rules for *what is allowed*, with
 no execution and no crypto. A driver runs this client-side to reject illegal
-queries before they touch the closed engine, and the engine's planner
+queries before they touch the engine, and the engine's planner
 enforces the same rules server-side. The two MUST agree; this module is the
 canonical statement of the rules (spec §2, §4).
 

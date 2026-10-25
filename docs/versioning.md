@@ -89,8 +89,15 @@ After 1.0:
 
 ## Conformance
 
-A third-party engine is **conformant** if `torussql/spec/conformance/test_conformance.py`
-passes against it. This suite is the binding contract. The ROADMAP is the
+A third-party engine is **conformant** if `spec/conformance/test_conformance.py`
+passes against it. This suite is the binding contract. Run it from a checkout
+(Python >= 3.11, `pip install pytest`):
+
+```bash
+pytest spec/conformance          # runs against the bundled keyless engine
+```
+
+To test another engine, change only the `EngineSeam` adapter in `spec/conformance/conftest.py`. The ROADMAP is the
 route; the spec and suite are the destination.
 
 Conformance tests are versioned with the dialect: adding a test is a MINOR

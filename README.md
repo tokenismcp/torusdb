@@ -19,6 +19,11 @@ nothing about encrypted columns (`I(M; V_S) = 0`, unconditional).
 └───────────────────────────────────────────────────────────┘
 ```
 
+**New here? Start with [`docs/GETTING_STARTED.md`](docs/GETTING_STARTED.md)** (10 minutes,
+install to a restart-safe encrypted `SUM`). **Requires Python 3.11 or newer** for the
+Python packages, shell and server (`python3 --version`; macOS and older Linux often ship
+3.9/3.10, and `pip` then fails with "requires a different Python").
+
 > **Be precise about the guarantee.** It covers the *values* of `ENC`/`PAIRED`
 > columns. The server still sees `PLAIN` columns, the schema, row counts, access
 > patterns and join keys, and — unless you enable `authenticated=True` — can lie
@@ -67,15 +72,19 @@ reference and the list of what is *not* supported:
 | `core/` | `torusdb-core` — keyless engine: planner, blinding client, keyless store (Apache-2.0) |
 | `bench/` | Micro-, network and TPC-H-style benchmarks |
 | `fuzz/`, `tests/` | Fuzz/robustness and end-to-end suites |
-| `docs/` | Quickstart, ops guide, threat model, crypto review packet, versioning |
+| `docs/` | **[Getting started](docs/GETTING_STARTED.md)**, [quickstart](docs/quickstart.md), ops guide, threat model, crypto review packet, versioning |
 
 Everything here is Apache-2.0 and self-contained: no proprietary package is needed
 to build, run or test any of it.
 
 ## Try it
 
+The packages are not on PyPI yet; until they are, install from a checkout (run in the
+directory that contains this README, inside a Python >= 3.11 virtualenv):
+
 ```bash
-pip install torusdb-server torussql                   # Python >= 3.11, pure Python
+python3.12 -m venv .venv && source .venv/bin/activate        # any Python >= 3.11
+pip install ./parser ./core ./drivers/python ./server        # once published: pip install torusdb-server torussql
 torusdb-server --db ./demo.db &                       # loopback; see docs/ops-guide.md for production
 torussql --vault ./demo.vault                         # interactive shell, like psql
 ```
@@ -87,24 +96,28 @@ torussql> INSERT INTO t (id, v) VALUES (2, 32);
 torussql> SELECT SUM(v) FROM t;                       -- computed by the server on blinded data
 ```
 
-or from code:
+or from code (use another table name, or another server/vault, if you already ran the shell
+above: `table 't' already exists`):
 
 ```python
 import torussql
 c = torussql.connect("127.0.0.1", 8533, vault_path="./demo.vault")
-c.execute("CREATE TABLE t (id INT PLAIN, v INT ENC)")
-c.cursor().executemany("INSERT INTO t (id, v) VALUES (%s, %s)", [(1, 10), (2, 32)])
-print(c.execute("SELECT SUM(v) FROM t").rows)         # [[42]]
+c.execute("CREATE TABLE t2 (id INT PLAIN, v INT ENC)")
+c.cursor().executemany("INSERT INTO t2 (id, v) VALUES (%s, %s)", [(1, 10), (2, 32)])
+print(c.execute("SELECT SUM(v) FROM t2").rows)        # [[42]]
 ```
 
 Docker: `docker build -f server/Dockerfile -t torusdb-server .` (see the Dockerfile header).
+`FHE` columns and threshold custody need an optional dependency: `pip install "py_ecc>=6,<9"`
+(plus `mclbn256` for native speed) — see [`docs/GETTING_STARTED.md`](docs/GETTING_STARTED.md) §5.
 
 ## Threshold key custody
 
 The owner's mask vault can be sealed under a key that **no one ever holds**: it is
 generated dealer-free by `n` custodians and used by any `k` of them through one
 verifiable message each — the key is never reassembled (`python -m torussql.custody`,
-[`docs/custody.md`](docs/custody.md)). Custodian hosts need neither the server nor the engine core.
+[`docs/custody.md`](docs/custody.md)). Needs `pip install "py_ecc>=6,<9"` (extra `torussql[custody]`);
+custodian hosts need neither the server nor the engine core.
 
 ## Postgres-style operation
 
@@ -118,15 +131,18 @@ verifiable message each — the key is never reassembled (`python -m torussql.cu
 ## Operating it
 
 Durable (snapshot + WAL), authenticated (roles), TLS-verifying by default,
-transactional, with backups, metrics and a hardened container image — see
-[`docs/ops-guide.md`](docs/ops-guide.md), including a runbook and the honest
-list of limitations (single node, no replication, in-memory dataset).
+transactional, with backups, metrics, a disk storage engine, asynchronous/synchronous
+replication with manual promotion and a hardened container image — see
+[`docs/ops-guide.md`](docs/ops-guide.md), including a runbook and the honest list of
+limitations (single writer node, no automatic fail-over, one open transaction at a time).
 
 ## Development
 
 ```bash
-pytest                                      # everything (pure Python; py_ecc for the custody tests)
-(cd drivers/typescript && npm ci && npm test)
+pip install pytest "py_ecc>=6,<9"           # Python >= 3.11; the tests import the source tree directly
+pytest                                      # everything (pure Python; py_ecc for the FHE/custody tests)
+pytest spec/conformance                     # just the dialect conformance suite
+(cd drivers/typescript && npm ci && npm test)    # Node >= 18
 (cd drivers/rust && cargo test)
 ```
 

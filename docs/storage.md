@@ -52,8 +52,8 @@ definitions are durable; the index contents live in RAM and are rebuilt at start
 ## Limits (be aware)
 
 * **Concurrency model:** one write transaction at a time, served first-come-first-served
-  (`BEGIN` waits up to `--tx-wait`, then `Busy`); a transaction idle for `--tx-idle-timeout`
-  seconds (default 30) or older than `tx_timeout` is aborted so it cannot hold the lock
+  (`BEGIN` waits up to 10 s, then `Busy`); a transaction idle for `--tx-idle-timeout`
+  seconds (default 30) or older than 60 s is aborted so it cannot hold the lock
   forever. Readers never wait: they see the last committed state. Row ids and the owner's
   masks are assigned at write time, which rules out optimistic multi-writer transactions —
   scale reads with replicas (`docs/replication.md`), keep write transactions short.

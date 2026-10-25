@@ -4,7 +4,7 @@
 An EC-FHE scheme (elliptic-curve based — not lattice-based; no noise, no bootstrapping) over
 the BN254 pairing groups (G1, G2, GT), implemented on
 ``py_ecc`` (portable) with an optional native ``mclbn256`` back end — nothing here depends
-on the proprietary engine.
+on any external engine.
 
     secrets s, s2      public  Q = s·P (G1),  Q2 = s2·G2 (G2)        e = pairing(G2, G1)
                        (s2 is a SECOND secret, derived from s — never publish Q2 = s·G2, see below)

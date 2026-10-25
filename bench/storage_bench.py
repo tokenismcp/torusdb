@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Disk vs memory storage micro-benchmark (server-side store only, no network).
 
-    python bench/storage_bench.py --rows 200000 --cache-rows 5000
+    python bench/storage_bench.py --rows 200000 --cache-rows 5000 --kind disk   # or --kind memory
 """
 from __future__ import annotations
 

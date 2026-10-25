@@ -7,8 +7,12 @@ encrypted aggregation is sub-millisecond at thousands of rows.
 ## Run
 
 ```bash
-python torussql/bench/bench.py --rows 100,1000,5000 --repeat 3
-python torussql/bench/bench.py --rows 1000,5000 --authenticated   # with integrity MAC
+# from the repository root (Python >= 3.11, packages installed or the source tree importable)
+python bench/bench.py --rows 100,1000,5000 --repeat 3
+python bench/bench.py --rows 1000,5000 --authenticated   # with integrity MAC
+python bench/net_bench.py --rows 20000 [--auth]          # real TCP, server + driver
+python bench/tpch.py --rows 1000                         # TPC-H-style queries
+python bench/storage_bench.py --rows 200000 --cache-rows 5000 --kind disk   # or --kind memory
 ```
 
 Deterministic row values; one-time-pad masks use the OS RNG (timings vary, not

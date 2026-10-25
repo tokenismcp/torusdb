@@ -19,12 +19,17 @@ from __future__ import annotations
 import os
 import threading
 
-from py_ecc.fields import optimized_bn128_FQ as _FQ_cls
-from py_ecc.optimized_bn128 import (
-    FQ, FQ2, FQ12, G1 as PG1, G2 as PG2, Z1, Z2, add as p_add, b, b2, curve_order,
-    final_exponentiate, is_inf, is_on_curve, multiply as p_mul, neg as p_neg, normalize,
-    pairing as p_pairing,
-)
+try:
+    from py_ecc.fields import optimized_bn128_FQ as _FQ_cls
+    from py_ecc.optimized_bn128 import (
+        FQ, FQ2, FQ12, G1 as PG1, G2 as PG2, Z1, Z2, add as p_add, b, b2, curve_order,
+        final_exponentiate, is_inf, is_on_curve, multiply as p_mul, neg as p_neg, normalize,
+        pairing as p_pairing,
+    )
+except ImportError as _exc:                                   # pragma: no cover
+    raise ImportError(
+        "FHE columns need the 'py_ecc' package: pip install 'torusdb-core[fhe]' "
+        "(add [fhe-native] for the ~150x faster mclbn256 back end)") from _exc
 
 N = curve_order
 G1_BYTES, G2_BYTES, GT_BYTES = 64, 128, 384

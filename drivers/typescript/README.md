@@ -4,6 +4,21 @@ No-key TorusDB client. Connects to a **keyless** server (wire protocol v2),
 holds the mask vault locally, blinds on insert and unblinds results - the
 server never holds a key and never decrypts.
 
+## Install and first run
+
+Node >= 18, and a running server (Python >= 3.11; from the repository root
+`pip install ./parser ./core ./drivers/python ./server && torusdb-server`, see
+[`docs/GETTING_STARTED.md`](../../docs/GETTING_STARTED.md)).
+
+```bash
+npm install @torusdb/driver          # once published
+# from a checkout, today:
+cd drivers/typescript && npm ci && npm run build && npm pack     # -> torusdb-driver-0.5.0.tgz
+cd /your/project && npm install /path/to/torusdb-driver-0.5.0.tgz
+# run the bundled example against a server on 127.0.0.1:8533 (needs a fresh server each time):
+cd drivers/typescript && npx ts-node example.ts
+```
+
 The driver exposes a **programmatic API** (not raw SQL - SQL parsing lives in
 the Python `torussql-parser`). Field arithmetic uses native `BigInt` (exact
 mod-n); wire format and framing match the Python driver and `../../proto/`.
@@ -322,8 +337,9 @@ npm test             # compiles to build-test/ and runs node:test
 
 Integration tests start a real server subprocess:
 `$TORUSDB_PYTHON` (or `<repo>/.venv/bin/python`, then `python3`)
-`torussql/server/nokey_server.py --port 0`. If no working interpreter/server
-is found they are **skipped**, not failed. The vector tests need no server.
+`server/nokey_server.py --port 0`. That interpreter must be Python >= 3.11 with `py_ecc`
+installed (a system `python3` 3.9 does not work: `export TORUSDB_PYTHON=/path/to/python3.12`).
+If no working interpreter/server is found they are **skipped**, not failed. The vector tests need no server.
 TLS tests need `openssl`. The FHE tests also run the Python reference as a cross-implementation peer
 (`PYTHONPATH=<repo>/core:<repo>/parser:<repo>/drivers/python`, set up by the test helper); set
 `TORUSDB_MCL_PATH=<dir containing mclbn256>` to additionally run DOT against a native-pairing server.

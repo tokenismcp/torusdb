@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
-// Run a keyless server first:
-//   python torussql/server/nokey_server.py --port 8533
-// then:  npx ts-node example.ts
+// Run a keyless server first (pip install ./parser ./core ./drivers/python ./server, see
+// docs/GETTING_STARTED.md):
+//   torusdb-server --port 8533
+// then, in drivers/typescript:  npm ci && npx ts-node example.ts
+// (creates table `emp`; start a fresh server to run it again)
 import { Client, eq } from "./src/torusdb";
 
 async function main() {

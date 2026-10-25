@@ -18,11 +18,20 @@ everything below:
 
 ## 1. Installing
 
+Python **3.11 or newer** is required.
+
 ```bash
-pip install torusdb-server          # pulls torussql + torusdb-core
-# or, container:
+pip install torusdb-server          # pulls torussql + torusdb-core (until published: from a checkout,
+                                    #   pip install ./parser ./core ./drivers/python ./server)
+# or, container (run from the repository root; build context = this directory):
 docker build -f server/Dockerfile -t torusdb-server:0.5.0 .
 ```
+
+`torusdb-server --help` lists every flag. FHE columns need `pip install "py_ecc>=6,<9"` and
+threshold custody `pip install "torussql[custody]"`; both are optional and the tools say so
+if they are missing. In the container image add them with a derived image if you need them.
+
+First time? [`GETTING_STARTED.md`](GETTING_STARTED.md) is the 10-minute path.
 
 
 ## 2. Starting the server
@@ -45,6 +54,13 @@ the clear.
 | `--db PATH` | in-memory | Enable durability (snapshot + journal + lock file) |
 | `--fsync always\|never` | `always` | fsync each commit. `never` is faster and loses the last commits on power failure |
 | `--checkpoint-every N` | 5000 | Fold the journal into a new snapshot every N commits |
+| `--storage memory\|disk`, `--cache-rows N` | `memory`, 50000 | `disk` keeps rows in heap files under `PATH.data/` so the data set may exceed RAM — see [`storage.md`](storage.md) |
+| `--replica-of HOST:PORT`, `--repl-token-env VAR`, `--repl-tls`, `--repl-cafile CA`, `--repl-ring N` | off | Run as a read-only hot standby / size the primary's catch-up ring — see [`replication.md`](replication.md) |
+| `--sync-replicas N`, `--sync-timeout S`, `--sync-strict` | 0, 10, off | Synchronous replication: acknowledge a commit after N replicas have it |
+| `--tx-idle-timeout S` | 30 | Abort a transaction idle for S seconds (0 = off) |
+| `--fhe-allow-client-backend` | off | Let clients pick the pairing back end for `FHE` `DOT` (default: the server's own) |
+| `--insecure-no-auth` | off | Allow a non-loopback bind without tokens (throw-away testing only) |
+| `--version` | | Print the version and exit |
 | `--token-file F` | none | Enable authentication (see §3) |
 | `--tls --cert C [--key K] [--cafile CA]` | off | TLS ≥1.2; `--cafile` requires client certificates (mutual TLS) |
 | `--max-connections N` | 256 | Extra connections get `Busy` |
@@ -97,6 +113,12 @@ openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial -days 
         -extfile <(printf "subjectAltName=DNS:db.example.com") -out server.crt
 ```
 
+For a quick local test with a self-signed certificate use the same commands with
+`-subj "/CN=localhost"` and `subjectAltName=DNS:localhost,IP:127.0.0.1`, start the server with
+`--tls --cert server.crt --key server.key`, and connect with `cafile="ca.crt"` (shell:
+`--tls --cafile ca.crt`). Without `cafile` a private certificate fails with
+`CERTIFICATE_VERIFY_FAILED`.
+
 Clients **verify the certificate and hostname by default**:
 `connect("db.example.com", 8533, tls=True, cafile="ca.crt", token=…)`. For mutual
 TLS add `--cafile ca.crt` to the server and `certfile=`/`keyfile=` to the client.
@@ -135,7 +157,9 @@ conn = torussql.connect(..., token=ADMIN_TOKEN)
 path = conn.backup()          # checksummed snapshot in --backup-dir (server-side)
 ```
 
-Schedule it (cron, k8s CronJob) and copy the files off-host. Retention is
+(`admin` token required; `--backup-dir` must be set on the server, and the file is written on
+the server's disk. The shell has no backup command.) Schedule it (cron, k8s CronJob) and copy the
+files off-host. Retention is
 `--backup-keep`. To restore, stop the server and run:
 
 ```bash
@@ -247,8 +271,9 @@ the on-disk snapshot is ≈ 370 / 700 bytes/row and the vault ≈ 300 / 600 byte
 Plan RAM at roughly 3× the snapshot size. Reproduce with
 `python bench/net_bench.py --rows 20000 [--auth]` and `python bench/tpch.py`.
 
-Exceeding these sizes needs sharding by table across servers; there is no
-built-in replication or clustering (see §13).
+Exceeding these sizes needs `--storage disk` for data larger than RAM (see
+[`storage.md`](storage.md)), replicas for read scale-out ([`replication.md`](replication.md)),
+or sharding by table across servers; there is no clustering or multi-writer (see §13).
 
 ## 11. Upgrades and compatibility
 
@@ -278,8 +303,11 @@ built-in replication or clustering (see §13).
 
 ## 13. Known limitations (be honest with your auditors)
 
-* No replication, clustering or hot standby — recovery is restore-from-backup.
-* One in-memory dataset per server; one open transaction at a time.
+* Replication is asynchronous WAL shipping to read-only hot standbys (optionally synchronous,
+  `--sync-replicas`); promotion is **manual** and there is no automatic fail-over, clustering or
+  multi-primary ([`replication.md`](replication.md)).
+* One writer node; the default storage keeps the whole dataset in RAM (`--storage disk` lifts that,
+  [`storage.md`](storage.md)); one open transaction at a time.
 * Integrity (`authenticated=True`) is **opt-in**; without it a malicious server
   can return wrong answers undetected.
 * Joins run at the owner on plaintext keys; encrypted-key joins, encrypted

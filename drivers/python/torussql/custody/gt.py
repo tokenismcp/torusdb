@@ -42,10 +42,14 @@ from __future__ import annotations
 import secrets
 from dataclasses import dataclass
 
-from py_ecc.optimized_bn128 import (FQ2, FQ12, G1 as _G1, G2 as _G2, add as _add, b2 as _B2,
-                                    curve_order as Q, field_modulus as P, final_exponentiate,
-                                    is_inf, is_on_curve, multiply as _mul, neg as _neg,
-                                    normalize, pairing)
+try:
+    from py_ecc.optimized_bn128 import (FQ2, FQ12, G1 as _G1, G2 as _G2, add as _add, b2 as _B2,
+                                        curve_order as Q, field_modulus as P, final_exponentiate,
+                                        is_inf, is_on_curve, multiply as _mul, neg as _neg,
+                                        normalize, pairing)
+except ImportError as _exc:                                   # pragma: no cover
+    raise ImportError("threshold custody needs the 'py_ecc' package: "
+                      "pip install 'torussql[custody]'") from _exc
 
 from . import laurent
 from .group import CustodyError, Group, InvalidPoint

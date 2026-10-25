@@ -1,13 +1,21 @@
 # TorusSQL Quickstart
 
-Ten minutes to an encrypted query. You will run a keyless server, connect as the
-data owner, store salaries encrypted, and compute over them — the server never
-sees a salary.
+> **First time? Do [`GETTING_STARTED.md`](GETTING_STARTED.md) first** — the tested
+> 10-minute path (install, server, encrypted `SUM`, FHE column, restart). This page is
+> the longer tour that follows it: a multi-table payroll with joins, grouping,
+> transactions and integrity checking. It assumes a running server and the install
+> from there.
+
+You will connect as the data owner, store salaries encrypted, and compute over
+them — the server never sees a salary.
 
 ## 1. Install
 
+Python **3.11 or newer** is required. From a checkout (nothing is published yet):
+
 ```bash
-pip install torusdb-server torussql      # Python >= 3.11, pure Python, no other dependencies
+python3.12 -m venv .venv && source .venv/bin/activate
+pip install ./parser ./core ./drivers/python ./server    # later: pip install torusdb-server torussql
 ```
 
 Everything is Apache-2.0 and self-contained. The TypeScript (`@torusdb/driver`) and
@@ -16,7 +24,7 @@ Rust (`torusdb`) drivers speak the same wire protocol and need only a running se
 ## 2. Start a server
 
 ```bash
-torusdb-server --port 8533 --db ./demo.db        # durable; loopback only, no auth needed
+torusdb-server --port 8533 --db ./demo.db        # durable; loopback only, no auth needed (leave it running)
 ```
 
 For anything reachable from a network add `--token-file` and `--tls`
@@ -32,7 +40,9 @@ cur = conn.cursor()
 ```
 
 `vault_path` is where **your** masks live — the only thing that can decrypt the
-data. Without it the vault exists only in memory. Back it up.
+data. Without it the vault exists only in memory. Back it up. The code below creates
+tables `emp` and `dept`: on a server that already has them (from running it twice) use
+`DROP TABLE emp` / `DROP TABLE dept` first, or start with a fresh `--db`.
 
 ## 4. Create, load, query
 
@@ -50,7 +60,7 @@ cur.executemany(
     [(1, 5, "Ana", 8000, 50, 40), (2, 5, "Bo", 9000, 60, 35), (3, 9, "Cy", 7000, 45, 40)])
 
 cur.execute("SELECT SUM(salary), AVG(salary) FROM emp");           print(cur.fetchall())
-cur.execute("SELECT DOT(rate, hours) FROM emp");                   print(cur.fetchall())  # 4100+... on blinded data
+cur.execute("SELECT DOT(rate, hours) FROM emp");                   print(cur.fetchall())  # 5900 = 2000+2100+1800, on blinded data
 cur.execute("""SELECT d.dname, COUNT(*), SUM(e.salary)
                FROM emp e JOIN dept d ON e.dept = d.dept
                GROUP BY d.dname ORDER BY d.dname""");             print(cur.fetchall())
@@ -77,10 +87,16 @@ conn = torussql.connect(..., authenticated=True)   # MAC every encrypted cell
 ```
 
 Tampering then raises `IntegrityError`. Without it a malicious server could
-return wrong aggregates undetected.
+return wrong aggregates undetected. Decide this **when the vault is created**: a vault
+(and its tables) written without MACs is refused with "refusing to silently run
+unprotected; use a new vault for authenticated mode", so use a fresh `vault_path`
+and fresh tables for the authenticated mode.
 
 ## 7. Next
 
 * `ops-guide.md` — auth, TLS, backups, vault custody, monitoring.
 * `threat-model.md` — exactly what the server can and cannot learn.
-* `torussql -h 127.0.0.1 -p 8533` — an interactive shell (`torussql --help`).
+* `torussql -h 127.0.0.1 -p 8533 --vault ./demo.vault` — an interactive shell (`torussql --help`;
+  `-h` is the host, not help).
+* `FHE` columns (the server multiplies ciphertexts), custody, replication: [`fhe-columns.md`](fhe-columns.md),
+  [`custody.md`](custody.md), [`replication.md`](replication.md).

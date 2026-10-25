@@ -9,11 +9,26 @@ description = "Open parser and static validator for the TorusSQL dialect"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "Apache-2.0" }
+authors = [{ name = "J1729 Labs", email = "jlabsrd@gmail.com" }]
 keywords = ["torussql", "torusdb", "sql", "homomorphic-encryption", "parser"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Database :: Front-Ends",
+    "Topic :: Software Development :: Compilers",
+]
 dependencies = []                    # zero runtime dependencies — engine-free
 
 [project.optional-dependencies]
 test = ["pytest>=7"]
+
+[project.urls]
+Homepage = "https://torusdb.io"
 
 [tool.setuptools]
 packages = ["torussql_parser"]

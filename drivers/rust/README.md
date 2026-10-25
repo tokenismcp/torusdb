@@ -6,6 +6,18 @@ server never holds a key and never decrypts. Programmatic API (no SQL parser;
 that lives in the Python `torussql-parser`); exact mod-n arithmetic via
 `num-bigint`; wire format and framing match the other drivers.
 
+## Install and first run
+
+You need a running server (Python >= 3.11): from the repository root
+`pip install ./parser ./core ./drivers/python ./server && torusdb-server`
+([`docs/GETTING_STARTED.md`](../../docs/GETTING_STARTED.md)). Then add the crate:
+
+```bash
+cargo add torusdb                     # once published
+# from a checkout, today (Cargo.toml):  torusdb = { path = "/path/to/torussql/drivers/rust" }
+cd drivers/rust && cargo run --example demo     # bundled example against 127.0.0.1:8533 (fresh server each run)
+```
+
 ```rust
 use torusdb::{Client, Column, CellIn, eq_int, all};
 
@@ -315,7 +327,8 @@ cargo run --example demo    # against a running server
 
 Integration tests start a real server subprocess (`$TORUSDB_PYTHON`, else
 `<repo>/.venv/bin/python`, else `python3`, running
-`torussql/server/nokey_server.py --port 0`). When none is found they print
+`server/nokey_server.py --port 0`; it must be Python >= 3.11 with `py_ecc`, so on a machine whose
+`python3` is older set `TORUSDB_PYTHON=/path/to/python3.12`). When none is found they print
 `SKIP` and return (they show as passed - check stderr). The vector tests read
 `../vectors.json` and `../../proto/fhe-vectors.json`, so they only run from a checkout of the repository; the published crate ships no tests (`include` omits `tests/`). Set `TORUSDB_REQUIRE_INTEGRATION=1` to fail instead of skip.
 

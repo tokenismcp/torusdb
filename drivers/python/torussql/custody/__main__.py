@@ -40,7 +40,10 @@ from . import (CustodyError, KeyShare, Participant, PublicKey, ReshareSpec, Quor
                run_local_ceremony, transcript_hash, unwrap_key, wrap_key)
 from .dkg import dkg_params
 from .identity import (Identity, export_dealing, fingerprint, ids_digest, import_dealings)
-from .net import Custodian, CustodianServer, RemoteCustodian
+try:
+    from .net import Custodian, CustodianServer, RemoteCustodian
+except ImportError as _exc:      # py_ecc is an optional dependency
+    raise SystemExit(f"error: {_exc}") from None
 
 
 def _pass(args, prompt="Passphrase: ", confirm=False) -> str | None:

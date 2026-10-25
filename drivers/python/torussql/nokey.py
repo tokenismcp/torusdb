@@ -185,7 +185,14 @@ class _Conn:
             sock.close()
             if isinstance(exc, (FileNotFoundError, PermissionError)):
                 raise InterfaceError(f"cannot read TLS file: {exc}") from exc
-            raise OperationalError(f"TLS handshake failed: {exc}") from exc
+            hint = ""
+            if "CERTIFICATE_VERIFY_FAILED" in str(exc):
+                hint = (" — the server certificate is not trusted: pass cafile=<your CA or the "
+                        "self-signed certificate> (torussql: --cafile PATH); the certificate must "
+                        "also name the host you connect to (subjectAltName)")
+            elif "WRONG_VERSION_NUMBER" in str(exc):
+                hint = " — the server is probably not running with --tls"
+            raise OperationalError(f"TLS handshake failed: {exc}{hint}") from exc
         except BaseException:
             sock.close()
             raise
@@ -215,7 +222,8 @@ class _Conn:
         if self.server_info.get("auth_required"):
             if token is None:
                 raise AuthenticationError(
-                    "the server requires a token (pass token=...)")
+                    "the server requires a token (pass token=... to connect(), or "
+                    "--token-env VAR to the torussql shell)")
             self.call("auth", [token])
 
     def call(self, method: str, args: list):

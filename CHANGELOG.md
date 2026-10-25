@@ -11,6 +11,18 @@ Versioning: [Versioning Policy](docs/versioning.md).
 Hardening release: SQL joins completed, server and drivers made operable, a
 cryptographic self-audit, and the open repository made self-contained.
 
+### Changed — first-run experience (late 0.5.0)
+
+- `docs/GETTING_STARTED.md`: one tested 10-minute path (install from a checkout, server, shell, Python, FHE
+  column, restart); the Python >= 3.11 requirement is stated up front everywhere.
+- Friendlier errors: port already in use, missing `py_ecc` for FHE/custody (names the extra to install),
+  missing token (names `--token-env` for the shell), FHE table without a key, TLS certificate not trusted,
+  untrusted-schema writes (name the shell flags). `torusdb-server --version`, `torussql --version`.
+- Every sdist/wheel now ships `LICENSE` and `NOTICE`; the parser and server carry authors/classifiers/URLs.
+- Docs: stale statements corrected (replication/disk storage exist, FHE integrity is opt-in, TS/Rust drivers
+  have the MAC mode and the anchor file, `DOT` modes), the conformance suite and every benchmark are documented
+  with commands that run from the repository root.
+
 ### Added — QuorumAnchor, threshold-key anchor tests, periodic re-verification (late 0.5.0)
 
 - `torussql.custody.anchor.QuorumAnchor`: the integrity anchor replicated over k-of-n custodians (new custodian RPCs
@@ -78,7 +90,7 @@ cryptographic self-audit, and the open repository made self-contained.
 - `torussql --fhe-keygen/--fhe-key`, `connect(fhe_key=…)`, RPCs `fhe_sum` / `fhe_dot`.
 - Native pairing back end (`mclbn256`, optional `fhe-native` extra): ≈150× faster; the pure-Python
   `py_ecc` back end remains the portable fallback. Cells interoperate; DOT blobs carry a back-end tag.
-- Experimental: no integrity, Python driver only.
+- Experimental at this point: no integrity, Python driver only (superseded by the entries above).
 
 ### Added — scheduling, synchronous replication, atomic IF [NOT] EXISTS (late 0.5.0)
 

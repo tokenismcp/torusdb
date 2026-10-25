@@ -65,3 +65,166 @@ def test_readme_sql_examples_validate():
         "UPDATE emp SET salary = FRAC(9500,1) WHERE id = 2", "DELETE FROM emp WHERE dept = 9",
     ]:
         sch.validate(parse(sql))
+
+
+# ── docs/GETTING_STARTED.md: the whole tested path ────────────────────────────
+import re
+import shlex
+import socket
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+GETTING_STARTED = ROOT / "docs" / "GETTING_STARTED.md"
+
+
+def _have_pyecc():
+    try:
+        import py_ecc  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def _getting_started_steps():
+    """The runnable parts of GETTING_STARTED.md, in document order."""
+    steps = []
+    for lang, body in re.findall(r"```(\w*)\n(.*?)```", GETTING_STARTED.read_text(), re.S):
+        if lang == "python":
+            steps.append(("python", body))
+        elif lang == "bash":
+            for line in body.splitlines():
+                line = line.strip()
+                if line.startswith("export FHE_PASS="):
+                    steps.append(("env", line.split("=", 1)[1].strip("'\"")))
+                elif line.startswith("torusdb-server --db"):
+                    steps.append(("server", shlex.split(line)[2]))
+                elif line.startswith("torussql "):
+                    argv = shlex.split(line)[1:]
+                    if ("-c" in argv or "--fhe-keygen" in argv or "--version" in argv):
+                        steps.append(("shell", argv))
+        elif "torussql>" in body:                                 # the interactive session
+            stmts = [l.split("torussql> ", 1)[1] for l in body.splitlines()
+                     if l.startswith("torussql> ") and not l.split("> ", 1)[1].startswith("\\")]
+            argv = ["--vault", "./demo.vault"]
+            for s in stmts:
+                argv += ["-c", s]
+            steps.append(("shell", argv))
+    return steps
+
+
+def test_getting_started_runs_end_to_end(tmp_path, monkeypatch, capsys):
+    from torussql import cli
+    monkeypatch.chdir(tmp_path)
+    steps = _getting_started_steps()
+    kinds = [k for k, _ in steps]
+    assert kinds.count("server") == 2 and "python" in kinds and "shell" in kinds
+    pyecc = _have_pyecc()
+    srv = None
+    port = None
+    for kind, arg in steps:
+        if kind == "env":
+            monkeypatch.setenv("FHE_PASS", arg)
+        elif kind == "server":
+            if srv is not None:                                   # "restart" step
+                srv.shutdown(); srv.server_close()
+            srv = NoKeyTCPServer("127.0.0.1", 0, arg)
+            threading.Thread(target=srv.serve_forever, daemon=True).start()
+            port = srv.address[1]
+        elif kind == "python":
+            ns = {}
+            exec(compile(arg.replace("8533", str(port)), "GETTING_STARTED.md", "exec"), ns)
+            ns["conn"].close()                                    # a script exits; release the vault lock
+        else:
+            if any(a.startswith("--fhe") for a in arg) and not pyecc:
+                continue
+            if "--version" in arg:
+                with pytest.raises(SystemExit) as ei:
+                    cli.main(arg)
+                assert ei.value.code == 0
+                continue
+            argv = list(arg) if "--fhe-keygen" in arg else arg + ["-p", str(port)]
+            assert cli.main(argv) == 0, argv
+    out = capsys.readouterr().out
+    srv.shutdown(); srv.server_close()
+    assert out.count("42") >= 2                  # SUM(v) before and after the restart
+    assert "[(24000,)]" in out and "[(5900,)]" in out and "[(5, 17000), (9, 7000)]" in out
+    if pyecc:
+        assert re.search(r"^90\s*$", out, re.M) and re.search(r"^12400\s*$", out, re.M)
+
+
+def test_getting_started_is_linked_first():
+    readme = (ROOT / "README.md").read_text()
+    quick = (ROOT / "docs" / "quickstart.md").read_text()
+    assert "docs/GETTING_STARTED.md" in readme[:readme.index("Be precise about the guarantee")]
+    assert "GETTING_STARTED.md" in quick[:700]
+    assert "3.11" in GETTING_STARTED.read_text()[:1500]          # Python requirement is prominent
+
+
+def test_relative_links_in_docs_resolve():
+    files = [ROOT / n for n in ("README.md", "ROADMAP.md", "SECURITY.md", "CONTRIBUTING.md",
+                                "RELEASING.md", "bench/README.md", "server/README.md",
+                                "core/README.md", "parser/README.md", "drivers/python/README.md",
+                                "drivers/typescript/README.md", "drivers/rust/README.md")]
+    files += sorted((ROOT / "docs").glob("*.md")) + sorted((ROOT / "spec").glob("*.md"))
+    bad = []
+    for f in files:
+        text = re.sub(r"```.*?```", "", f.read_text(), flags=re.S)
+        for m in re.finditer(r"\]\(([^)\s]+)\)", text):
+            url = m.group(1)
+            if url.startswith(("http", "#", "mailto")):
+                continue
+            if not (f.parent / url.split("#")[0]).exists():
+                bad.append((str(f.relative_to(ROOT)), url))
+    assert not bad, bad
+
+
+def test_documented_flags_exist_in_help():
+    """Every `--flag` mentioned in the main docs is a real flag of one of the CLIs (or a known external one)."""
+    import subprocess, sys
+    cmds = [[sys.executable, str(ROOT / "server" / "nokey_server.py"), "--help"],
+            [sys.executable, "-m", "torussql.cli", "--help"]]
+    from torussql.custody.__main__ import main as _m  # noqa: F401  (needs py_ecc)
+    real = set()
+    import os
+    env = dict(os.environ, PYTHONPATH=os.pathsep.join(
+        str(ROOT / p) for p in ("core", "parser", "drivers/python", "server")))
+    for c in cmds:
+        real |= set(re.findall(r"--[a-z][a-z0-9-]+", subprocess.run(c, capture_output=True, text=True, env=env).stdout))
+    sub = ["identity-new", "ids-merge", "new-session", "dkg-start", "dkg-finish", "keygen-local", "share-check",
+           "public-show", "serve", "open-test", "fhe-keygen-threshold", "fhe-open-test", "reshare-start",
+           "reshare-finish", "mask-init", "mask-status", "mask-repair", "mask-gc", "mask-reshare"]
+    for s in sub:
+        real |= set(re.findall(r"--[a-z][a-z0-9-]+", subprocess.run(
+            [sys.executable, "-m", "torussql.custody", s, "--help"], capture_output=True, text=True, env=env).stdout))
+    for b in ("bench", "net_bench", "storage_bench", "tpch"):
+        real |= set(re.findall(r"--[a-z][a-z0-9-]+", subprocess.run(
+            [sys.executable, str(ROOT / "bench" / f"{b}.py"), "--help"], capture_output=True, text=True, env=env).stdout))
+    external = {"--all-targets", "--example", "--features", "--from", "--interval", "--no-cache-dir", "--retries",
+                "--start-period", "--timeout", "--port", "--rows", "--help", "--name", "--format", "--no-deps",
+                "--allow-dirty", "--list", "--dry-run", "--find-links", "--no-index", "--wheel", "--outdir",
+                "--force-reinstall", "--editable"}
+    mentioned = set()
+    for f in [ROOT / "README.md", ROOT / "bench" / "README.md", ROOT / "server" / "README.md",
+              ROOT / "server" / "Dockerfile", *(ROOT / "docs").glob("*.md"),
+              *(ROOT / "drivers").glob("*/README.md")]:
+        mentioned |= set(re.findall(r"--[a-z][a-z0-9-]+", f.read_text()))
+    assert not (mentioned - real - external), sorted(mentioned - real - external)
+
+
+def test_first_run_error_messages_say_what_to_do(tmp_path):
+    import nokey_server
+    # token required but not given: the message names both the API argument and the shell flag
+    srv = NoKeyTCPServer("127.0.0.1", 0, config=nokey_server.ServerConfig(tokens={"admin": "x" * 20})) \
+        if hasattr(nokey_server, "ServerConfig") else None
+    if srv is not None:
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        with pytest.raises(torussql.AuthenticationError) as ei:
+            torussql.connect("127.0.0.1", srv.address[1])
+        assert "token=" in str(ei.value) and "--token-env" in str(ei.value)
+        srv.shutdown(); srv.server_close()
+    # port in use: a one-line instruction, not a traceback
+    s = socket.socket(); s.bind(("127.0.0.1", 0)); s.listen()
+    with pytest.raises(SystemExit) as ei:
+        nokey_server.main(["--port", str(s.getsockname()[1])])
+    s.close()
+    assert "cannot listen" in str(ei.value) and "--port" in str(ei.value)

@@ -6,8 +6,9 @@ The owner's mask vault is the one secret that can read the data. This module
 generates its **protection key without a dealer** and lets it be **used without
 ever being reassembled**, by any `k` of `n` custodians.
 
-> **Threshold *storage* vs threshold *use*.** The older closed-engine `keymgmt`
-> custody splits a key and *reconstructs it* on one machine at recovery time —
+> **Threshold *storage* vs threshold *use*.** Conventional secret-sharing custody
+> (including the older, no-longer-shipped `keymgmt` of the legacy engine) splits a key and
+> *reconstructs it* on one machine at recovery time —
 > that machine briefly holds the whole key. Here the key `x` is never
 > assembled, not at generation, not at use, not at refresh. Each custodian
 > answers one verifiable message; the opener combines the answers.
@@ -51,7 +52,7 @@ ever being reassembled**, by any `k` of `n` custodians.
 
 | z-MPC feature | Here |
 |---|---|
-| Laurent-series secret sharing, secret as residue | **Yes** — same structure as the older closed-engine LSS, with linear reconstruction coefficients |
+| Laurent-series secret sharing, secret as residue | **Yes** — same structure as the legacy engine's LSS (not part of this repository), with linear reconstruction coefficients |
 | Aggregator-free, one-round | **Yes** — one message per custodian to use the key; DKG and reshare are one broadcast round |
 | Zero-knowledge proofs | **Yes** — Schnorr proof of knowledge (DKG, signatures), Chaum–Pedersen DLEQ (every partial result) |
 | Multiple curves | secp256k1 (default), BN254 G1. *Not* P-256 / Ed25519 yet |

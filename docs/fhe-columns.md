@@ -31,10 +31,16 @@ torussql --fhe-keygen ./fhe.key --fhe-pass-env FHE_PASS --fhe-range 1000000   # 
 torussql --fhe-key ./fhe.key --fhe-pass-env FHE_PASS -p 8533                   # then use FHE columns
 ```
 ```python
+import os, torussql
 from torusdb_core import fhe
-key = fhe.load_key("fhe.key", passphrase)
-conn = torussql.connect(host, fhe_key=key, authenticated=True)   # authenticated: integrity tags
+key = fhe.load_key("fhe.key", os.environ["FHE_PASS"])
+conn = torussql.connect("127.0.0.1", 8533, fhe_key=key, authenticated=True)   # authenticated: integrity tags
 ```
+
+Needs `pip install "py_ecc>=6,<9"` (or `"torusdb-core[fhe-native]"` for the ~150x faster native back end);
+without it the tools stop with that instruction. Step by step: [`GETTING_STARTED.md`](GETTING_STARTED.md) §5.
+A table with `FHE` columns can be created without a key, but reading or writing its FHE cells
+without `--fhe-key` / `fhe_key=` fails with "no FHE key is loaded".
 
 ## What you get compared with `ENC` / `PAIRED`
 
@@ -47,7 +53,7 @@ conn = torussql.connect(host, fhe_key=key, authenticated=True)   # authenticated
 | UPDATE/DELETE/crash/orphans | mask-first ordering, gc, repair | nothing to repair |
 | speed | fast | native back end: encrypt 0.3 ms/cell, `SUM` 0.4 ms/row, `DOT` 1.4 ms/row; pure Python: 33 ms, 0.1 ms, 200 ms |
 | result range | ≈ ±2^126 exact rationals | integers only, results within the key's range (default ±10^6) |
-| integrity vs a lying server | optional SPDZ MACs | optional tags for cells / `SUM` / `k*SUM`; with `integrity_anchor=` also the row set and freshness (see below); **none for delegated `DOT`** |
+| integrity vs a lying server | optional SPDZ MACs | optional tags for cells / `SUM` / `k*SUM`; with `integrity_anchor=` also the row set and freshness (see below); `DOT` is verified by recomputing at the owner (`fhe_dot_mode="local"`, the default when authenticated), **none for delegated `DOT`** |
 
 ## Scheme (EC-FHE on the BN254 pairing groups; implemented in `torusdb_core/fhe.py`)
 
@@ -77,8 +83,11 @@ variants are broken.
   dropped, duplicated or swapped row, a result scaled by the server, and cells written without
   tags (soundness ≈ 1/n per attempt). **Not covered:** replay of an older version of the same
   cell or of a whole table, the **set of rows** (WHERE results, COUNT/AVG denominators, deleted/dead rows —
-  all come from the server), and **`DOT`** — a ciphertext product cannot be tag-checked, so an authenticated
-  connection refuses `DOT` unless you pass `fhe_allow_unverified_dot=True`. Without
+  all come from the server), and **delegated `DOT`** — a ciphertext product cannot be tag-checked, so an
+  authenticated connection by default (`fhe_dot_mode="auto"`) verifies `DOT` locally instead (the owner reads
+  both operand columns, each cell verified by its tag, and multiplies the plaintexts: O(n) decryptions);
+  `fhe_dot_mode="delegated"` (legacy spelling `fhe_allow_unverified_dot=True`) lets the server multiply
+  and the result is NOT integrity-checked. Without
   `authenticated=True` a malicious server can return a wrong ciphertext and the owner decrypts
   a wrong number (or fails with *out of range*); use `ENC` + `authenticated=True` when
   you need verified products.
@@ -242,8 +251,8 @@ native encryption dominates).
 * **Freshness between rescans**: between epoch changes the owner answers from its cached snapshot. A server that
   silently rolls back *data the owner does not read* is noticed on the next fetch of that data, on `verify_table()`,
   when another owner (or a restart) triggers a rescan, or — if you set `integrity_recheck_seconds` — within that period.
-* Python driver only (the TypeScript and Rust drivers do not implement the anchor yet); the O(rows) scan and
-  per-row memory do not suit very large tables.
+* `FileAnchor` is implemented in the Python, TypeScript and Rust drivers (one file format); the replicated
+  `QuorumAnchor` is Python only. The O(rows) scan and per-row memory do not suit very large tables.
 
 ## Threshold custody of the FHE key (`ThresholdFheKey`)
 

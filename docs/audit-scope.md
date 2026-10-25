@@ -65,7 +65,7 @@ denial of service by an attacker who controls the network path.
 git clone <repo> && cd torussql
 python -m venv .venv && . .venv/bin/activate          # Python >= 3.11
 pip install pytest "py_ecc>=6,<9" -e parser -e core -e drivers/python -e server
-pytest                                                # ~700 tests, ~3–4 min
+pytest                                                # ~900 tests, ~4–6 min
 torusdb-server --port 8533 --insecure-no-auth &        # loopback; see docs/ops-guide.md
 torussql -c "CREATE TABLE t (id INT PLAIN, v INT ENC)" -c "INSERT INTO t (id, v) VALUES (1, 42)"
 ```
