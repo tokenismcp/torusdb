@@ -184,11 +184,24 @@ jobs:
           python bench/tpch.py --rows 500
 
   publish-python:
-    name: publish Python packages (PyPI, trusted publishing)
+    name: publish ${{ matrix.package }} (PyPI, trusted publishing)
     needs: [parser, custody, python, wheels]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
-    environment: pypi
+    # PyPI allows one pending publisher per (repo, workflow, environment), so every
+    # package has its own environment. Packages go out one at a time in dependency order.
+    # torusdb-server is registered after the first three exist (PyPI caps pending
+    # publishers at three); until then its job fails and is simply re-run (RELEASING.md).
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        include:
+          - { package: torussql-parser, dir: parser,         env: pypi-parser }
+          - { package: torusdb-core,    dir: core,           env: pypi }
+          - { package: torussql,        dir: drivers/python, env: pypi-driver }
+          - { package: torusdb-server,  dir: server,         env: pypi-server }
+    environment: ${{ matrix.env }}
     permissions: { id-token: write, contents: read }
     steps:
       - uses: actions/checkout@v4
@@ -196,14 +209,13 @@ jobs:
         with: { python-version: "3.12" }
       - run: |
           pip install build
-          # dependency order: parser -> core -> driver -> server
-          for d in parser core drivers/python server; do python -m build --outdir dist "$d"; done
+          python -m build --outdir dist "${{ matrix.dir }}"
       - uses: pypa/gh-action-pypi-publish@release/v1
         with: { packages-dir: dist }
 
   publish-npm:
     name: publish @torusdb/driver
-    needs: [typescript, publish-python]
+    needs: [typescript, python, wheels]   # independent of PyPI so a pending PyPI job cannot block npm
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     environment: npm
