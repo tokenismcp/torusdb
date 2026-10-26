@@ -1,5 +1,13 @@
 # TorusSQL
 
+> **Status: experimental (v0.x), not independently audited.** Do not put data you
+> cannot afford to lose or leak into it yet. The cryptography has had internal
+> reviews only, no external one. `FHE` columns use BN254 (≈100-bit security, not
+> 128), and the pure-Python pairing path is about 150× slower than the optional
+> native one. The code, tests and docs were developed with substantial AI
+> assistance (see [Status and provenance](#status-and-provenance)). Known limits
+> are listed in [`docs/threat-model.md`](docs/threat-model.md).
+
 **The open developer surface of [TorusDB](https://torusdb.io)** — a SQL dialect,
 drivers and a keyless server for data that stays encrypted end to end.
 
@@ -145,6 +153,21 @@ pytest spec/conformance                     # just the dialect conformance suite
 (cd drivers/typescript && npm ci && npm test)    # Node >= 18
 (cd drivers/rust && cargo test)
 ```
+
+## Status and provenance
+
+* **Maturity:** v0.x, experimental. Measured in tests, not in production years: there is no
+  long-running deployment, no large-scale load experience and no independent security audit.
+* **Security review so far:** internal and AI-assisted review rounds with proof-of-concept
+  attacks, every confirmed finding fixed and covered by a regression test
+  ([`docs/fhe-review-log.md`](docs/fhe-review-log.md)). That is not a substitute for an external
+  audit; a brief for one is in [`docs/audit-scope.md`](docs/audit-scope.md).
+* **How it was built:** the author designed the protocols and the product; the implementation,
+  tests and documentation were produced with substantial help from AI coding assistants and
+  reviewed by running the test suites and attack scripts, not by line-by-line human review of
+  every file. Treat the code accordingly and read it before you rely on it.
+* **Not in this repository:** the EC-FHE engine used by the full TorusDB product is closed source;
+  this repository is the key-less server layer, drivers and spec, and works without it.
 
 Contributing: [`CONTRIBUTING.md`](CONTRIBUTING.md) · Security reports:
 [`SECURITY.md`](SECURITY.md) · Changes: [`CHANGELOG.md`](CHANGELOG.md) · Plan:
