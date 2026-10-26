@@ -1,4 +1,14 @@
+<p align="center">
+  <img src="assets/logo.png" alt="TorusDB" width="140">
+</p>
+
 # TorusSQL
+
+<p align="center">
+  <a href="https://github.com/tokenismcp/torusdb/actions/workflows/ci.yml"><img src="https://github.com/tokenismcp/torusdb/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue" alt="Apache-2.0"></a>
+  <img src="https://img.shields.io/badge/status-experimental%20(pre--audit)-orange" alt="experimental, pre-audit">
+</p>
 
 > **Status: experimental (v0.x), not independently audited.** Do not put data you
 > cannot afford to lose or leak into it yet. The cryptography has had internal

@@ -1,3 +1,5 @@
+<p align="center"><img src="https://raw.githubusercontent.com/tokenismcp/torusdb/main/assets/logo-128.png" alt="TorusDB" width="96"></p>
+
 # @torusdb/driver (TypeScript / Node) - v0.5.0
 
 No-key TorusDB client. Connects to a **keyless** server (wire protocol v2),

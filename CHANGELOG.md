@@ -6,6 +6,13 @@ Versioning: [Versioning Policy](docs/versioning.md).
 
 ---
 
+## [Unreleased]
+
+- Project logo and social-preview card (`assets/`), README badges and status banner.
+- GitHub issue/PR templates and Dependabot configuration.
+- CI: the TypeScript and Rust jobs install the repo packages; the Rust TLS test signs its
+  server certificate with a throw-away CA (rustls refuses a CA certificate as end entity).
+
 ## [0.5.0] — 2026-10-21
 
 Hardening release: SQL joins completed, server and drivers made operable, a

@@ -1,3 +1,5 @@
+<p align="center"><img src="https://raw.githubusercontent.com/tokenismcp/torusdb/main/assets/logo-128.png" alt="TorusDB" width="96"></p>
+
 # torusdb-core
 
 The keyless engine of [TorusDB](https://torusdb.io): SQL planner, the owner-side

@@ -1,3 +1,5 @@
+<p align="center"><img src="https://raw.githubusercontent.com/tokenismcp/torusdb/main/assets/logo-128.png" alt="TorusDB" width="96"></p>
+
 # torusdb (Rust) - v0.5.0
 
 No-key TorusDB client (wire protocol v2). Connects to a **keyless** server,

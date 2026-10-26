@@ -1,3 +1,5 @@
+<p align="center"><img src="https://raw.githubusercontent.com/tokenismcp/torusdb/main/assets/logo-128.png" alt="TorusDB" width="96"></p>
+
 # torusdb-server
 
 The **keyless** TorusDB server. It stores schema, plaintext columns and

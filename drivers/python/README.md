@@ -1,3 +1,5 @@
+<p align="center"><img src="https://raw.githubusercontent.com/tokenismcp/torusdb/main/assets/logo-128.png" alt="TorusDB" width="96"></p>
+
 # torussql — Python driver (PEP 249) for TorusDB
 
 Encrypted SQL over the **no-key delegation protocol**: the server holds no key.
