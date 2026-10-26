@@ -29,7 +29,14 @@ fhe = ["torusdb-core[fhe]==0.5.0"]
 fhe-native = ["torusdb-core[fhe-native]==0.5.0"]
 
 [project.urls]
-Homepage = "https://torusdb.io"
+Homepage      = "https://torusdb.io"
+Repository    = "https://github.com/tokenismcp/torusdb"
+Documentation = "https://github.com/tokenismcp/torusdb/blob/main/docs/GETTING_STARTED.md"
+"Bug Tracker" = "https://github.com/tokenismcp/torusdb/issues"
+Discussions   = "https://github.com/tokenismcp/torusdb/discussions"
+Changelog     = "https://github.com/tokenismcp/torusdb/blob/main/CHANGELOG.md"
+Security      = "https://github.com/tokenismcp/torusdb/blob/main/SECURITY.md"
+Funding       = "https://github.com/sponsors/tokenismcp"
 
 [project.scripts]
 torusdb-server = "nokey_server:main"

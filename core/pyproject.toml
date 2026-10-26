@@ -26,8 +26,14 @@ fhe = ["py_ecc>=6.0.0,<9.0.0"]                  # FHE columns (pairing arithmeti
 fhe-native = ["py_ecc>=6.0.0,<9.0.0", "mclbn256>=1.3"]   # ... ~150x faster (native pairings)
 
 [project.urls]
-Homepage = "https://torusdb.io"
-Repository = "https://github.com/tokenismcp/torusdb"
+Homepage      = "https://torusdb.io"
+Repository    = "https://github.com/tokenismcp/torusdb"
+Documentation = "https://github.com/tokenismcp/torusdb/blob/main/docs/GETTING_STARTED.md"
+"Bug Tracker" = "https://github.com/tokenismcp/torusdb/issues"
+Discussions   = "https://github.com/tokenismcp/torusdb/discussions"
+Changelog     = "https://github.com/tokenismcp/torusdb/blob/main/CHANGELOG.md"
+Security      = "https://github.com/tokenismcp/torusdb/blob/main/SECURITY.md"
+Funding       = "https://github.com/sponsors/tokenismcp"
 
 [tool.setuptools]
 packages = ["torusdb_core"]
