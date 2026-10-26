@@ -358,10 +358,10 @@ Python suite 264 → 600+ (`test_join_v05`, `test_ops`, `test_crypto_audit`,
 
 ### Added
 
-- No-key delegation engine (`ecfhe/nokey.py`): I(M;V_S)=0, Π_lin + Π_mult.
+- No-key delegation engine: I(M;V_S)=0, Π_lin + Π_mult.
 - No-key SQL engine (`ecfhe_query/nokey_engine.py`): full dialect over blinded scalars.
 - Networked no-key server (`server/nokey_server.py`) + Python driver (`drivers/python/`).
-- LSS key custody (`ecfhe/lss.py`, `ecfhe_query/keymgmt.py`, `chain.py`).
+- LSS key custody.
 - Malicious-server integrity MAC (SPDZ-style, §IX, authenticated mode).
 - Binary framing (`proto/framing.py`): 4-byte length-prefixed frames.
 - TypeScript driver (`drivers/typescript/`), Rust driver (`drivers/rust/`).

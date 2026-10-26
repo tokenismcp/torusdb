@@ -190,6 +190,8 @@ TorusDB is developed in the open and is not funded by a product company. Donatio
 Sponsor via the **Sponsor** button on the repository page. Funding is support for the work, not a
 security guarantee or a support contract, and sponsors get no special access to vulnerability reports.
 
+Questions and ideas: [Discussions](https://github.com/tokenismcp/torusdb/discussions) · Help: [`SUPPORT.md`](SUPPORT.md) · Conduct: [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md)
+
 Contributing: [`CONTRIBUTING.md`](CONTRIBUTING.md) · Security reports:
 [`SECURITY.md`](SECURITY.md) · Changes: [`CHANGELOG.md`](CHANGELOG.md) · Plan:
 [`ROADMAP.md`](ROADMAP.md) · License: Apache-2.0 ([`LICENSE`](LICENSE)).

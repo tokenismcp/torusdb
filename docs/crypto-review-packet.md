@@ -214,7 +214,7 @@ Shamir over a Laurent ring. The reviewers should verify:
 | Π_lin sum (§VI, C16) | same | `NoKeyClient._pi_lin_sum` |
 | Π_mult product (§VII, C18) | same | `NoKeyClient._pi_mult_products` |
 | SPDZ MAC (§IX) | same | `NoKeyClient._verify_mac` |
-| LSS share (§LSS) | `ec_fhe_engine/ecfhe/lss.py` | `LSSScheme.share` | (legacy engine, not in this repo)
+| LSS share (§LSS) | (reference implementation, not in this repository) | `LSSScheme.share` | the open implementation is `torussql.custody`
 | LSS reconstruct | same | `LSSScheme.reconstruct` |
 | Proactive refresh | same | `LSSScheme.refresh` |
 | Vault seal | `ec_fhe_query/ecfhe_query/keymgmt.py` | `VaultCustody.export_shares` | (legacy engine, not in this repo)
