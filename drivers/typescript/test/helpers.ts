@@ -4,7 +4,7 @@ import { spawn, spawnSync, ChildProcess } from "child_process";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
-import { Column } from "../src/torusdb";
+import { Client, Column, ConnectOptions } from "../src/torusdb";
 
 // compiled to <root>/drivers/typescript/build-test/test -> repo root is 4 up. TORUSDB_PY_ROOT points the
 // Python side (server, core, parser, python driver) at another checkout (e.g. a pristine release snapshot).
@@ -135,4 +135,10 @@ export function runExprPeer(host: string, port: number, spec: unknown): any {
     { env: pythonEnv(), encoding: "utf8", timeout: 240000, maxBuffer: 64 * 1024 * 1024 });
   if (r.status !== 0) throw new Error(`expr_peer failed (${r.status}): ${r.stderr}`);
   return JSON.parse(r.stdout);
+}
+
+/** Connect with the owner-computed expression transport (`expressionMode: "owner"`): the tests of that
+ *  transport (mult_combine_batch on the wire, the v0.6 costs) keep their exact assertions. */
+export function ownerConnect(host: string, port: number, opts: ConnectOptions = {}): Promise<Client> {
+  return Client.connect(host, port, { expressionMode: "owner", ...opts });
 }

@@ -8,8 +8,8 @@ This file states what is *not* done as plainly as what is.
 | Area | Status |
 |---|---|
 | Dialect: DDL/DML, SUM/AVG/MIN/MAX/COUNT, `k*col`, `a*b`, `DOT`, WHERE (AND/OR/IN), GROUP BY/HAVING, ORDER BY/LIMIT/DISTINCT, aliases | ✅ spec v0.5 + executable conformance |
-| **Dialect v0.6 (unreleased)**: arithmetic expressions `+ - * /`, products of arbitrary depth (one batched round per level, default max depth 8), division by public and by encrypted values, `SUM(expr)`/`AVG(expr)` | ✅ Python driver/engine + conformance, now with **secret-shared wires** (wire protocol 2.1: the server holds its share of every intermediate, nothing is unmasked at the owner; F-18 addressed). Residuals: the owner is the Beaver dealer and so *can* derive operands (F-22), shared mode needs `authenticated=True` against a malicious server (F-23). The TypeScript and Rust drivers still use the owner-computed transport (`mult_combine_batch`), same grammar/results/costs of that mode, cross-checked against the Python engine's `expr_mode="owner"` |
-| **Wire protocol 2.1**: `wire_exec` / `wire_free` (session-scoped secret-shared wire store, caps, TTL) | ✅ server + Python driver; ⬜ TypeScript and Rust drivers |
+| **Dialect v0.6 (unreleased)**: arithmetic expressions `+ - * /`, products of arbitrary depth (one batched round per level, default max depth 8), division by public and by encrypted values, `SUM(expr)`/`AVG(expr)` | ✅ Python driver/engine + conformance, now with **secret-shared wires** (wire protocol 2.1: the server holds its share of every intermediate, nothing is unmasked at the owner; F-18 addressed). Residuals: the owner is the Beaver dealer and so *can* derive operands (F-22), shared mode needs `authenticated=True` against a malicious server (F-23). The TypeScript and Rust drivers use the same shared-wire transport by default (`expressionMode`/`expression_mode`; owner-computed mode kept), cross-checked against the Python engine value-for-value, cost-for-cost and request-shape-for-request-shape |
+| **Wire protocol 2.1**: `wire_exec` / `wire_free` (session-scoped secret-shared wire store, caps, TTL) | ✅ server + Python, TypeScript and Rust drivers |
 | Joins: INNER/LEFT, aliases, self-joins, multi-join, grouping over joins | ✅ (hash join at the owner on PLAIN keys) |
 | Exactness contract with loud overflow errors | ✅ |
 | Open parser + validator, engine-agreement tests | ✅ |
@@ -50,9 +50,9 @@ This file states what is *not* done as plainly as what is.
 * ⬜ Schema migration tooling (ALTER TABLE).
 * 🔬 Encrypted predicates / ordering (needs an FHE comparison circuit).
 * 🔬 Sub-linear owner work for products (shared wires keep the intermediates at the server, but the owner still does O(rows) share arithmetic per level), and an owner that is *blind* to intermediates (needs a third non-colluding dealer or computational OT/HE triple generation; F-22).
-* ⬜ Shared-wire expressions in the TypeScript and Rust drivers (wire protocol 2.1).
-* ✅ Expressions in the TypeScript and Rust drivers (owner-computed mode; `drivers/expr_vectors.json`, live Python peer).
-* 🔬 Expressions over `FHE` columns (the pairing scheme has one multiplicative level).
+* ✅ Shared-wire expressions in the TypeScript and Rust drivers (wire protocol 2.1; the default, `expressionMode: "owner"` keeps the old transport).
+* ✅ Expressions in the TypeScript and Rust drivers (shared and owner-computed modes; `drivers/expr_vectors.json`, live Python peer, wire audit, mutation checks).
+* ✅ Expressions over `FHE` columns, to the one level the pairing scheme has: depth-1 products of integer-linear forms, aggregated (`SUM((a+2*b)*(c-d))`, `SUM(a)*SUM(b)`, public scale/add after decryption); server-side, keyless; Python driver/engine only (TypeScript/Rust: not yet). Deeper products and division stay rejected by design (no decrypt-and-re-encrypt).
 * 🔬 Access-pattern hiding (ORAM-style) — the largest remaining leakage.
 
 ## Explicit non-goals

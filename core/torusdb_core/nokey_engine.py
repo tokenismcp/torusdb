@@ -208,6 +208,44 @@ class NoKeyServer:
         return fhe.dot_cells(self._rows[ltable].cells(lcol, lids),
                              self._rows[rtable].cells(rcol, rids), backend)
 
+    def fhe_mul_prepare(self, table: str, mode: str, ids, ids_r, lterms, lconst: int,
+                        rterms, rconst: int, backend: str | None = None):
+        """Ciphertext x ciphertext product of two integer-LINEAR operands (v0.6.1 FHE expressions).
+
+        Public data only — no key, no mask, no cell uploaded by the owner. ``lterms`` / ``rterms`` are
+        ``[[column, k], ...]`` (public integer coefficients, FHE columns of ``table``), ``lconst`` /
+        ``rconst`` public integers: the operands are ``L = Σ k·col + lconst`` and ``R = Σ k'·col + rconst``.
+        ``mode="sum"``: ``ids`` (``ids_r`` is None) are the rows; the blob opens to ``Σ_i L_i·R_i``.
+        ``mode="agg"``: ``ids`` / ``ids_r`` are the rows summed into ``L`` / ``R``; the blob opens to
+        ``(Σ L)(Σ R)``. Returns a closure that does the pairing math (so a caller may run it outside
+        a lock); its result is a DOT-format blob."""
+        from . import fhe
+        if mode not in ("sum", "agg"):
+            raise ExecError("fhe_mul: mode is 'sum' or 'agg'")
+        if table not in self._rows:
+            raise ExecError(f"no such table: {table}")
+        pol = {c[0]: c[2] for c in self._schema[table]}
+
+        def operand(terms, ids_):
+            out = []
+            for col, k in terms:
+                if pol.get(col) != "fhe":
+                    raise ExecError(f"fhe_mul: {table}.{col} is not an FHE column")
+                try:
+                    out.append((k, self._rows[table].cells(col, list(ids_))))
+                except KeyError:
+                    raise ExecError(f"fhe_mul: no such row in {table!r}") from None
+            return out
+        if mode == "sum":
+            if ids_r is not None:
+                raise ExecError("fhe_mul: mode 'sum' takes one id list")
+            ids_r = ids
+        lt, rt = operand(lterms, ids), operand(rterms, ids_r)
+        return lambda: fhe.mul_cells(lt, lconst, rt, rconst, mode, backend)
+
+    def fhe_mul(self, table, mode, ids, ids_r, lterms, lconst, rterms, rconst, backend=None):
+        return self.fhe_mul_prepare(table, mode, ids, ids_r, lterms, lconst, rterms, rconst, backend)()
+
     def fhe_rows(self, table: str, start: int, count: int):
         """Anchored-table scan (``fhe_anchor``): for the slots ``start .. start+count-1`` return
         ``(slots, [(rowid, dead, plain_values, [(nonce, sha256(cell), sha256(tag)), ...])])`` —
@@ -890,7 +928,7 @@ class NoKeyClient:
             return names[0], col_name
 
         for p in plan.projections or []:
-            if isinstance(p, PExpr):
+            if isinstance(p, PExpr) and not p.fhe:           # FHE expressions: no owner rounds
                 rounds = expr_rounds(self, p, inst, names, loc)
                 if rounds > self.max_mult_depth:
                     raise DepthLimitExceeded(
@@ -1133,6 +1171,9 @@ class NoKeyClient:
         if isinstance(p, PCountStar):
             return len(tuples)
         if isinstance(p, PExpr):
+            if p.fhe:
+                from .fhe_expr import FheExprRunner
+                return FheExprRunner(self, p, inst, names, loc, tuples).run()
             if self.expr_mode == "shared":
                 from .expr_shared import SharedExprRunner
                 return SharedExprRunner(self, p, inst, names, loc, tuples).run()
@@ -1252,14 +1293,19 @@ class NoKeyClient:
             nonces = self.server.plain_cells(table, _fnonce_col(col), idxs)
         return key.decrypt_sum_verified(total, tags, table, col, idxs, k, nonces)
 
-    def _fhe_dot(self, lt, lc, lids, rt, rc, rids) -> int:
-        from . import fhe
-        key = self._fhe_key()
+    def _fhe_mode(self) -> str:
+        """``"local"`` or ``"delegated"``: who multiplies ciphertexts (DOT and FHE expressions)."""
         mode = self.fhe_dot_mode
         if mode not in ("auto", "local", "delegated"):
             raise ExecError("fhe_dot_mode must be 'auto', 'local' or 'delegated'")
         if mode == "auto":
             mode = "delegated" if (not self.authenticated or self.fhe_allow_unverified_dot) else "local"
+        return mode
+
+    def _fhe_dot(self, lt, lc, lids, rt, rc, rids) -> int:
+        from . import fhe
+        key = self._fhe_key()
+        mode = self._fhe_mode()
         if not lids:
             return 0
         if mode == "local":

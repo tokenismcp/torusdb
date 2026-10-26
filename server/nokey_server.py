@@ -81,7 +81,7 @@ log = logging.getLogger("torusdb.server")
 READ_RPCS = frozenset({
     "schema", "tables", "table_info", "matching_rowids", "plain_cells", "blinded_cell",
     "blinded_cells", "blinded_sum", "blinded_scaled_sum",
-    "blinded_per_row_scaled", "mult_combine_batch", "fhe_sum", "fhe_dot", "fhe_rows",
+    "blinded_per_row_scaled", "mult_combine_batch", "fhe_sum", "fhe_dot", "fhe_mul", "fhe_rows",
     "wire_exec", "wire_free",
 })
 WIRE_RPCS = frozenset({"wire_exec", "wire_free"})
@@ -139,6 +139,9 @@ class ServerConfig:
     fhe_max_sum_rows: int = 5000      # rows per fhe_sum call
     fhe_max_dot_rows: int = 300       # rows per fhe_dot call with the pure-Python back end
     fhe_max_dot_rows_native: int = 6000   # ... with the native (mcl) back end
+    fhe_max_mul_work: int = 3000      # fhe_mul: rows x (terms of both operands) per call, pure Python
+    fhe_max_mul_work_native: int = 60000  # ... with the native back end
+    fhe_max_mul_agg_rows_native: int = 50000  # fhe_mul mode "agg": rows per operand, native (pure Python: fhe_max_sum_rows)
     fhe_max_scan_rows: int = 2000     # slots per fhe_rows call (anchored-table scan)
     fhe_allow_client_backend: bool = False   # may a client force a different pairing back end?
     tx_ring: int = 100_000            # committed transaction ids remembered
@@ -1027,6 +1030,10 @@ class Engine:
                         "max_scan_rows": self.cfg.fhe_max_scan_rows,
                         "max_dot_rows": {"pyecc": self.cfg.fhe_max_dot_rows,
                                          "mcl": self.cfg.fhe_max_dot_rows_native},
+                        "max_mul_work": {"pyecc": self.cfg.fhe_max_mul_work,
+                                         "mcl": self.cfg.fhe_max_mul_work_native},
+                        "max_mul_agg_rows": {"pyecc": self.cfg.fhe_max_sum_rows,
+                                             "mcl": self.cfg.fhe_max_mul_agg_rows_native},
                         # sizes that finish well inside a 30 s client timeout
                         "recommended_dot_rows": {"pyecc": 50, "mcl": 2000},
                         "backends": ["pyecc"] + (["mcl"] if have_native else []),
@@ -1462,6 +1469,69 @@ class Engine:
         right = self.srv._rows[rt].cells(rc, b)
         backend = be.name
         return lambda: _b64e(repl_fhe().dot_cells(left, right, backend))
+
+    def _rpc_fhe_mul(self, table, mode, ids, ids_r, lterms, lconst, rterms, rconst, backend=None):
+        """Product of two integer-LINEAR operands over FHE columns, computed from PUBLIC data (the
+        stored cells, the literals of the query) — see ``NoKeyServer.fhe_mul_prepare``. The server
+        receives no ciphertext and no secret: only names, row ids and small integers."""
+        from torusdb_core import fhe, fhe_backend
+        if mode not in ("sum", "agg"):
+            raise BadRequest("fhe_mul: mode is 'sum' or 'agg'")
+        lim = fhe.MUL_MAX_K
+
+        def terms(t, what):
+            if not isinstance(t, list) or len(t) > fhe.MUL_MAX_TERMS:
+                raise BadRequest(f"fhe_mul: {what} is a list of at most {fhe.MUL_MAX_TERMS} [column, k] terms")
+            seen = set()
+            for item in t:
+                if not (isinstance(item, list) and len(item) == 2 and isinstance(item[0], str)):
+                    raise BadRequest(f"fhe_mul: {what} terms are [column, k]")
+                col, k = item
+                if col.startswith("__") or col in seen:
+                    raise BadRequest(f"fhe_mul: {what} names a column twice or an internal column")
+                seen.add(col)
+                self._fhe_col(table, col)
+                if isinstance(k, bool) or not isinstance(k, int) or k == 0 or abs(k) > lim:
+                    raise BadRequest("fhe_mul: a coefficient is a non-zero integer with |k| <= 2^40")
+            return t
+        lterms, rterms = terms(lterms, "the left operand"), terms(rterms, "the right operand")
+        for c_ in (lconst, rconst):
+            if isinstance(c_, bool) or not isinstance(c_, int) or abs(c_) > lim:
+                raise BadRequest("fhe_mul: a constant is an integer with |c| <= 2^40")
+        a = self._check_ids(table, ids)
+        b = a if mode == "sum" else self._check_ids(table, ids_r)
+        if mode == "sum" and ids_r is not None:
+            raise BadRequest("fhe_mul: mode 'sum' takes one id list")
+        if backend is not None and backend not in ("pyecc", "mcl"):
+            raise BadRequest("backend must be 'pyecc' or 'mcl'")
+        try:
+            be = fhe_backend.default()
+            if backend and backend != be.name and self.cfg.fhe_allow_client_backend:
+                be = fhe_backend.get(backend)
+        except ValueError as exc:
+            raise BadRequest(f"FHE back end unavailable on this server: {exc}") from None
+        native = be.name == "mcl"
+        if len(set(a)) != len(a) or len(set(b)) != len(b):
+            raise BadRequest("fhe_mul takes distinct row ids")
+        if mode == "sum":
+            cap = self.cfg.fhe_max_dot_rows_native if native else self.cfg.fhe_max_dot_rows
+            work = self.cfg.fhe_max_mul_work_native if native else self.cfg.fhe_max_mul_work
+            if len(a) > cap or len(a) * max(1, len(lterms) + len(rterms)) > work:
+                raise BadRequest(f"fhe_mul takes at most {cap} rows and {work} row-terms per call "
+                                 f"with the {be.name} back end")
+        else:
+            cap = self.cfg.fhe_max_mul_agg_rows_native if native else self.cfg.fhe_max_sum_rows
+            if len(a) > cap or len(b) > cap:
+                raise BadRequest(f"fhe_mul takes at most {cap} rows per operand with the {be.name} "
+                                 f"back end")
+        try:
+            run = self.srv.fhe_mul_prepare(table, mode, a, None if mode == "sum" else b,
+                                           lterms, lconst, rterms, rconst, be.name)
+        except Exception as exc:                                  # noqa: BLE001
+            if type(exc).__name__ == "ExecError":
+                raise BadRequest(str(exc)) from None
+            raise
+        return lambda: _b64e(run())
 
     # — shared wires: stored cells of the named rows as ring elements (internal; reached only
     #   through wire_exec, which runs it as a snapshot read like every other read) —

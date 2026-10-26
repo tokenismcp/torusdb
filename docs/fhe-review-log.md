@@ -40,6 +40,33 @@ Both remaining server lies need owner-held state to detect, so the fix is a smal
 | F12 | Info | The anchor is itself a rollback target; `adopt_table` is trust-on-first-use; an anchor store that colludes with the server defeats the mode. | **Single-store case FIXED by `QuorumAnchor`** (k-of-n custodian-replicated, highest version with k identical answers, read-repair, CAS writes needing W acks). Condition: ≥ k honest, reachable custodians holding the latest value and ≤ k-1 faulty/rolled-back/colluding; k colluding custodians (or anchor store on the server's host) still defeat it. `adopt_table` stays trust on first use. Tests: `tests/test_fhe_quorum_anchor.py`. |
 | F13 | Info | A cached snapshot could keep answering while the server silently rolled back data the owner never reads. | Mitigated by the optional `integrity_recheck_seconds` (bounded by the period; default off). |
 
+## Round 3 — products of integer-linear forms (v0.6.1; self-review, not independent)
+
+Added: server-side `fhe_mul` (depth-1 products of public integer combinations of cells, aggregated), see
+`fhe-columns.md` "Expressions over FHE columns". The design question was how far products can go *without* a key at the server and
+*without* the owner decrypting-and-re-encrypting an intermediate (rejected on principle). Answer: exactly one pairing level, with
+operands that are integer-linear in cells; nothing deeper. Findings and review questions from building it (tests in
+`tests/test_fhe_expr.py` unless noted):
+
+| ID | Severity | Finding / question | Status |
+|---|---|---|---|
+| F14 | Info | Does a per-row integer combination with PUBLIC coefficients create a value oracle? A combination is a function of public data the server could already compute (pair any G2 half with any G1 half); the value-oracle pairing identities between a *combined* operand and the public keys `Q`, `Q2` are tested, with the weak-`Q2 = s·G2` positive control. | Tested; no new public key-dependent value exists. |
+| F15 | Info | Constants inside an operand (`(a+1)*b`) are added as a trivial ciphertext (`c·G1` on `C2`, `c·G2` on `D2`, randomness 0). | Sound: the randomised part (`C1`/`D1`, `Σk·r`) is unchanged; a cancelled combination (`a-a`) is the public constant, built from nothing. |
+| F16 | Info | Randomness independence (`r1 != r2`) after combining: halves are combined separately, so `Σk·r1` and `Σk·r2` stay independent; the same-cell product `a*a` pairs `D` and `C` of one cell (independent randomness). | Tested (`test_randomness_of_the_two_halves...`). |
+| F17 | Medium (owner side) | A hostile server could send a GT blob made of small-order elements. | Unchanged: `decrypt_dot` checks `c00, c01, c10` individually; chunk blobs are multiplied with `mul_dots` and the PRODUCT is checked before any exponentiation. |
+| F18 | Medium | Ranges: a result outside `[-range, range]` must raise, never wrap. Operand coefficients, constants (`<= 2^40`), width (16) and expression size bound every true product below `2^232`, far under `n/2`. A hostile writer could store a cell outside the key range; unauthenticated delegated mode cannot detect that (no integrity at all there); authenticated mode opens each cell with a range-checked dlog. | Both modes raise on an out-of-range term (tested, boundary included); `5*SUM(a*b)` may leave the range after decryption by design. |
+| F19 | Medium | Integrity of a product. Tags are linear in the value; `Σ TagL_i ★ R_i = α·ΣL_iR_i + Σγ_iR_i` needs `Σγ_iR_i`, which the owner can form only from the plaintexts `R_i` (or by revealing `γ_i` to the server, which destroys the tag). A probabilistic check of the pairing result without the operands does not exist in this scheme. | **Not solved; mitigated honestly**: authenticated `auto` = `local` (verified operands, owner multiplies); delegated + authenticated only by explicit opt-in. No silent weakening. |
+| F20 | Low | DoS: a product multiplies the per-row curve work by the number of terms. | Server caps rows, row×terms (`fhe_max_mul_work`), terms (16), operand rows for aggregates (`fhe_max_mul_agg_rows_native`); published in `hello.limits.fhe`. `AL*AR` over `m` chunks costs `m²` requests. |
+| F21 | Info | The owner uploads nothing: no ciphertext, no tag, no scalar derived from data. The wire audit enumerates every string/integer the server receives and is validated against sabotaged traffic and a sabotaged client. | Tested (`test_wire_audit...`, `test_the_audit_has_teeth`, `test_a_sabotaged_owner...`). |
+| F22 | Info | `AVG` introduces `1/n`: `n` is public (the server knows the row count), applied at the owner after decryption. | By design. |
+
+Open review questions for an external reviewer: (Q1) is there any distinguisher between `Enc(L)` built from `m` stored cells with
+public coefficients and a fresh encryption of `L`, other than via the individual cells (multi-challenge SXDH with linear
+relations among challenges)? (Q2) Does the dependence `s2 = H(s)` matter once the adversary can pair arbitrary half-pairs? (Q3) Is the
+statement "the GT result reveals only the owner-opened value" tight when many products over overlapping rows are decrypted by the
+same owner and the application leaks the plaintexts to a party who also controls the server? (Q4) Is there a sound way to verify a
+GT result with `O(1)` owner work (e.g. a second GT tag with an owner-computable correction)? We found none.
+
 ## Known residual limits (inherent to the design)
 
 * **Rollback / replay of a complete old version** of a cell or table (value + tag + nonce together) is not
@@ -50,11 +77,11 @@ Both remaining server lies need owner-held state to detect, so the fix is a smal
 * **The anchor itself**: with a `FileAnchor`, loss, rollback or collusion with the server defeats anchor mode. A
   `QuorumAnchor` tolerates up to `k-1` faulty custodians and `n-k` unavailable ones (conditions in `fhe-columns.md`);
   `adopt_table` is trust on first use.
-* **Delegated `DOT`** has no integrity check; `local` mode (default when authenticated) verifies operands instead.
+* **Delegated `DOT` and delegated FHE expressions** (`SUM(a*b)`, `SUM(a)*SUM(b)`, ...) have no integrity check; `local` mode (default when authenticated) verifies operands instead.
 * **Not constant time** in pure Python, and GT exponentiation is never constant time (only split-randomised).
 * **Security level** ≈ 100 bit (BN254), SXDH assumed. **No independent human review yet.**
 
 ## How to re-run the checks
 
 `pytest torussql/tests/test_fhe.py torussql/tests/test_fhe_redteam.py torussql/tests/test_fhe_threshold.py
-torussql/tests/test_fhe_table_integrity.py` (with and without `PYTHONPATH=…/mclbn256` for the native back end).
+torussql/tests/test_fhe_table_integrity.py torussql/tests/test_fhe_expr.py torussql/parser/tests/test_fhe_expr_analysis.py` (with and without `PYTHONPATH=…/mclbn256` for the native back end).

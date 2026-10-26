@@ -111,7 +111,7 @@ fn run_case(db: &mut Client, c: &Value) -> Result<ExprValue, Error> {
 fn vectors(auth: bool) {
     let Some(s) = Server::start(&[]) else { return };
     let v = vec_json();
-    let mut db = Client::connect_with(&s.addr, &ConnectOptions { authenticated: auth, ..Default::default() }).unwrap();
+    let mut db = Client::connect_with(&s.addr, &ConnectOptions { expression_mode: ExprMode::Owner, authenticated: auth, ..Default::default() }).unwrap();
     load_tables(&mut db, &v);
     let (mut ok, mut bad) = (0, 0);
     for c in v["exec"]["cases"].as_array().unwrap() {
@@ -217,7 +217,7 @@ fn n_methods(log: &[(String, Value)], m: &str) -> usize {
 fn rounds_follow_the_multiplicative_depth_checked_on_the_wire() {
     let Some(s) = Server::start(&[]) else { return };
     let rec = recorder(&s.addr, None);
-    let mut db = Client::connect(&rec.addr).unwrap();
+    let mut db = connect_owner(&rec.addr).unwrap();
     seed(&mut db, "t");
     let cases: [(&str, usize); 13] = [
         ("a*b", 1), ("a*b*c", 2), ("a*b*c*d", 3), ("(a*b)*(c*d)", 2), ("a*b + c*d + a*d", 1), ("2*a*b*3", 1), ("a/b", 1),
@@ -236,7 +236,7 @@ fn rounds_follow_the_multiplicative_depth_checked_on_the_wire() {
 fn the_depth_cap_is_enforced_before_any_request() {
     let Some(s) = Server::start(&[]) else { return };
     let rec = recorder(&s.addr, None);
-    let mut db = Client::connect_with(&rec.addr, &ConnectOptions { max_mult_depth: 2, ..Default::default() }).unwrap();
+    let mut db = Client::connect_with(&rec.addr, &ConnectOptions { expression_mode: ExprMode::Owner, max_mult_depth: 2, ..Default::default() }).unwrap();
     seed(&mut db, "t");
     assert_eq!(db.max_mult_depth(), 2);
     db.expr("t", "a*b*c", all()).unwrap(); // depth 2: allowed
@@ -251,7 +251,7 @@ fn the_depth_cap_is_enforced_before_any_request() {
     assert_eq!(db.expr("t", "a*b+0", all()).unwrap_err().kind, Kind::DepthLimitExceeded);
     db.expr("t", "s/2+a*3", all()).unwrap(); // depth 0 is always fine
     // the default is 8
-    let mut d2 = Client::connect(&s.addr).unwrap();
+    let mut d2 = connect_owner(&s.addr).unwrap();
     assert_eq!(d2.max_mult_depth(), 8);
     tiny(&mut d2, "cap8", &[1, -1]);
     let chain = |n: usize| vec!["a"; n].join("*");
@@ -263,7 +263,7 @@ fn the_depth_cap_is_enforced_before_any_request() {
 fn a_zero_denominator_does_not_change_the_request_sequence() {
     let Some(s) = Server::start(&[]) else { return };
     let rec = recorder(&s.addr, None);
-    let mut db = Client::connect(&rec.addr).unwrap();
+    let mut db = connect_owner(&rec.addr).unwrap();
     seed(&mut db, "t");
     let shape = |log: &[(String, Value)]| -> Vec<(String, Vec<usize>)> {
         log.iter().map(|(m, a)| (m.clone(), a.as_array().unwrap().iter().map(|v| v.as_array().map_or(0, |x| x.len())).collect())).collect()
@@ -288,7 +288,7 @@ fn a_zero_denominator_does_not_change_the_request_sequence() {
 #[test]
 fn division_by_zero_semantics() {
     let Some(s) = Server::start(&[]) else { return };
-    let mut db = Client::connect(&s.addr).unwrap();
+    let mut db = connect_owner(&s.addr).unwrap();
     seed(&mut db, "t");
     db.update("t", vec![("b", ci(0))], eq_int("id", 2)).unwrap();
     let e = db.expr("t", "a/b", all()).unwrap_err();
@@ -312,7 +312,7 @@ fn division_by_zero_semantics() {
 #[test]
 fn authenticated_mode_detects_tampered_operands() {
     let Some(s) = Server::start(&[]) else { return };
-    let mut db = Client::connect_with(&s.addr, &ConnectOptions { authenticated: true, ..Default::default() }).unwrap();
+    let mut db = Client::connect_with(&s.addr, &ConnectOptions { expression_mode: ExprMode::Owner, authenticated: true, ..Default::default() }).unwrap();
     seed(&mut db, "t");
     raw_rpc(&s.addr, "update_cell", json!(["t", 1, "b", {"t": "i", "v": "123456789"}]));
     for x in ["a*b*c*d", "a/b", "SUM(a*b)/COUNT(*)", "SUM(a+b)", "b*2+a"] {
@@ -341,7 +341,7 @@ fn a_forged_product_term_at_any_level_is_detected_but_not_without_authentication
     let Some(s) = Server::start(&[]) else { return };
     for level in 1..=3 {
         let rec = recorder(&s.addr, Some(bump_products(1, Some(level))));
-        let mut db = Client::connect_with(&rec.addr, &ConnectOptions { authenticated: true, ..Default::default() }).unwrap();
+        let mut db = Client::connect_with(&rec.addr, &ConnectOptions { expression_mode: ExprMode::Owner, authenticated: true, ..Default::default() }).unwrap();
         let t = format!("forge{}", level);
         seed(&mut db, &t);
         let e = db.expr(&t, "a*b*c*d", all()).unwrap_err();
@@ -355,12 +355,12 @@ fn a_forged_product_term_at_any_level_is_detected_but_not_without_authentication
         reply
     });
     let rec = recorder(&s.addr, Some(drop_first));
-    let mut db = Client::connect(&rec.addr).unwrap();
+    let mut db = connect_owner(&rec.addr).unwrap();
     seed(&mut db, "forge_len");
     assert_eq!(db.expr("forge_len", "a*b", all()).unwrap_err().kind, Kind::Integrity);
     // without authenticated mode nothing checks e*g (as for dot): the answer is silently wrong
     let rec2 = recorder(&s.addr, Some(bump_products(1, None)));
-    let mut d2 = Client::connect(&rec2.addr).unwrap();
+    let mut d2 = connect_owner(&rec2.addr).unwrap();
     seed(&mut d2, "forge_plain");
     let got = rows_of(d2.expr("forge_plain", "a*b*c", all()).unwrap());
     let want: Vec<Option<Decoded>> = rows().iter().map(|r| big(bi(r.a) * bi(r.b) * bi(r.c))).collect();
@@ -370,7 +370,7 @@ fn a_forged_product_term_at_any_level_is_detected_but_not_without_authentication
 #[test]
 fn expressions_see_uncommitted_changes_rollback_restores_and_a_vault_reload_works() {
     let Some(s) = Server::start(&[]) else { return };
-    let mut db = Client::connect_with(&s.addr, &ConnectOptions { authenticated: true, ..Default::default() }).unwrap();
+    let mut db = Client::connect_with(&s.addr, &ConnectOptions { expression_mode: ExprMode::Owner, authenticated: true, ..Default::default() }).unwrap();
     seed(&mut db, "t");
     let sum = |db: &mut Client| match db.expr("t", "SUM(a*b*c)", all()).unwrap() {
         ExprValue::Scalar(Some(Decoded::Int(b))) => b,
@@ -395,7 +395,7 @@ fn expressions_see_uncommitted_changes_rollback_restores_and_a_vault_reload_work
     let vf = tmpdir("exprvault").join("v.json");
     db.save_vault(Some(&vf)).unwrap();
     drop(db);
-    let mut db2 = Client::connect_with(&s.addr, &ConnectOptions { authenticated: true, vault_path: Some(vf), ..Default::default() }).unwrap();
+    let mut db2 = Client::connect_with(&s.addr, &ConnectOptions { expression_mode: ExprMode::Owner, authenticated: true, vault_path: Some(vf), ..Default::default() }).unwrap();
     assert_eq!(rows_of(db2.expr("t", "a*b*c", eq_int("id", 1)).unwrap()), vec![big(bi(100) * bi(r0.b) * bi(r0.c))]);
 }
 
@@ -403,7 +403,7 @@ fn expressions_see_uncommitted_changes_rollback_restores_and_a_vault_reload_work
 fn analyze_expr_sends_nothing_fhe_str_and_enc_rules() {
     let Some(s) = Server::start(&[]) else { return };
     let rec = recorder(&s.addr, None);
-    let mut db = Client::connect(&rec.addr).unwrap();
+    let mut db = connect_owner(&rec.addr).unwrap();
     db.create_table(
         "an",
         vec![
@@ -438,9 +438,9 @@ fn analyze_expr_sends_nothing_fhe_str_and_enc_rules() {
 #[test]
 fn tables_learned_only_from_the_server_are_refused() {
     let Some(s) = Server::start(&[]) else { return };
-    let mut owner = Client::connect(&s.addr).unwrap();
+    let mut owner = connect_owner(&s.addr).unwrap();
     seed(&mut owner, "t");
-    let mut other = Client::connect(&s.addr).unwrap(); // syncs the schema: untrusted
+    let mut other = connect_owner(&s.addr).unwrap(); // syncs the schema: untrusted
     assert_eq!(other.expr("t", "a*b*c", all()).unwrap_err().kind, Kind::UntrustedSchema);
     other.trust_table("t").unwrap();
     let e = other.expr("t", "a*b*c", all()).unwrap_err(); // trusted now, but no masks: loud, not wrong
@@ -450,7 +450,7 @@ fn tables_learned_only_from_the_server_are_refused() {
 #[test]
 fn a_98_level_expression_runs_exactly() {
     let Some(s) = Server::start(&[]) else { return };
-    let mut db = Client::connect_with(&s.addr, &ConnectOptions { max_mult_depth: 120, ..Default::default() }).unwrap();
+    let mut db = Client::connect_with(&s.addr, &ConnectOptions { expression_mode: ExprMode::Owner, max_mult_depth: 120, ..Default::default() }).unwrap();
     tiny(&mut db, "tall", &[1, -1]);
     assert_eq!(rows_of(db.expr("tall", &format!("a{}", "*a".repeat(98)), all()).unwrap()), vec![int(1), int(-1)]);
     assert_eq!(db.last_expr_cost().unwrap().mult_rounds, 98);
@@ -462,7 +462,7 @@ fn a_98_level_expression_runs_exactly() {
 fn a_linear_sum_is_a_pi_lin_aggregate() {
     let Some(s) = Server::start(&[]) else { return };
     let rec = recorder(&s.addr, None);
-    let mut db = Client::connect(&rec.addr).unwrap();
+    let mut db = connect_owner(&rec.addr).unwrap();
     seed(&mut db, "t");
     let n0 = rec.len();
     let want: BigInt = rows().iter().map(|r| bi(r.a) + bi(2) * bi(r.b)).sum();
@@ -489,7 +489,7 @@ fn a_max_items_limit_chunks_each_level() {
         reply
     });
     let rec = recorder(&s.addr, Some(hello_limit));
-    let mut db = Client::connect(&rec.addr).unwrap();
+    let mut db = connect_owner(&rec.addr).unwrap();
     assert_eq!(db.server_info().limits.as_ref().and_then(|l| l.max_items), Some(7));
     db.create_table("chunk", vec![col("a", "int", "paired"), col("b", "int", "paired"), col("c", "int", "paired")]).unwrap();
     let data: Vec<(i64, i64, i64)> = (0..20).map(|i| (i + 1, 2 * i - 5, i % 4 + 1)).collect();
@@ -507,7 +507,7 @@ fn a_max_items_limit_chunks_each_level() {
 #[test]
 fn the_empty_selection_and_null_operands() {
     let Some(s) = Server::start(&[]) else { return };
-    let mut db = Client::connect(&s.addr).unwrap();
+    let mut db = connect_owner(&s.addr).unwrap();
     db.create_table("nul", vec![col("id", "int", "plain"), col("w", "int", "plain"), col("a", "int", "paired"), col("b", "int", "paired")]).unwrap();
     let data = [(1, Some(2), 3, 4), (2, None, 5, 6), (3, Some(3), 7, 8)];
     db.insert_many(
@@ -552,7 +552,7 @@ fn md_pub(x: &BigInt) -> BigInt {
 fn wire_audit(auth: bool) {
     let Some(s) = Server::start(&[]) else { return };
     let rec = recorder(&s.addr, None);
-    let mut db = Client::connect_with(&rec.addr, &ConnectOptions { authenticated: auth, ..Default::default() }).unwrap();
+    let mut db = Client::connect_with(&rec.addr, &ConnectOptions { expression_mode: ExprMode::Owner, authenticated: auth, ..Default::default() }).unwrap();
     seed(&mut db, "aud");
     db.update("aud", vec![("b", ci(2_000_099))], eq_int("id", 2)).unwrap();
     let mut rs = rows();
@@ -653,7 +653,7 @@ fn wire_audit_authenticated() {
 fn identical_plaintexts_give_uniform_openings_at_every_level() {
     let Some(s) = Server::start(&[]) else { return };
     let rec = recorder(&s.addr, None);
-    let mut db = Client::connect(&rec.addr).unwrap();
+    let mut db = connect_owner(&rec.addr).unwrap();
     db.create_table("uni", vec![col("a", "int", "paired"), col("b", "int", "paired"), col("c", "int", "paired"), col("d", "int", "paired")]).unwrap();
     db.insert_many("uni", (0..1200).map(|_| vec![("a", ci(7)), ("b", ci(7)), ("c", ci(7)), ("d", ci(7))]).collect()).unwrap();
     let n0 = rec.len();
@@ -690,7 +690,7 @@ fn a_malformed_mult_combine_batch_reply_is_a_typed_error() {
             "mult_combine_batch" => Some(Reply::Json(rep.clone())),
             _ => None,
         }));
-        let mut db = Client::connect(&f.addr).unwrap();
+        let mut db = connect_owner(&f.addr).unwrap();
         db.create_table("t", vec![col("a", "int", "paired"), col("b", "int", "paired")]).unwrap();
         db.insert_many("t", vec![vec![("a", ci(1)), ("b", ci(2))], vec![("a", ci(3)), ("b", ci(4))]]).unwrap();
         assert!(db.expr("t", "a*b", all()).is_err(), "{}", reply);
@@ -707,13 +707,13 @@ fn a_server_that_relabels_encrypted_columns_as_plain_gets_no_expression_request(
         "schema" => Some(Reply::Json(json!({"ok": [["id", "int", "plain"], ["v", "int", "plain"], ["w", "int", "paired"]]}))),
         _ => None,
     }));
-    let mut db = Client::connect(&f.addr).unwrap();
+    let mut db = connect_owner(&f.addr).unwrap();
     let n0 = f.seen().len();
     for x in ["v*w+0", "w*v*w", "SUM(w+v)"] {
         assert_eq!(db.expr("t", x, all()).unwrap_err().kind, Kind::UntrustedSchema, "{}", x);
     }
     assert_eq!(f.seen().len(), n0, "an expression request reached the server");
     // also with a trusted-by-flag connection the missing masks are a loud error, never a wrong value
-    let mut t = Client::connect_with(&f.addr, &ConnectOptions { trust_server_schema: true, ..Default::default() }).unwrap();
+    let mut t = Client::connect_with(&f.addr, &ConnectOptions { expression_mode: ExprMode::Owner, trust_server_schema: true, ..Default::default() }).unwrap();
     assert!(t.expr("t", "w*w+0", all()).is_err());
 }

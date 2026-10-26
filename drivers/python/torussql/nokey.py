@@ -298,6 +298,11 @@ class RemoteNoKeyServer:
         args = [lt, lc, lids, rt, rc, rids] + ([backend] if backend else [])
         return _b64d(self._c.call("fhe_dot", args))
 
+    def fhe_mul(self, table, mode, ids, ids_r, lterms, lconst, rterms, rconst, backend=None):
+        """Product of two integer-linear operands over FHE columns (v0.6.1): public data only."""
+        args = [table, mode, ids, ids_r, lterms, lconst, rterms, rconst] + ([backend] if backend else [])
+        return _b64d(self._c.call("fhe_mul", args))
+
     def fhe_rows(self, table, start, count):
         """Scan of an anchored table (see ``torusdb_core.fhe_anchor``): -> (slots, rows) exactly
         like ``NoKeyServer.fhe_rows``. The reply is parsed strictly; anything malformed is
@@ -1265,7 +1270,8 @@ def connect(host: str = "127.0.0.1", port: int = 8533, *,
             the ciphertexts with pairings: fast, but the result cannot be integrity-checked),
             ``"local"`` (the owner reads both operand columns, each cell verified by its tag, and
             multiplies the plaintexts: verified, O(n) decryptions) or ``"auto"`` (default:
-            delegated without ``authenticated``, local with it)
+            delegated without ``authenticated``, local with it). The same mode decides who multiplies
+            in FHE expressions such as ``SUM((a+2*b)*(c-d))`` / ``SUM(a)*SUM(b)`` (dialect v0.6.1)
         fhe_allow_unverified_dot: legacy; with ``authenticated=True`` it selects ``"delegated"``
         integrity_anchor: a file path, or an ``Anchor`` object (``QuorumAnchor`` in ``torussql.custody.anchor``
             replicates it over k-of-n custodians: no single store to lose), holding the owner-trusted

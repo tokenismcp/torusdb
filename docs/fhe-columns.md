@@ -10,12 +10,16 @@
 > * **public scalar × ciphertext** (`k * SUM(col)`) is plain EC scalar multiplication of the
 >   ciphertext points — cheap, and a different operation.
 
-> **Limits (dialect v0.6).** `FHE` columns support `SUM`, `AVG`, `k * SUM(col)` and a single `DOT`
-> between two `FHE` columns. They cannot appear in the v0.6 arithmetic expressions: `x*y*x`,
-> `x/2`, `x+1`, `SUM(x)/COUNT(*)` and `SUM(x*y)` are rejected with an error naming `FHE` (never a
-> wrong answer), because a pairing product lands in the target group GT and cannot be multiplied
-> again. Products of arbitrary depth and division are available for `ENC`/`PAIRED` columns only
-> (computed at the owner; `crypto-review-packet.md` §3.3).
+> **Limits (dialect v0.6.1).** `FHE` columns support `SUM`, `AVG`, `k * SUM(col)`, a single `DOT` between
+> two `FHE` columns, and — new in v0.6.1 — **depth-1 products of integer-linear forms, aggregated**
+> (`SUM((a + 2*b) * (c - d))`, `SUM(a) * SUM(b)`, `2*SUM(a*b) - SUM(c*d)/4 + 7`, `AVG(a*b)`; section
+> "Expressions over FHE columns" below). Everything deeper is rejected with an error naming `FHE`
+> (never a wrong answer): a product of products (`SUM(a*b)*SUM(c)`, `SUM(a*b*c)`), any division by a
+> non-literal, `x+1`, `SUM(x)/COUNT(*)`, FHE mixed with `PLAIN`/`ENC`/`PAIRED` columns, a per-row
+> product, operands that are not integer-linear. The reason is structural: a pairing product lands in
+> the target group GT and cannot be paired again, and this design does **not** decrypt-and-re-encrypt an
+> intermediate (neither at the server nor at the owner). Arbitrary depth and division are available for
+> `ENC`/`PAIRED` columns only (computed with the owner; `crypto-review-packet.md` §3.3).
 
 `ENC`/`PAIRED` columns use the *no-key delegation* protocol: the server stores one-time
 pads and the owner finishes every computation. **`FHE` columns** are the other, complementary
@@ -79,6 +83,103 @@ guess. Using an independent `s2` for the G2 half closes both. `tests/test_fhe.py
 pairing identity between a cell and the public keys, with a positive control showing the weak
 variants are broken.
 
+## Expressions over FHE columns (dialect v0.6.1)
+
+```sql
+-- emp (id INT PLAIN, dept INT PLAIN, rate INT FHE, hours INT FHE, bonus INT FHE)
+SELECT SUM((rate + bonus) * hours) FROM emp;                    -- operands are integer-linear forms
+SELECT SUM((rate + 2*bonus) * (hours - 8)) FROM emp WHERE dept = 5;   -- operands: integer-LINEAR forms
+SELECT SUM(rate) * SUM(hours) FROM emp;                         -- product of two aggregates
+SELECT (SUM(rate) + 2*SUM(bonus)) * (SUM(hours) - 1) FROM emp;
+SELECT 2*SUM(rate*hours) - SUM(bonus*hours)/4 + 7 FROM emp;     -- public scale / add / divide AFTER decryption
+SELECT AVG(rate * hours), COUNT(*) FROM emp;                    -- AVG = SUM / n at the owner
+SELECT dept, SUM(2*rate*hours) FROM emp GROUP BY dept;
+```
+
+**Accepted** (checked by one function, `torussql_parser.fhe_expr`, shared by the open validator, the planner
+and the evaluator): a public affine combination (`+ - `, `* literal`, `/ nonzero literal`, unary minus, AVG's
+`1/n`) of *terms*, at least one of which is a **product** `L * R` whose operands `L`, `R` are integer-linear forms
+`k1*c1 + k2*c2 + ... + k0` of FHE columns (or, for `SUM(c)*SUM(d)`, of their SUMs), aggregated either row by row
+(`SUM(L*R)`) or as aggregates (`AL * AR`). Coefficients and constants are integers with `|k| <= 2^40`, at most 16
+columns per operand, at most 16 products per expression. A plain `SUM(L)` / `SUM(c)` may appear as an extra term.
+One spelling is deliberately kept rejected: `SUM(x * y)` over exactly two bare FHE columns *is* `DOT(x, y)` (use `DOT`); it was
+rejected before v0.6.1 and the v0.5/v0.6 conformance suite and the cross-language expression vectors pin that, so it keeps its
+text. Every other product (`SUM(2*x*y)`, `SUM((x+0)*y)`, `SUM(x*y)*1`) is accepted. The switch is one constant
+(`torussql_parser.fhe_expr.REJECT_BARE_COLUMN_PRODUCT`).
+
+**Rejected with a precise message** (never evaluated): a product of a product (`SUM(a*b)*SUM(c)`, `SUM(a*b*c)`,
+`SUM(a)*SUM(b)*SUM(c)`: depth 2), any division whose denominator is not a literal, an `AVG`/sum of terms used as a
+factor, non-integer or oversized operand coefficients (`SUM(a/2*b)` — write `SUM(a*b)/2`), FHE columns together with
+`PLAIN`/`ENC`/`PAIRED` columns, a per-row (non-aggregated) FHE value or product (`a+1`, `(a+1)*(b+1)`; the projection
+`a * b` keeps its v0.5 rejection), joins, `COUNT(*)` inside the expression, expressions with no product. FHE columns hold no
+`NULL` (an INSERT/UPDATE of NULL is refused), so there is no NULL handling to define; an empty selection gives `SUM = 0` and
+`AVG = NULL`, and an expression whose AVG sees no rows is `NULL`.
+
+### Who computes what
+
+| Step | Who | Data it touches |
+|---|---|---|
+| Parse, validate, plan, choose rows (`WHERE` on PLAIN columns) | owner + server (as for every query) | PLAIN data, the query text |
+| Operand ciphertexts `Enc(L)`, `Enc(R)`: `Σ k·D1`, `Σ k·D2 + c·G2` (G2 half of the left operand) and `Σ k·C1`, `Σ k·C2 + c·G1` (G1 half of the right one); for aggregates the cells of the selected rows are summed first | **server** (default mode) | stored cells + the query's integer literals. Constants are added as "trivial" ciphertexts (randomness 0) |
+| Pairing of the two halves: 4 Miller loops per row for `SUM(L*R)` (multiplied, then ONE final exponentiation per component), 4 pairings in total for `AL*AR` | **server** | the operand points above |
+| Opening a GT result: `c11·c01^-s2·c10^-s·c00^(s·s2)`, one bounded GT discrete log per product term | **owner** (or a custodian quorum for a threshold key) | the GT blob(s) |
+| `SUM(c)` terms | server adds, owner opens (as `SUM`) | — |
+| Public scale / sum / `/ literal` / AVG's `1/n`, in exact `Fraction` arithmetic | **owner**, after decryption | decrypted integers |
+
+The server holds **no key**, receives **no ciphertext, mask, tag key or plaintext-derived number** from the owner (the
+request is table/column names, row ids, the two mode strings, a back-end hint and small integers that are literals of
+the query — pinned by the wire audit in `tests/test_fhe_expr.py`), decrypts nothing and re-encrypts nothing. The owner
+never decrypts, re-encrypts or re-uploads an intermediate: there are none, the only intermediate is a GT element
+that the owner opens once. Cost per statement (`conn.client.last_expr_cost`): `server_products` GT blobs,
+`pairings` (4 per row for `SUM(L*R)`), `gt_results` discrete logs (each ≈ √(2·range) GT multiplications, worst case; the
+baby-step table is built once per key), `decrypted_cells` (0 when the server multiplies), `mult_rounds` and `depth`
+always 0 (no owner round trip exists). Pure Python: ≈0.2 s per pairing, i.e. ≈0.8 s per row; native: ≈1 ms per row.
+Request sizes follow `hello.limits.fhe` (`max_dot_rows`, `max_mul_work`, `max_mul_agg_rows`, `recommended_dot_rows`):
+a `SUM(L*R)` is chunked by rows (blobs multiply by bilinearity); an `AL*AR` over more rows than one request allows
+costs `m²` requests for `m` chunks (`Σ_u L_u · Σ_v R_v = Π e(L_u, R_v)`).
+
+### Integrity: authenticated connections verify by recomputing
+
+A tag is linear in the value, so the product of two ciphertexts cannot be tag-checked (the same reason as for `DOT`).
+These expressions therefore follow `fhe_dot_mode` exactly:
+
+* `auto` (default) **without** `authenticated=True` → *delegated*: the server multiplies, **no integrity** (a lying server
+  gives a wrong number, or *out of range*).
+* `auto` **with** `authenticated=True` (and with an anchor, which additionally pins the row set and the version of every cell)
+  → *local*: the owner reads the operand cells, each verified against its row-bound tag (and the anchored table state), or the
+  verified `SUM`s, and multiplies the plaintexts itself (`O(rows × columns)` decryptions); the server only serves cells and sums.
+  Local mode additionally requires every operand `SUM` to lie in the key's range.
+* `fhe_dot_mode="delegated"` on an authenticated connection (legacy `fhe_allow_unverified_dot=True`) is an explicit opt-in to an
+  **unverified** server product, as for `DOT`. There is no half-way mode: this release does not pretend to verify a pairing
+  result it cannot verify.
+
+Range: the exact integer of every product term must lie in `[-range, range]` (`range <= 2^40`) in both modes, otherwise
+`FheError` ("outside the key's value range") — decryption never wraps. The bounds on operands keep every true product
+below `2^232 << n/2 ≈ 2^253` for any table of at most `2^32` rows, so a residue inside the range *is* the integer.
+A public scale applied after decryption (`5*SUM(a*b)`) may leave the range; only the decrypted terms are bounded.
+
+### Security argument (and what is not proven)
+
+* *Correctness.* Every cell is a valid encryption `(C1,C2 | D1,D2)` of `v` under independent randomness `r1`, `r2`. Integer
+  combinations and constants preserve validity on each half separately (`Σk·D1 = (Σk·r2)·G2` and `Σk·D2 + c·G2 = (Σk·v + c)·G2 +
+  (Σk·r2)·Q2`), the pairing is bilinear, so `e(Enc2(L), Enc1(R))` opens to `g^(L·R)` with the unchanged `decrypt_dot`; sums of
+  products and chunking multiply Miller outputs. The differential tests compare every shape with exact integer / `Fraction`
+  arithmetic on both back ends.
+* *Server view.* Every value the server computes is a function of public data (stored cells, query literals, row ids); the GT
+  result goes to the owner only. The owner issues requests that depend on the query text and on the row ids of the selection,
+  never on a decrypted value. So a server that follows the protocol learns the query shape (which rows, which columns, which
+  coefficients, how many products) and nothing about the data beyond what stored cells already give it. Two pitfalls from the
+  review log stay closed: halves use independent randomness (`r1 != r2`) and independent secrets (`Q2 = s2·G2`, `s2 != s`),
+  and **no new key-dependent value is ever published** — combinations are built per query, in memory, and returned only as a
+  GT ciphertext. A test pins the value-oracle identities on a *combined* operand (and a positive control that fires for the weak
+  `Q2 = s·G2`), and that a fully cancelled combination is the public constant.
+* *Not proven here.* (1) The reduction "the server's capability to pair any G2 half with any G1 half leaks nothing about the
+  plaintexts" is the SXDH argument already used for `DOT`; it is **not independently reviewed**, and the dependence of `s2` on `s`
+  (a hash) is a design choice, not a proof. (2) A malicious server's *wrong* blob is an unauthenticated-delegated risk: the
+  owner's decryption outcome (success, or a range/subgroup error) is observable to whoever sees the application's behaviour; the
+  owner checks every GT component it uses as an exponent base is in the order-`n` subgroup (F6), but that does not make the result
+  correct. (3) Access patterns (which rows/columns/coefficients) are visible to the server, as for every query.
+
 ## Limits — read before relying on it
 
 * **Integrity is partial** (`authenticated=True`) — and with an **integrity anchor** (next section) the two
@@ -103,7 +204,7 @@ variants are broken.
 * **What the server still sees:** plaintext columns, the schema, row counts, which rows each
   query touches, and the fact that two cells are equal *only* if you tell it (it cannot test).
 * **No WHERE/ORDER/GROUP BY/MIN/MAX/JOIN on FHE columns; no `k*col`, `a*b` per row, rational
-  values.** Rejected loudly by the validator and the planner.
+  values; products only to depth 1** (see "Expressions over FHE columns"). Rejected loudly by the validator and the planner.
 * **Range:** every plaintext and every result must lie in `[-range, range]`; larger sums raise
   an error rather than wrap. Decryption keeps a table of ≈ √(2·range) entries (range 10^9 ≈
   45 k entries, a few seconds the first time per process).

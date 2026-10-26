@@ -132,6 +132,7 @@ class PExpr:
     ct_muls: int          # ciphertext x ciphertext products per row (Beaver triples per row)
     inversions: int       # owner-assisted inversions (non-constant denominators)
     text: str
+    fhe: bool = False     # over FHE columns: the SERVER pairs the ciphertexts (no owner rounds, depth 0)
 
 
 PProj = Union[PColRef, PSum, PDot, PCtMul, PScalarMul, PScaledSum, PCountStar,
@@ -505,12 +506,13 @@ def _plan_select(q: Select, cat: Catalog) -> Plan:
                                         policy=col.policy))
             elif isinstance(proj, ExprProj):
                 try:
-                    folded, info = analyze_expr(proj.expr, scope.resolve)
+                    folded, info = analyze_expr(proj.expr, scope.resolve, fhe_ok=not is_join)
                 except _OpenValidationError as exc:
                     raise PlanError(str(exc)) from None
                 projs.append(PExpr(expr=_qualify(folded, scope, qn), kind=info.kind,
                                    enc=info.enc, depth=info.depth, ct_muls=info.ct_muls,
-                                   inversions=info.inversions, text=_render_expr(folded)))
+                                   inversions=info.inversions, text=_render_expr(folded),
+                                   fhe=info.fhe))
             elif isinstance(proj, CountStar):
                 projs.append(PCountStar())
             elif isinstance(proj, AvgExpr):

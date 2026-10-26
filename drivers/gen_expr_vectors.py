@@ -11,6 +11,13 @@ The Python parser/engine is the reference. For every expression text this record
                 strings "n" / "n/d", NULL as null, a per-row expression as a list), the cost the owner
                 spent (rounds == depth) - or the error class.
 
+Every exec case carries TWO expectations: the top-level `value` / `error` / `cost` of expr_mode="owner"
+(the owner-computed transport) and a `shared` object for expr_mode="shared" (the default: every wire a
+two-party additive sharing; a division by an ENCRYPTED value costs one extra level, so depth / rounds and
+the depth cap differ for those expressions). The shared cost also carries the transport accounting
+(openings, wires, requests, reveals) and `trace`, the sha256 of the language-neutral shape of every wire
+request the owner sent (drivers/wire_shape.py), which pins the whole gate / batching / free structure.
+
 The TypeScript and Rust drivers re-run every case and must agree exactly (drivers/typescript/test/
 expr.test.ts, drivers/rust/tests/expr.rs). Re-generate with:
 
@@ -41,6 +48,7 @@ from torusdb_core.nokey_engine import NoKeyClient, NoKeyServer  # noqa: E402
 from torusdb_core.planner import _Scope                          # noqa: E402
 from torusdb_core.catalog import ColumnSpec, TableSpec          # noqa: E402
 from torusdb_core.protocol import OutOfBudget                    # noqa: E402
+import wire_shape                                                # noqa: E402  (drivers/wire_shape.py)
 
 F = Fraction
 
@@ -193,10 +201,25 @@ def lit(v):
     return str(int(v))
 
 
-def make_client(auth=False):
-    cli = NoKeyClient(NoKeyServer(), authenticated=auth)
-    if hasattr(cli, "expr_mode"):
-        cli.expr_mode = "owner"          # the owner-computed evaluation the TypeScript / Rust drivers implement
+class TracingServer(NoKeyServer):
+    """The in-process server, recording the shape of every wire request (wire_shape.py)."""
+
+    def __init__(self):
+        super().__init__()
+        self.trace = []
+
+    def wire_exec(self, ops):
+        self.trace.append(wire_shape.exec_entry(ops))
+        return super().wire_exec(ops)
+
+    def wire_free(self, ids=None):
+        self.trace.append(wire_shape.free_entry(ids))
+        return super().wire_free(ids)
+
+
+def make_client(auth=False, mode="owner"):
+    cli = NoKeyClient(TracingServer(), authenticated=auth)
+    cli.expr_mode = mode                 # "owner": v0.6 transport; "shared": the default Pi_C shared wires
     for name, schema, rows in TABLES:
         cols = ", ".join(f"{n} {t.upper()} {'ENC' if p == 'encrypted' else p.upper()}" for n, t, p in schema)
         cli.execute(f"CREATE TABLE {name} ({cols})")
@@ -207,7 +230,7 @@ def make_client(auth=False):
 
 
 def run_query(cli, case):
-    """-> result dict for one exec case"""
+    """-> result dict for one exec case (the shared mode adds the transport cost fields and the trace)"""
     where = ""
     w = case.get("where")
     if w:
@@ -223,16 +246,26 @@ def run_query(cli, case):
         frm = case["table"]
     sql = f"SELECT {case['expr']} FROM {frm}{where}"
     cli.max_mult_depth = case.get("max_depth", 8)
+    shared = cli.expr_mode == "shared"
+    cli.server.trace.clear()
     try:
         rs = cli.execute(sql)
     except Exception as exc:                                    # noqa: BLE001
-        return {"error": cls(exc), "message": str(exc)}
+        res = {"error": cls(exc), "message": str(exc)}
+        if shared:
+            res["trace"] = wire_shape.digest(cli.server.trace)
+        return res
     v = rs.rows[0][0]
     cost = cli.last_expr_cost
     res = {"value": [sval(x) for x in v] if isinstance(v, list) else sval(v)}
     if cost is not None:
         res["cost"] = {"depth": cost["depth"], "mult_rounds": cost["mult_rounds"], "products": cost["products"],
                        "inversions": cost["inversions"], "linear_sums": cost["linear_sums"]}
+        if shared:
+            for k in ("openings", "wires", "requests", "reveals"):
+                res["cost"][k] = cost[k]
+    if shared:
+        res["trace"] = wire_shape.digest(cli.server.trace)
     return res
 
 
@@ -339,6 +372,7 @@ def main():
         cases.append({"table": "t", "expr": tree_sql(tr)})
 
     plain, auth = make_client(False), make_client(True)
+    splain, sauth = make_client(False, "shared"), make_client(True, "shared")
     for c in cases:
         r = run_query(plain, c)
         ra = run_query(auth, c)
@@ -346,8 +380,23 @@ def main():
             raise SystemExit(f"unexpected IntegrityError for {c}")
         # authenticated mode must agree with plain mode (values and errors; the cost may differ)
         assert {k: v for k, v in r.items() if k != "message"} == {k: v for k, v in ra.items() if k != "message"}, (c, r, ra)
+        rs_, rsa = run_query(splain, c), run_query(sauth, c)
+        for x in (rs_, rsa):
+            if x.get("error") == "IntegrityError":
+                raise SystemExit(f"unexpected IntegrityError (shared) for {c}")
+        # the shared mode agrees with the owner mode on every value; errors agree except the depth cap
+        # (a division by an encrypted value is one level deeper); plain and authenticated shared runs
+        # agree on values, errors and costs (the authenticated trace differs: tagged wires)
+        if "value" in r and "value" in rs_:
+            assert r["value"] == rs_["value"], (c, r, rs_)
+        elif "error" in r and "error" in rs_ and rs_["error"] != "DepthLimitExceeded":
+            assert r["error"] == rs_["error"], (c, r, rs_)
+        assert {k: v for k, v in rs_.items() if k not in ("message", "trace")} == \
+            {k: v for k, v in rsa.items() if k not in ("message", "trace")}, (c, rs_, rsa)
         c = dict(c)
         c.update(r)
+        c["shared"] = rs_
+        c["shared_auth_trace"] = rsa["trace"]
         out["exec"]["cases"].append(c)
     json.dump(out, sys.stdout, indent=1, ensure_ascii=True)
     sys.stdout.write("\n")

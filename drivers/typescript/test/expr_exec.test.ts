@@ -10,7 +10,7 @@ import {
   Client, TorusError, eq, ne, gt, isIn, N, Column, JoinResult, ExprValue, encodeInt, encodeRational, Decoded,
 } from "../src/torusdb";
 import { fake, base, recorder, rawRpc, Recorder } from "./fake";
-import { skipReason, startServer, RunningServer, tmpdir, EXPR_VECTORS } from "./helpers";
+import { skipReason, startServer, RunningServer, tmpdir, EXPR_VECTORS, ownerConnect } from "./helpers";
 
 const skip = skipReason();
 let srv: RunningServer;
@@ -72,7 +72,7 @@ for (const auth of [false, true]) {
   R(`vectors: ${vec.exec.cases.length} expressions give the Python reference's result, error and cost (${auth ? "authenticated" : "plain"})`, async () => {
     const s = await startServer();
     try {
-      const db = await Client.connect(s.host, s.port, { authenticated: auth, timeoutMs: 60_000 });
+      const db = await ownerConnect(s.host, s.port, { authenticated: auth, timeoutMs: 60_000 });
       await loadTables(db);
       let ok = 0, bad = 0;
       for (const c of vec.exec.cases) {
@@ -120,7 +120,7 @@ const tname = (b: string) => `${b}_${process.pid}_${++seq}`;
 
 R("rounds follow the multiplicative depth, one mult_combine_batch per level (checked on the wire)", async () => {
   const rec = await recorder(srv);
-  const db = await Client.connect("127.0.0.1", rec.port);
+  const db = await ownerConnect("127.0.0.1", rec.port);
   const t = tname("rd");
   await seed(db, t);
   const cases: Array<[string, number]> = [["a*b", 1], ["a*b*c", 2], ["a*b*c*d", 3], ["(a*b)*(c*d)", 2],
@@ -139,7 +139,7 @@ R("rounds follow the multiplicative depth, one mult_combine_batch per level (che
 
 R("the depth cap is enforced before ANY request, per connection and per assignment", async () => {
   const rec = await recorder(srv);
-  const db = await Client.connect("127.0.0.1", rec.port, { maxMultDepth: 2 });
+  const db = await ownerConnect("127.0.0.1", rec.port, { maxMultDepth: 2 });
   const t = tname("cap");
   await seed(db, t);
   assert.equal(db.maxMultDepth, 2);
@@ -153,10 +153,10 @@ R("the depth cap is enforced before ANY request, per connection and per assignme
   await assert.rejects(db.expr(t, "a*b+0"), kind("DepthLimitExceeded"));
   assert.ok(await db.expr(t, "s/2+a*3"));                                    // depth 0 is always fine
   for (const bad of [-1, 1.5, NaN, "3" as any]) assert.throws(() => { db.maxMultDepth = bad; }, kind("InterfaceError"));
-  await assert.rejects(Client.connect("127.0.0.1", rec.port, { maxMultDepth: -2 }), kind("InterfaceError"));
+  await assert.rejects(ownerConnect("127.0.0.1", rec.port, { maxMultDepth: -2 }), kind("InterfaceError"));
   db.close(); rec.close();
   // the default is 8
-  const d2 = await Client.connect(srv.host, srv.port);
+  const d2 = await ownerConnect(srv.host, srv.port);
   assert.equal(d2.maxMultDepth, 8);
   const t2 = tname("cap8");
   await d2.createTable(t2, [{ name: "a", type: "int", policy: "paired" }]);
@@ -168,7 +168,7 @@ R("the depth cap is enforced before ANY request, per connection and per assignme
 
 R("a zero denominator does not change the request sequence the server sees", async () => {
   const rec = await recorder(srv);
-  const db = await Client.connect("127.0.0.1", rec.port);
+  const db = await ownerConnect("127.0.0.1", rec.port);
   const t = tname("zero");
   await seed(db, t);
   const exprs = ["a/b", "c*d/(a-a+b)*a", "SUM(a/b*c)", "a*c/(b+d-d)", "100/(b-b+b)"];
@@ -191,7 +191,7 @@ R("a zero denominator does not change the request sequence the server sees", asy
 });
 
 R("division by zero: rows removed by WHERE do not count; an empty aggregate divides by zero; no cost is recorded", async () => {
-  const db = await Client.connect(srv.host, srv.port);
+  const db = await ownerConnect(srv.host, srv.port);
   const t = tname("dz");
   await seed(db, t);
   await db.update(t, { b: 0n }, eq("id", 2));
@@ -206,7 +206,7 @@ R("division by zero: rows removed by WHERE do not count; an empty aggregate divi
 });
 
 R("authenticated mode: tampered operands are detected through deep products, divisions and linear sums", async () => {
-  const db = await Client.connect(srv.host, srv.port, { authenticated: true });
+  const db = await ownerConnect(srv.host, srv.port, { authenticated: true });
   const t = tname("tamper");
   await seed(db, t);
   const forged = { t: "i", v: "123456789" };
@@ -226,7 +226,7 @@ R("authenticated mode: a forged product term at ANY level is detected; unauthent
       }
       return reply;
     });
-    const db = await Client.connect("127.0.0.1", rec.port, { authenticated: true });
+    const db = await ownerConnect("127.0.0.1", rec.port, { authenticated: true });
     const t = tname("forge");
     await seed(db, t);
     await assert.rejects(db.expr(t, "a*b*c*d"), (e: unknown) => e instanceof TorusError && e.kind === "IntegrityError" && /forged product/.test(e.message), `level ${level}`);
@@ -234,7 +234,7 @@ R("authenticated mode: a forged product term at ANY level is detected; unauthent
   }
   // a reply with the wrong number of terms is an integrity failure too
   const rec = await recorder(srv, (m, _a, reply) => (m === "mult_combine_batch" && reply.ok ? { ok: reply.ok.slice(1) } : reply));
-  const db = await Client.connect("127.0.0.1", rec.port);
+  const db = await ownerConnect("127.0.0.1", rec.port);
   const t = tname("forge2");
   await seed(db, t);
   await assert.rejects(db.expr(t, "a*b"), kind("IntegrityError"));
@@ -242,7 +242,7 @@ R("authenticated mode: a forged product term at ANY level is detected; unauthent
   // without authenticated mode nothing checks e*g (as for dot): the answer is silently wrong
   const rec2 = await recorder(srv, (m, _a, reply) => (m === "mult_combine_batch" && reply.ok
     ? { ok: reply.ok.map((x: string) => ((BigInt(x) + 1n) % N).toString()) } : reply));
-  const d2 = await Client.connect("127.0.0.1", rec2.port);
+  const d2 = await ownerConnect("127.0.0.1", rec2.port);
   const t2 = tname("forge3");
   await seed(d2, t2);
   const got = await d2.expr(t2, "a*b*c") as Decoded[];
@@ -251,7 +251,7 @@ R("authenticated mode: a forged product term at ANY level is detected; unauthent
 });
 
 R("expressions see uncommitted changes, rollback restores, a vault reload keeps working", async () => {
-  const db = await Client.connect(srv.host, srv.port, { authenticated: true });
+  const db = await ownerConnect(srv.host, srv.port, { authenticated: true });
   const t = tname("tx");
   await seed(db, t);
   const before = await db.expr(t, "SUM(a*b*c)") as bigint;
@@ -270,14 +270,14 @@ R("expressions see uncommitted changes, rollback restores, a vault reload keeps 
   const vf = path.join(tmpdir(), "v.json");
   db.saveVault(vf);
   db.close();
-  const db2 = await Client.connect(srv.host, srv.port, { authenticated: true, vaultPath: vf });
+  const db2 = await ownerConnect(srv.host, srv.port, { authenticated: true, vaultPath: vf });
   assert.deepEqual(await db2.expr(t, "a*b*c", eq("id", 1)), [100n * ROWS[0].b * ROWS[0].c]);
   db2.close();
 });
 
 R("analyzeExpr reports kind/depth/cost without a request; FHE columns are rejected naming FHE; STR/ENC rules", async () => {
   const rec = await recorder(srv);
-  const db = await Client.connect("127.0.0.1", rec.port);
+  const db = await ownerConnect("127.0.0.1", rec.port);
   const t = tname("an");
   await db.createTable(t, [
     { name: "id", type: "int", policy: "plain" }, { name: "nm", type: "str", policy: "plain" },
@@ -299,10 +299,10 @@ R("analyzeExpr reports kind/depth/cost without a request; FHE columns are reject
 });
 
 R("tables learned only from the server are refused for expressions (a lying server could relabel a column)", async () => {
-  const owner = await Client.connect(srv.host, srv.port);
+  const owner = await ownerConnect(srv.host, srv.port);
   const t = tname("untrusted");
   await seed(owner, t);
-  const other = await Client.connect(srv.host, srv.port);            // syncSchema: learns the table, untrusted
+  const other = await ownerConnect(srv.host, srv.port);            // syncSchema: learns the table, untrusted
   await assert.rejects(other.expr(t, "a*b*c"), kind("UntrustedSchema"));
   other.trustTable(t);
   await assert.rejects(other.expr(t, "a*b*c"), /no mask/);           // trusted now, but it has no masks: loud, not wrong
@@ -310,7 +310,7 @@ R("tables learned only from the server are refused for expressions (a lying serv
 });
 
 R("an expression 98 levels high runs (maximum parser height), exactly", async () => {
-  const db = await Client.connect(srv.host, srv.port, { maxMultDepth: 120, timeoutMs: 120_000 });
+  const db = await ownerConnect(srv.host, srv.port, { maxMultDepth: 120, timeoutMs: 120_000 });
   const t = tname("tall");
   await db.createTable(t, [{ name: "a", type: "int", policy: "paired" }]);
   await db.insertMany(t, [{ a: 1n }, { a: -1n }]);
@@ -323,7 +323,7 @@ R("an expression 98 levels high runs (maximum parser height), exactly", async ()
 
 R("a linear SUM is a Pi_lin aggregate (blinded_sum), not a row download; coefficients may exceed the budget while the result does not", async () => {
   const rec = await recorder(srv);
-  const db = await Client.connect("127.0.0.1", rec.port);
+  const db = await ownerConnect("127.0.0.1", rec.port);
   const t = tname("lin");
   await seed(db, t);
   const n0 = rec.log.length;
@@ -347,7 +347,7 @@ R("a server limit on max_items chunks each level into several requests, still on
     if (m === "hello" && reply.ok) return { ok: { ...reply.ok, limits: { ...(reply.ok.limits ?? {}), max_items: 7 } } };
     return reply;
   });
-  const db = await Client.connect("127.0.0.1", rec.port);
+  const db = await ownerConnect("127.0.0.1", rec.port);
   assert.equal(db.serverInfo.limits?.maxItems, 7);
   const t = tname("chunk");
   await db.createTable(t, [{ name: "a", type: "int", policy: "paired" }, { name: "b", type: "int", policy: "paired" }, { name: "c", type: "int", policy: "paired" }]);
@@ -363,7 +363,7 @@ R("a server limit on max_items chunks each level into several requests, still on
 });
 
 R("the empty selection and NULL operands", async () => {
-  const db = await Client.connect(srv.host, srv.port);
+  const db = await ownerConnect(srv.host, srv.port);
   const t = tname("nul");
   await db.createTable(t, [{ name: "id", type: "int", policy: "plain" }, { name: "w", type: "int", policy: "plain" },
     { name: "a", type: "int", policy: "paired" }, { name: "b", type: "int", policy: "paired" }]);
@@ -391,7 +391,7 @@ const encR = (num: bigint, den: bigint) => encodeRational(num, den);
 for (const auth of [false, true]) {
   R(`wire audit: nothing derived from keys, masks or plaintexts reaches the server (${auth ? "authenticated" : "plain"})`, async () => {
     const rec = await recorder(srv);
-    const db = await Client.connect("127.0.0.1", rec.port, { authenticated: auth });
+    const db = await ownerConnect("127.0.0.1", rec.port, { authenticated: auth });
     const t = tname("aud");
     await seed(db, t);
     await db.update(t, { b: 2_000_099n }, eq("id", 2));
@@ -451,7 +451,7 @@ for (const auth of [false, true]) {
 
 R("wire audit: identical plaintexts give uniform openings at every level", async () => {
   const rec = await recorder(srv);
-  const db = await Client.connect("127.0.0.1", rec.port);
+  const db = await ownerConnect("127.0.0.1", rec.port);
   const t = tname("uni");
   await db.createTable(t, [{ name: "a", type: "int", policy: "paired" }, { name: "b", type: "int", policy: "paired" },
     { name: "c", type: "int", policy: "paired" }, { name: "d", type: "int", policy: "paired" }]);
@@ -483,7 +483,7 @@ test("a malformed mult_combine_batch reply is a typed error, never a wrong numbe
       blinded_cells: { ok: [{ t: "i", v: "5" }, { t: "i", v: "6" }] },
       mult_combine_batch: reply as any,
     }));
-    const db = await Client.connect("127.0.0.1", f.port);
+    const db = await ownerConnect("127.0.0.1", f.port);
     await db.createTable("t", [{ name: "a", type: "int", policy: "paired" }, { name: "b", type: "int", policy: "paired" }]);
     await db.insertMany("t", [{ a: 1, b: 2 }, { a: 3, b: 4 }]);
     await assert.rejects(db.expr("t", "a*b"), (e: unknown) => e instanceof TorusError, JSON.stringify(reply));
@@ -499,7 +499,7 @@ test("a server that relabels encrypted columns as plain gets no expression reque
     tables: { ok: ["t"] },
     schema: { ok: [["id", "int", "plain"], ["v", "int", "plain"], ["w", "int", "paired"]] },
   }));
-  const db = await Client.connect("127.0.0.1", f.port);
+  const db = await ownerConnect("127.0.0.1", f.port);
   const n0 = f.seen.length;
   for (const x of ["v*w+0", "w*v*w", "SUM(w+v)"]) await assert.rejects(db.expr("t", x), kind("UntrustedSchema"), x);
   assert.equal(f.seen.length, n0, "an expression request reached the server");

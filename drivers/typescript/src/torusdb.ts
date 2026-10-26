@@ -26,7 +26,8 @@ import {
   Anchor, AnchorManager, AnchorValue, FhePart, FileAnchor, Snapshot, schemaDigest, sha256 as anchorSha,
 } from "./anchor";
 import { parseExpression, analyzeExpression, scopeResolver } from "./expr";
-import { ExprRunner, ExprHost, ExprCost, Ring } from "./exprEval";
+import { ExprRunner, ExprHost, ExprCost, Ring, WireLimits } from "./exprEval";
+import { SharedExprRunner } from "./exprShared";
 import type { ExprInfo } from "./expr";
 import {
   FheKey, FheBackend, newNonce, FHE_CELL_BYTES, FHE_DOT_BYTES, FHE_SUM_BYTES, addSums as fheAddSums, mulDots as fheMulDots,
@@ -43,7 +44,8 @@ export {
 export type { Anchor, Entry as AnchorEntry, Pending as AnchorPending, Change as AnchorChange } from "./anchor";
 export { parseExpression, analyzeExpression, renderExpr, MAX_EXPR_HEIGHT } from "./expr";
 export type { Expr, ExprInfo, ExprColumn, Frac } from "./expr";
-export type { ExprCost } from "./exprEval";
+export type { ExprCost, WireLimits } from "./exprEval";
+export type ExpressionMode = "shared" | "owner";
 
 /** Newest wire protocol this driver speaks. */
 export const PROTOCOL_VERSION = 2;
@@ -103,8 +105,15 @@ function modInv(a: bigint, m: bigint = N): bigint {
 }
 
 function randScalar(): bigint {
-  // 32 uniform bytes reduced mod N (negligible bias at 254 bits)
-  return mod(BigInt("0x" + randomBytes(32).toString("hex")));
+  // exactly uniform in [0, N): 254 random bits, rejected when >= N (N is just under 2^254; acceptance ~ 0.76).
+  // (Reducing 256 random bits mod N would NOT be uniform: 2^256 / N ~ 5.3, so the lowest ~29% of the residues
+  // would be ~20% more likely - a bias the wire audit's chi-square test detects.)
+  for (;;) {
+    const b = randomBytes(32);
+    b[0] &= 0x3f;
+    const v = BigInt("0x" + b.toString("hex"));
+    if (v < N) return v;
+  }
 }
 
 // ── encode / decode (Z/nZ <-> int / rational) ───────────────────────────────
@@ -192,6 +201,8 @@ function isRational(v: unknown): v is Rational {
 /** Request-size limits a server publishes in `hello` (absent on older servers: conservative defaults apply). */
 export interface ServerLimits {
   maxItems?: number;
+  /** the shared-wire caps (wire protocol 2.1); absent on a server without `wire_exec` */
+  wires?: WireLimits;
   fhe?: {
     maxSumRows?: number;
     maxScanRows?: number;
@@ -391,6 +402,14 @@ export interface ConnectOptions {
    *  trips, one batched Pi_mult exchange each) one expression may need. Default 8. Checked before any request
    *  is sent; a deeper expression fails with kind "DepthLimitExceeded". Raise it deliberately. */
   maxMultDepth?: number;
+  /** How dialect v0.6 expressions are evaluated. `"shared"` (default, like the Python driver): the paper's
+   *  circuit composition Pi_C with every wire a two-party ADDITIVE SHARING - the server keeps its share of
+   *  every wire (needs a server with the `wire_exec` RPCs, wire protocol 2.1), products are Beaver
+   *  multiplications that leave the result as a NEW server-resident wire, nothing intermediate is ever
+   *  reconstructed or decrypted by anyone, a division by an ENCRYPTED value costs one extra level, and the
+   *  result is revealed by the server sending its share. `"owner"`: the previous owner-computed transport
+   *  (the owner unmasks the operand cells, the server only multiplies the openings e*g). */
+  expressionMode?: ExpressionMode;
 }
 
 const DEFAULT_TIMEOUT_MS = 30_000;
@@ -757,6 +776,7 @@ export class Client {
   #fheDotMode: "local" | "delegated";
   #amgr: AnchorManager | undefined;
   #maxMultDepth = 8;
+  #exprMode: ExpressionMode = "shared";
   #updateCells = true;                           // false once the server answered "unknown method" for update_cells
   #als = new AsyncLocalStorage<boolean>();
   #tail: Promise<void> = Promise.resolve();
@@ -785,6 +805,7 @@ export class Client {
       : this.#authenticated && o.fheAllowUnverifiedDot !== true ? "local" : "delegated";
     if (this.#authenticated) this.#alpha = 1n + (randScalar() % (N - 1n));
     if (o.maxMultDepth !== undefined) this.maxMultDepth = o.maxMultDepth;
+    if (o.expressionMode !== undefined) this.expressionMode = o.expressionMode;
     if (o.integrityAnchor !== undefined) {
       if (!this.#authenticated) throw usage("integrityAnchor needs authenticated: true (the anchor protects the authenticated FHE tables)");
       if (!this.#fhe) throw usage("integrityAnchor needs an FHE key (fheKey): the anchor's leaves are keyed by the owner's MAC secret");
@@ -875,6 +896,12 @@ export class Client {
     if (o.limits !== null && typeof o.limits === "object" && !Array.isArray(o.limits)) {
       const l = o.limits as Record<string, any>;
       const lim: ServerLimits = { maxItems: posInt(l.max_items) };
+      const wl = l.wires;
+      if (wl !== null && typeof wl === "object" && !Array.isArray(wl) && Object.keys(wl).length > 0) {
+        lim.wires = { maxWires: posInt(wl.max_wires), maxElements: posInt(wl.max_elements), maxOps: posInt(wl.max_ops),
+                      maxRequestElements: posInt(wl.max_request_elements),
+                      ttl: typeof wl.ttl === "number" && Number.isFinite(wl.ttl) && wl.ttl > 0 ? wl.ttl : undefined };
+      }
       const f = l.fhe;
       if (f !== null && typeof f === "object" && !Array.isArray(f)) {
         const pair = (x: any) => (x !== null && typeof x === "object" ? { pyecc: posInt(x.pyecc), mcl: posInt(x.mcl) } : {});
@@ -2100,6 +2127,13 @@ export class Client {
     this.#maxMultDepth = n;
   }
 
+  /** `"shared"` (default) or `"owner"`; see {@link ConnectOptions.expressionMode}. May be changed between queries. */
+  get expressionMode(): ExpressionMode { return this.#exprMode; }
+  set expressionMode(m: ExpressionMode) {
+    if (m !== "shared" && m !== "owner") throw usage(`expressionMode must be "shared" or "owner", not ${String(m)}`);
+    this.#exprMode = m;
+  }
+
   /** Parse and check an expression against the table policies WITHOUT sending anything: its kind
    *  ("row" or "agg"), multiplicative depth, product / inversion counts and canonical text. Throws
    *  "ParseError" / "PlanError" exactly where the Python parser and engine do. */
@@ -2111,10 +2145,18 @@ export class Client {
     const tree = parseExpression(expression);
     const scope = scopeResolver(instances.map(([a, t]) => [a, this.cols(t)] as [string, Column[]]));
     const { expr, info } = analyzeExpression(tree, (n) => scope(n).col);
-    if (info.depth > this.#maxMultDepth) {
+    const loc = (n: string) => { const r = scope(n); return { alias: r.inst, col: r.col.name }; };
+    let depth = info.depth;
+    if (this.#exprMode === "shared") {
+      // a division by an ENCRYPTED value costs one extra product level in the shared transport
+      depth = new SharedExprRunner(this.exprHost(), this.exprRing(), expr, info, new Map(instances), loc, []).sharedDepth();
+    }
+    if (depth > this.#maxMultDepth) {
       throw new TorusError("DepthLimitExceeded",
-        `expression '${info.text}' needs ${info.depth} sequential ciphertext x ciphertext product levels ` +
-        `(one owner round each) but maxMultDepth is ${this.#maxMultDepth}; raise maxMultDepth ` +
+        `expression '${info.text}' needs ${depth} sequential ciphertext x ciphertext product levels ` +
+        `(one owner round each` +
+        (this.#exprMode === "shared" ? "; a division by an encrypted value costs one extra level in expressionMode 'shared'" : "") +
+        `) but maxMultDepth is ${this.#maxMultDepth}; raise maxMultDepth ` +
         `deliberately or restructure the expression`);
     }
     for (const [, t] of instances) {
@@ -2125,7 +2167,7 @@ export class Client {
           `or call trustTable('${t}') first`);
       }
     }
-    return { expr, info, loc: (n: string) => { const r = scope(n); return { alias: r.inst, col: r.col.name }; } };
+    return { expr, info, loc };
   }
 
   private exprHost(): ExprHost {
@@ -2141,18 +2183,29 @@ export class Client {
           .map((x) => parseBig(x, "mult_combine_batch"));
       },
       isPlain: (t, c) => this.col(t, c).policy === "plain",
+      shared: {
+        alpha: () => this.#alpha,
+        wireLimits: () => this.serverInfo.limits?.wires,
+        mask: (t, i, c) => this.mask(t, i, c),
+        rpc: (method, args, maxReply) => this.call(method, args, maxReply),
+      },
+    };
+  }
+
+  private exprRing(): Ring {
+    return {
+      N, mod, rand: randScalar, inv: (a) => modInv(a),
+      encode: (f) => (f.den === 1n ? encodeInt(f.num) : encodeRational(f.num, f.den)),
+      decode,
     };
   }
 
   private async runExpr(plan: ReturnType<Client["exprPlan"]>, inst: Array<[string, string]>,
                         tuples: Array<Array<number | null>>): Promise<ExprValue> {
     this.lastExprCost = null;
-    const ring: Ring = {
-      N, mod, rand: randScalar, inv: (a) => modInv(a),
-      encode: (f) => (f.den === 1n ? encodeInt(f.num) : encodeRational(f.num, f.den)),
-      decode,
-    };
-    const runner = new ExprRunner(this.exprHost(), ring, plan.expr, plan.info, new Map(inst), plan.loc, tuples);
+    const ring = this.exprRing();
+    const Runner = this.#exprMode === "shared" ? SharedExprRunner : ExprRunner;
+    const runner = new Runner(this.exprHost(), ring, plan.expr, plan.info, new Map(inst), plan.loc, tuples);
     const out = await runner.run() as ExprValue;
     this.lastExprCost = { ...runner.cost };
     return out;

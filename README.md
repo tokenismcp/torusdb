@@ -91,9 +91,9 @@ openings determine them; the code never computes them) — only the server is, u
 test a denominator against a guess); with it every opening and the result are MAC-checked. Details:
 spec §5.10, [review packet](docs/crypto-review-packet.md) §3.3 (findings F-18…F-25). The old owner-computed
 transport remains as `connect(..., expr_mode="owner")` (works with any v2 server). `x / 0` and out-of-range
-results are errors, never wrong values. `FHE` columns keep depth-1 `SUM`/`AVG`/`DOT` and reject deeper
-products and division.
-The TypeScript (`db.expr(table, "SUM(a*b)/COUNT(*)")`) and Rust (`db.expr(...)`) drivers evaluate the same expressions with the same grammar, results, errors and cost model (`drivers/typescript/README.md`, `drivers/rust/README.md`).
+results are errors, never wrong values. `FHE` columns keep depth-1 `SUM`/`AVG`/`DOT`, accept aggregated depth-1
+products of integer-linear forms (`SUM((a+2*b)*(c-d))`, v0.6.1) and reject deeper products and division.
+The TypeScript (`db.expr(table, "SUM(a*b)/COUNT(*)")`) and Rust (`db.expr(...)`) drivers evaluate the same expressions with the same grammar, results, errors and cost model, and use the same shared-wire transport by default (`expressionMode: "owner"` / `ExprMode::Owner` selects the old one; `drivers/typescript/README.md`, `drivers/rust/README.md`).
 
 ## Repository layout
 

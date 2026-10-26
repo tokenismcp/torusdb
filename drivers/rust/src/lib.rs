@@ -28,6 +28,7 @@ mod conn;
 mod error;
 mod expr;
 mod expr_eval;
+mod expr_shared;
 mod field;
 mod fhe;
 mod hash;
@@ -45,7 +46,13 @@ pub use fhe::{
 #[doc(hidden)]
 pub use fhe::internals as fhe_internals;
 pub use expr::{analyze_expression, parse_expression, render_expr, Expr, ExprInfo, Frac, MAX_EXPR_HEIGHT};
-pub use expr_eval::{ExprCost, ExprValue};
+pub use expr_eval::{ExprCost, ExprMode, ExprValue};
+
+/// SHA-256 of `data` as lowercase hex (test aid: the cross-language wire-trace digests). Not part of the stable API.
+#[doc(hidden)]
+pub fn sha256_hex(data: &[u8]) -> String {
+    hash::sha256(data).iter().map(|b| format!("{:02x}", b)).collect()
+}
 pub use field::{decode, encode_int, encode_rational, n, reduce, Decoded};
 
 use conn::{Conn, TransportOpts, HARD_MAX_FRAME};
@@ -312,6 +319,12 @@ pub struct ConnectOptions {
     /// trips, one batched Pi_mult exchange each) one expression may need. Default 8. Checked before any
     /// request is sent; a deeper expression fails with `Kind::DepthLimitExceeded`. Raise it deliberately.
     pub max_mult_depth: usize,
+    /// How dialect v0.6 expressions are evaluated, see [`ExprMode`]. Default `ExprMode::Shared` (like the Python
+    /// driver): every wire a two-party additive sharing, the server keeps its share of every wire (needs a server
+    /// with the `wire_exec` RPCs, wire protocol 2.1), nothing intermediate is ever reconstructed or decrypted by
+    /// anyone, a division by an ENCRYPTED value costs one extra level. `ExprMode::Owner` is the owner-computed
+    /// transport (the owner unmasks the operand cells).
+    pub expression_mode: ExprMode,
 }
 
 impl Default for ConnectOptions {
@@ -333,6 +346,7 @@ impl Default for ConnectOptions {
             integrity_anchor: None,
             integrity_anchor_max_rows: None,
             max_mult_depth: 8,
+            expression_mode: ExprMode::Shared,
         }
     }
 }
@@ -356,6 +370,7 @@ impl fmt::Debug for ConnectOptions {
             .field("integrity_anchor", &self.integrity_anchor)
             .field("integrity_anchor_max_rows", &self.integrity_anchor_max_rows)
             .field("max_mult_depth", &self.max_mult_depth)
+            .field("expression_mode", &self.expression_mode)
             .finish()
     }
 }
@@ -429,6 +444,17 @@ pub struct FheLimits {
 pub struct ServerLimits {
     pub max_items: Option<usize>,
     pub fhe: Option<FheLimits>,
+    /// the shared-wire caps (wire protocol 2.1); `None` on a server without `wire_exec`
+    pub wires: Option<WireLimits>,
+}
+
+/// The shared-wire caps a server publishes in `hello.limits.wires` (the `ttl` is not needed by the client).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WireLimits {
+    pub max_wires: Option<usize>,
+    pub max_elements: Option<usize>,
+    pub max_ops: Option<usize>,
+    pub max_request_elements: Option<usize>,
 }
 
 fn pos(v: &Value) -> Option<usize> {
@@ -445,7 +471,13 @@ fn parse_limits(l: &Value) -> Option<ServerLimits> {
         max_dot_rows: rows(&f["max_dot_rows"]),
         recommended_dot_rows: rows(&f["recommended_dot_rows"]),
     });
-    Some(ServerLimits { max_items: pos(&l["max_items"]), fhe })
+    let wires = l.get("wires").and_then(|w| w.as_object()).filter(|o| !o.is_empty()).map(|o| WireLimits {
+        max_wires: o.get("max_wires").and_then(pos),
+        max_elements: o.get("max_elements").and_then(pos),
+        max_ops: o.get("max_ops").and_then(pos),
+        max_request_elements: o.get("max_request_elements").and_then(pos),
+    });
+    Some(ServerLimits { max_items: pos(&l["max_items"]), fhe, wires })
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -579,6 +611,7 @@ pub struct Client {
     update_cells_ok: bool, // false once the server answered "unknown method" for update_cells
     amgr: Option<anchor::AnchorMgr>, // anchored table-state mode (integrity_anchor)
     max_mult_depth: usize,           // dialect v0.6: deepest expression `expr` / `join_expr` will run
+    expression_mode: ExprMode,
     last_expr_cost: Option<ExprCost>,
 }
 
@@ -744,6 +777,7 @@ impl Client {
             update_cells_ok: true,
             amgr: None,
             max_mult_depth: o.max_mult_depth,
+            expression_mode: o.expression_mode,
             last_expr_cost: None,
         };
         if let Some(spec) = &o.integrity_anchor {
@@ -2496,6 +2530,22 @@ impl Client {
         self.max_mult_depth = n;
     }
 
+    /// How expressions are evaluated, see [`ExprMode`]. May be changed between queries.
+    pub fn expression_mode(&self) -> ExprMode {
+        self.expression_mode
+    }
+
+    pub fn set_expression_mode(&mut self, m: ExprMode) {
+        self.expression_mode = m;
+    }
+
+    /// One raw RPC on this connection's session (test aid: wires are session-private, so a test that wants to
+    /// look at them must use the same connection). Not part of the stable API.
+    #[doc(hidden)]
+    pub fn raw_call(&mut self, method: &str, args: Value) -> Result<Value> {
+        self.call(method, args)
+    }
+
     /// Cost of the last successful `expr` / `join_expr` (depth, owner rounds, products, inversions,
     /// Pi_lin sums); `None` before one ran or after a failed one.
     pub fn last_expr_cost(&self) -> Option<&ExprCost> {
@@ -2510,13 +2560,36 @@ impl Client {
         }
         let scope = expr::Scope::new(specs)?;
         let (expr, info) = analyze_expression(&tree, &|n: &str| scope.resolve(n).map(|(_, c)| c))?;
-        if info.depth > self.max_mult_depth {
+        let mut locs = HashMap::new();
+        for name in expr::columns_of(&expr) {
+            let (inst, col) = scope.resolve(&name)?;
+            locs.insert(name, (inst, col.name));
+        }
+        let mut depth = info.depth;
+        if self.expression_mode == ExprMode::Shared {
+            // a division by an ENCRYPTED value costs one extra product level in the shared transport
+            let is_enc = |n: &str| -> bool {
+                let (alias, col) = &locs[n];
+                let table = &instances.iter().find(|(a, _)| a == alias).expect("alias in scope").1;
+                self.col(table, col).map(|c| c.policy != "plain").unwrap_or(true)
+            };
+            let (nodes, _) = expr_eval::compile_tree(&expr, 1, &is_enc);
+            depth = nodes.iter().map(|n| n.level).max().unwrap_or(0);
+        }
+        if depth > self.max_mult_depth {
             return Err(Error::new(
                 Kind::DepthLimitExceeded,
                 format!(
                     "expression '{}' needs {} sequential ciphertext x ciphertext product levels (one owner round \
-                     each) but max_mult_depth is {}; raise max_mult_depth deliberately or restructure the expression",
-                    info.text, info.depth, self.max_mult_depth
+                     each{}) but max_mult_depth is {}; raise max_mult_depth deliberately or restructure the expression",
+                    info.text,
+                    depth,
+                    if self.expression_mode == ExprMode::Shared {
+                        "; a division by an encrypted value costs one extra level in ExprMode::Shared"
+                    } else {
+                        ""
+                    },
+                    self.max_mult_depth
                 ),
             ));
         }
@@ -2533,17 +2606,17 @@ impl Client {
                 ));
             }
         }
-        let mut locs = HashMap::new();
-        for name in expr::columns_of(&expr) {
-            let (inst, col) = scope.resolve(&name)?;
-            locs.insert(name, (inst, col.name));
-        }
         Ok(ExprPlan { expr, info, locs })
     }
 
     fn run_expr(&mut self, plan: &ExprPlan, inst: &[(String, String)], tuples: &[Vec<Option<i64>>]) -> Result<ExprValue> {
         self.last_expr_cost = None;
-        let (value, cost) = expr_eval::ExprRunner::new(self, &plan.expr, &plan.info, inst, &plan.locs, tuples).run()?;
+        let mode = self.expression_mode;
+        let base = expr_eval::ExprRunner::new(self, &plan.expr, &plan.info, inst, &plan.locs, tuples);
+        let (value, cost) = match mode {
+            ExprMode::Owner => base.run()?,
+            ExprMode::Shared => expr_shared::SharedRunner::new(base).run()?,
+        };
         self.last_expr_cost = Some(cost);
         Ok(value)
     }

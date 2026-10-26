@@ -6,7 +6,7 @@ import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import * as fs from "fs";
 import { Client, Column, Decoded, ExprValue, TorusError } from "../src/torusdb";
-import { skipReason, startServer, RunningServer, runExprPeer, EXPR_VECTORS } from "./helpers";
+import { skipReason, startServer, RunningServer, runExprPeer, EXPR_VECTORS, ownerConnect } from "./helpers";
 
 const skip = skipReason();
 let srv: RunningServer;
@@ -51,7 +51,7 @@ for (const auth of [false, true]) {
     });
     assert.equal(peer.length, exprs.length);
 
-    const db = await Client.connect(srv.host, srv.port, { authenticated: auth, timeoutMs: 120_000 });
+    const db = await ownerConnect(srv.host, srv.port, { authenticated: auth, timeoutMs: 120_000 });
     const schema: Column[] = cols.map(([name, type, policy]) => ({ name, type, policy } as Column));
     await db.createTable(tsT, schema);
     const val = (s: string | null) => (s === null ? null : s.includes("/") ? { num: BigInt(s.split("/")[0]), den: BigInt(s.split("/")[1]) } : BigInt(s));

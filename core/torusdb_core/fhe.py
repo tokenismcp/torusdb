@@ -136,6 +136,125 @@ def dot_cells(left: Iterable[bytes], right: Iterable[bytes], backend=None) -> by
     return be.tag + b"".join(be.gt_to(be.final(x) if x is not None else one) for x in acc)
 
 
+MUL_MAX_TERMS = 16                      # columns in one linear operand of a product
+MUL_MAX_K = 1 << 40                     # |public coefficient| and |public constant| of an operand
+
+
+def _check_lin(terms, const) -> None:
+    """The PUBLIC description of one linear operand ``Σ k_j·cell_j + const``: integer coefficients
+    (never 0, |k| <= 2^40, at most ``MUL_MAX_TERMS`` of them) and an integer constant. The bound
+    keeps every operand, and so every product, far below the group order: a result that is
+    inside the key's range as a residue is then also the true integer (no wrap-around)."""
+    if len(terms) > MUL_MAX_TERMS:
+        raise FheError(f"at most {MUL_MAX_TERMS} columns per operand of a product")
+    for k, _cells in terms:
+        if isinstance(k, bool) or not isinstance(k, int) or k == 0 or abs(k) > MUL_MAX_K:
+            raise FheError("an operand coefficient is a non-zero integer with |k| <= 2^40")
+    if isinstance(const, bool) or not isinstance(const, int) or abs(const) > MUL_MAX_K:
+        raise FheError("an operand constant is an integer with |c| <= 2^40")
+
+
+def _parse_half(raw: bytes, be, g2: bool):
+    """-> (D1, D2) (``g2``) or (C1, C2) of a cell, validating only the half that is used."""
+    if not isinstance(raw, (bytes, bytearray)) or len(raw) != CELL_BYTES:
+        raise FheError(f"an FHE cell is exactly {CELL_BYTES} bytes")
+    r = bytes(raw)
+    try:
+        if g2:
+            return be.g2_from(r[128:256]), be.g2_from(r[256:384])
+        return be.g1_from(r[:64]), be.g1_from(r[64:128])
+    except _fb.BackendError as exc:
+        raise FheError(str(exc)) from None
+
+
+def _lin_halves(terms, const: int, rows: int | None, be, side: str):
+    """The G2 half (``side="g2"``: D1, D2) or G1 half (``"g1"``: C1, C2) of the ciphertext of the
+    integer-linear form ``Σ k_j·x_j + const``, formed by PUBLIC curve arithmetic on the stored
+    cells: ``Σ k_j·D1_j`` and ``Σ k_j·D2_j + const·G2`` (the constant is added as a "trivial"
+    ciphertext, randomness 0, to the second component only — the first, ``Σ k_j·r_j·G``, is a
+    valid randomiser exactly as for a stored cell).
+
+    ``rows=None``: aggregate operand — every list in ``terms`` is summed first (``Σ_i`` of the
+    cells, by linearity the ciphertext of ``Σ_i x_i``) and the constant added once; ONE pair is
+    returned. ``rows=n``: per-row operand — every list has ``n`` cells and ``n`` pairs are returned,
+    the constant added to each. Public data only: the coefficients are literals of the query."""
+    g2 = side == "g2"
+    add = be.g2_add if g2 else be.g1_add
+    mul = be.g2_mul if g2 else be.g1_mul
+    zero = be.g2_zero if g2 else be.g1_zero
+    gen = be.G2 if g2 else be.G1
+    parsed = []
+    for k, cells in terms:
+        if rows is not None and len(cells) != rows:
+            raise FheError("operand cell lists must have one cell per row")
+        pc = []
+        for raw in cells:
+            pc.append(_parse_half(raw, be, g2))
+        parsed.append((k, pc))
+    ct = mul(gen, const) if const else None
+    if rows is None:
+        a, b_ = zero(), zero()
+        for k, pc in parsed:
+            sa, sb = zero(), zero()
+            for x, y in pc:
+                sa, sb = add(sa, x), add(sb, y)
+            if k != 1:
+                sa, sb = mul(sa, k), mul(sb, k)
+            a, b_ = add(a, sa), add(b_, sb)
+        return [(a, add(b_, ct) if ct is not None else b_)]
+    out = []
+    for i in range(rows):
+        a, b_ = zero(), zero()
+        for k, pc in parsed:
+            x, y = pc[i]
+            if k != 1:
+                x, y = mul(x, k), mul(y, k)
+            a, b_ = add(a, x), add(b_, y)
+        out.append((a, add(b_, ct) if ct is not None else b_))
+    return out
+
+
+def mul_cells(lterms, lconst: int, rterms, rconst: int, mode: str, backend=None) -> bytes:
+    """Ciphertext x ciphertext product of two integer-LINEAR operands, as one GT ciphertext
+    ``tag ‖ c00 ‖ c01 ‖ c10 ‖ c11`` (the same blob as :func:`dot_cells`, opened by ``decrypt_dot``).
+
+    ``lterms`` / ``rterms`` are ``[(k, [cell bytes...]), ...]`` (public integer coefficients, stored
+    cells) and ``lconst`` / ``rconst`` public integers: the operands are ``L = Σ k·x + lconst`` and
+    ``R = Σ k'·y + rconst``. The pairing takes the G2 half of ``L`` and the G1 half of ``R`` — both built
+    here by public curve arithmetic — and is bilinear, so the product of the two sums is the sum of the
+    products of the cells (4 pairings, not 4 per pair):
+
+    * ``mode="sum"``: row aligned (every list has the same length ``n``), the result is ``Σ_i L_i·R_i``;
+      the ``4n`` Miller loops are multiplied before ONE final exponentiation per component.
+    * ``mode="agg"``: the lists are summed first (they may have different lengths), the result is
+      ``(Σ_i L_i)·(Σ_j R_j)``: 4 pairings in total.
+
+    Uses only public ciphertext data and public integers: nobody holding the cells can compute it, it
+    needs no key, and the result can be opened only with the owner's secret."""
+    be = _be(backend)
+    if mode not in ("sum", "agg"):
+        raise FheError("mode is 'sum' or 'agg'")
+    _check_lin(lterms, lconst)
+    _check_lin(rterms, rconst)
+    rows = None
+    if mode == "sum":
+        lens = {len(c) for _k, c in list(lterms) + list(rterms)}
+        if len(lens) > 1:
+            raise FheError("row-aligned operands need cell lists of one length")
+        rows = lens.pop() if lens else 0
+    left = _lin_halves(lterms, lconst, rows, be, "g2")
+    right = _lin_halves(rterms, rconst, rows, be, "g1")
+    acc = [None, None, None, None]
+    for (d1, d2), (c1, c2) in zip(left, right):
+        for k, (q, p_) in enumerate(((d1, c1), (d1, c2), (d2, c1), (d2, c2))):
+            if be.g1_is_zero(p_) or be.g1_is_zero(q):     # reads either group's identity
+                continue
+            m = be.miller(q, p_)
+            acc[k] = m if acc[k] is None else be.gt_mul(acc[k], m)
+    one = be.gt_one()
+    return be.tag + b"".join(be.gt_to(be.final(x) if x is not None else one) for x in acc)
+
+
 def add_sums(a: bytes, b: bytes, backend=None) -> bytes:
     """Combine two partial SUM ciphertexts (public operation)."""
     if len(a) != SUM_BYTES or len(b) != SUM_BYTES:

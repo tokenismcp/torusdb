@@ -67,7 +67,7 @@ fn peer_check(auth: bool) {
     let peer = peer.as_array().unwrap();
     assert_eq!(peer.len(), exprs.len());
 
-    let mut db = Client::connect_with(&s.addr, &ConnectOptions { authenticated: auth, ..Default::default() }).unwrap();
+    let mut db = Client::connect_with(&s.addr, &ConnectOptions { expression_mode: ExprMode::Owner, authenticated: auth, ..Default::default() }).unwrap();
     db.create_table(ts_t, cols.clone()).unwrap();
     let cell = |v: &Value| -> CellIn {
         match v.as_str() {

@@ -51,10 +51,19 @@ pub(crate) fn mod_inv(a: &BigInt) -> BigInt {
     md(&old_s)
 }
 
+/// Exactly uniform in [0, N): 254 random bits, rejected when >= N (N is just under 2^254; acceptance ~ 0.76).
+/// (Reducing 256 random bits mod N would NOT be uniform: 2^256 / N ~ 5.3, so the lowest ~29% of the residues
+/// would be ~20% more likely - a bias the wire audit's chi-square test detects.)
 pub(crate) fn rand_scalar() -> BigInt {
-    let mut b = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut b);
-    md(&BigInt::from_bytes_be(Sign::Plus, &b))
+    loop {
+        let mut b = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut b);
+        b[0] &= 0x3f;
+        let v = BigInt::from_bytes_be(Sign::Plus, &b);
+        if v < *n() {
+            return v;
+        }
+    }
 }
 
 /// A decoded value: either an integer or an exact rational in lowest terms.

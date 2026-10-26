@@ -66,7 +66,8 @@ db.expr("emp", "SUM(rate * hours * (1 - tax)) / COUNT(*)", eq_int("dept", 5))?; 
 db.expr("emp", "AVG(rate + hours)", all())?;                               // Scalar(None) over zero rows
 db.expr("emp", "100 / rate", all())?;                                      // exact rational, never truncated
 db.analyze_expr("emp", "rate * hours * rate")?;                            // ExprInfo { kind: "row", depth: 2, ct_muls: 2, .. } - sends nothing
-db.last_expr_cost();                                                       // Some(ExprCost { depth, mult_rounds, products, inversions, linear_sums })
+db.last_expr_cost();                                                       // Some(ExprCost { depth, mult_rounds, products, inversions, linear_sums, mode, openings, wires, requests, reveals })
+// ConnectOptions { expression_mode: ExprMode::Shared (default: server-held secret-shared wires) | ExprMode::Owner (any v2 server), .. }
 ```
 
 * **Grammar** (spec section 5.1): `+ - * /`, unary minus, parentheses, integer and `FRAC(n, d)` literals, `SUM(expr)`,
@@ -79,28 +80,65 @@ db.last_expr_cost();                                                       // So
   encrypted column involved to be `PAIRED`; `STR` and `FHE` columns are rejected (an `FHE` column keeps `sum`, `avg`,
   `scaled_sum`, `dot` - the error names FHE); a per-row expression needs an `ENC`/`PAIRED` column; per-row columns and aggregates
   cannot be mixed; constants fold exactly and a constant zero denominator or a constant beyond 2^126 is a `PlanError`.
+* **Transport: `expression_mode`.** `ExprMode::Shared` (the default, exactly as in the Python driver) or `ExprMode::Owner`
+  (`ConnectOptions::expression_mode`, `Client::set_expression_mode`). In shared mode every wire of the circuit is a two-party additive sharing and a server with the
+  `wire_exec` / `wire_free` RPCs (wire protocol 2.1, advertised in `hello.limits.wires`) is required; against an older server the
+  query fails with `Kind::Server("ExecError")` before any wire request and the message names `ExprMode::Owner`, which evaluates
+  expressions the v0.6 way (the owner unmasks the operand cells; works with any v2 server). Both modes return identical results.
 * **Depth and rounds.** The depth of an expression is its number of sequential ciphertext x ciphertext products
-  (`a*b*c*d` is 3, `(a*b)*(c*d)` is 2). The driver runs ONE batched `mult_combine_batch` round trip per level
-  (chunked to the server's `max_items`), so `last_expr_cost().mult_rounds == depth`. `ConnectOptions::max_mult_depth`
-  (or `set_max_mult_depth`, default 8) caps it: a deeper expression fails with `Kind::DepthLimitExceeded` **before any
-  request**. In `expr()` a plain `a*b` is an expression like any other, so it counts toward the cap (the Python
-  engine keeps its v0.5 `a*b` form outside it).
-* **Division** is exact: `7/2` is `Decoded::Rational(7, 2)`. By a public value it is a multiplication by the inverse (no round);
-  by an encrypted value the owner (this process) unmasks the denominator and inverts it, then multiplies (one more level if
-  the numerator is encrypted). A denominator that is 0 in any selected row returns `Kind::DivisionByZero` - but only **after the
-  protocol ran to its last round with a dummy inverse**, so the sequence of requests the server sees does not reveal that a
-  zero occurred (no abort oracle). A result outside the exactness contract (|num|, den <= 2^126, |num|*den < 2^189) is
-  `OutOfBudget`, never a wrong number; a transient intermediate outside it is harmless when the final result is back inside.
-* **Who computes what** (spec section 5.10; the Python engine's owner mode). The server holds blinded cells and only
-  (i) sums stored cells for a *linear* `SUM(...)` (`SUM(a + 2*b - s/4)`: one `blinded_sum` per column) and (ii) multiplies the
-  two openings `e*g` of each Beaver product. **Products and quotients are not offloaded**: the owner unmasks and holds both
-  operands of every product and every encrypted denominator (it learns the cells it reads anyway), O(rows) work and
-  bandwidth. Intermediates exist only here; they reach the server only inside the next level's opening `e = x - u` with a fresh
-  uniform `u`. No key, mask, MAC key or plaintext-derived value is ever sent. **No new RPC** (`blinded_cells`, `blinded_sum`,
-  `mult_combine_batch`, `matching_rowids`, `plain_cells`); the wire audit tests assert this.
-* **Integrity.** With `authenticated` every cell the owner reads and every blinded sum is MAC-checked and the server's
-  `e*g` of every product is checked (`Kind::Integrity`, also for a reply with the wrong number of terms). An intermediate has
-  no MAC (it never leaves the owner); without `authenticated` a lying server can alter a product term undetected, as for `dot`.
+  (`a*b*c*d` is 3, `(a*b)*(c*d)` is 2). In shared mode a division by an **encrypted** value costs one more level (the product
+  `rho*y` that is opened, then `x * (1/y)`), and the driver sends one `wire_exec` request per level plus one (the last also reveals
+  the result and frees every wire): `last_expr_cost().mult_rounds == depth` and `.requests == depth + 1` (more when the
+  caps in `hello.limits.wires` split a level into several requests). In owner mode it is ONE batched `mult_combine_batch` round
+  trip per level (chunked to the server's `max_items`) and a division costs no extra level. `max_mult_depth` (`ConnectOptions::max_mult_depth` or
+  `set_max_mult_depth`, default 8) caps it, counted in the active mode: a deeper expression fails with
+  `Kind::DepthLimitExceeded` **before any request**. `analyze_expr` reports the dialect depth (without the extra division level). In
+  `expr()` a plain `a*b` is an expression like any other, so it counts toward the cap (the Python engine keeps its v0.5 `a*b`
+  form outside it).
+* **Division** is exact: `7/2` is `Decoded::Rational(7, 2)`. By a public value it is a multiplication by the inverse (no round).
+  By an encrypted value in shared mode **nobody decrypts the denominator**: a fresh uniform non-zero `rho` is dealt as a sharing,
+  `t = rho*y` is formed by a Beaver product and opened (uniform on non-zero values whatever `y` is; MAC-checked first when
+  authenticated), and `1/y = t^-1 * rho` is a local public-scalar multiplication (in owner mode the owner unmasks the denominator
+  and inverts it). A denominator that is 0 in any selected row returns `Kind::DivisionByZero` - but only **after the protocol ran to its
+  last request**: a zero `t` is replaced by a fresh random non-zero dummy before anything goes back to the server, so neither the
+  request sequence nor its content reveals that a zero occurred (no abort oracle). A result outside the exactness contract
+  (|num|, den <= 2^126, |num|*den < 2^189) is `Kind::OutOfBudget`, never a wrong number; a transient intermediate outside it is harmless
+  when the final result is back inside.
+* **Who computes what** (spec section 5.10; [review packet](../../docs/crypto-review-packet.md) section 3.3). *Shared mode.* Every
+  wire X is `X = X_S + X_O (mod n)`; a stored cell is `x~ = x + r`, so a loaded column is `X_S = x~` (the server's own value) and
+  `X_O = -r` (the mask the owner already holds). The **server** applies every linear gate to its share (add, subtract, public
+  scalar / vector multiply, public add, `SUM`, broadcast), computes its share of every Beaver product (including its `e*g` term)
+  and keeps the result as a NEW server-resident wire in a session-scoped, capped store, and finally sends its share of the result
+  wire(s); it never receives a key, mask, MAC key or anything derived from a plaintext except uniform shares and openings, never
+  decodes, and never learns a product, quotient or the result. The **owner** (this process) applies the same linear gates to its
+  shares, deals one fresh uniform triple per product ELEMENT (the server gets only its shares), computes its share of each
+  product, and at the end adds the server's revealed share to its own and decodes. It reads no operand cell and unmasks no operand
+  or intermediate; a linear `SUM(a + 2*b)` is still a server-side sum of stored cells (`loadsum`, one per column). **Honest
+  limits:** the owner does O(rows) local ring arithmetic and bandwidth per level (inherent to unconditionally secure two-party
+  computation), and, being the *dealer*, could derive operands from its own openings (this code never does; only the server is
+  blind). New RPCs `wire_exec`, `wire_free` only; the wire audit tests assert that nothing else is used and that no mask, MAC
+  key, encoded plaintext, intermediate or inverse reaches the server, that openings and `t^-1` are uniform and that no triple
+  is reused (with controls proving the audit can fail; `../mutation_check_expr_shared.py` breaks the evaluator on purpose and
+  requires the tests to fail). *Owner mode* (kept): the server holds blinded cells and only sums stored cells for linear sums and
+  multiplies the two openings `e*g` of each Beaver product; products and quotients are not offloaded (the owner unmasks both
+  operands of every product and every encrypted denominator); intermediates reach the server only inside the next level's opening
+  `e = x - u` with a fresh uniform `u` (RPCs `blinded_cells`, `blinded_sum`, `mult_combine_batch`).
+* **Integrity.** With `authenticated`, in shared mode every wire carries a share of its SPDZ tag (`alpha * X`, `alpha` known
+  only to the owner), every opening and the revealed result are MAC-checked (`Kind::Integrity`), the opened `t = rho*y` before the
+  zero test (so tampering with a denominator is a `Kind::Integrity` error, never a zero oracle), and so is every stored cell read
+  into a wire (a tampered, swapped or replayed cell or tag). A reply with the wrong number of results, a short vector or a ring
+  element >= n is a `Kind::Integrity` error, a non-numeric element a `Kind::Protocol` error. **Without `authenticated` the shared mode is
+  secure against a semi-honest server only**: an active server can shift a result by a delta of its choosing and, by shifting a
+  denominator's share, learn whether that denominator equals a guess (pinned by tests). In owner mode every cell and blinded
+  sum is checked and the server's `e*g` of every product (an intermediate has no MAC; it never leaves the owner).
+* **Wire lifecycle.** The wires a query creates are dropped by the last request on success and, on any other exit path (an error
+  or abort in the middle of the protocol), by an explicit `wire_free`; the server also frees them at `COMMIT` / `ROLLBACK`,
+  after a transaction timeout, when an unused wire's TTL expires and when the connection ends. Caps (`WireError`, i.e. `Kind::Server("WireError")`: live wires,
+  elements per session, a server-wide element cap, ops and elements per request) are enforced by the server and sized by the
+  client from `hello.limits.wires`.
+* **Cost.** `db.last_expr_cost()` = `ExprCost { depth, mult_rounds, products, inversions, linear_sums, mode, openings, wires, requests,
+  reveals }`; the last four count the shared-mode transport (`openings`: ring elements opened, `wires`: created on the server,
+  `requests`: `wire_exec` calls, `reveals`) and are 0 in owner mode (`mode` is `ExprMode::Owner`).
 * **Trust.** Expressions refuse a table whose policies were only learned from the server (`Kind::UntrustedSchema`, unlike a
   plain read): a lying server could label an encrypted column "plain" and have a blinded value used as a public operand.
   Transactions work as for everything else (an open transaction sees its own writes; rollback restores).

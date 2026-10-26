@@ -8,6 +8,60 @@ Versioning: [Versioning Policy](docs/versioning.md).
 
 ## [Unreleased]
 
+### Changed - TypeScript and Rust drivers: shared-wire expressions (wire protocol 2.1), the new default
+
+- `Client.connect(..., { expressionMode: "shared" | "owner" })` (TypeScript; property `db.expressionMode`) and
+  `ConnectOptions { expression_mode: ExprMode::Shared | ExprMode::Owner }` (Rust; `Client::set_expression_mode`): `"shared"`
+  (default, as in the Python driver) is a port of `core/torusdb_core/expr_shared.py` (new files `src/exprShared.ts`,
+  `src/expr_shared.rs`): every wire a two-party additive sharing, the server keeps its share of every wire (`wire_exec` /
+  `wire_free`), a product is a Beaver exchange that leaves its result as a NEW server-resident wire (a fresh uniform triple per
+  element, only the server's shares are sent, spans / batching by `hello.limits.wires`), nothing intermediate is reconstructed,
+  fetched or decrypted by anyone, a division by an ENCRYPTED value costs one extra level (a uniform non-zero `rho` is dealt,
+  `t = rho*y` is opened - MAC-checked before the zero test - and `1/y = t^-1 * rho`; a zero is replaced by a fresh non-zero
+  dummy and `DivisionByZero` is raised after the last request), the result is revealed by the server sending its share and decoded
+  strictly (`OutOfBudget`). Authenticated mode: every wire carries a SPDZ tag share, every opening and the result are MAC-checked.
+  Every wire the query created is dropped with `wire_free` on every exit path. `"owner"` is the previous behaviour (unchanged;
+  works with any v2 server); a server without `hello.limits.wires` gives a clear error naming it. `lastExprCost` /
+  `last_expr_cost()` gain `mode, openings, wires, requests, reveals`; `maxMultDepth` / `max_mult_depth` counts the extra
+  division level (`analyzeExpr` still reports the dialect depth). Rust: `ServerLimits.wires`, `ExprCost.{mode, openings, wires,
+  requests, reveals}` (new public fields: struct literals of `ExprCost` / `ServerLimits` / `ConnectOptions` need `..Default::default()`).
+- Cross-language tests: `drivers/expr_vectors.json` now carries a `shared` expectation (value, error, cost incl. the transport
+  fields) and a digest of the SHAPE of every wire request (`drivers/wire_shape.py`) for each of the 484 executed cases;
+  `drivers/expr_peer.py` runs the Python engine in shared mode against the same server (`mode: "shared"`) and the TypeScript and
+  Rust drivers must agree on value, error class, cost and wire-trace digest for ~190 random expressions each, plain and authenticated.
+  New `test/expr_shared.test.ts` / `tests/expr_shared.rs`: abort-oracle trace equality, wire cleanup (success, error, abort, rollback,
+  commit, disconnect), caps / TTL / old-server errors, tampering / swap / replay / lying-reply cases (authenticated) and the pinned
+  unauthenticated limitations, and a recording-proxy wire audit (nothing derived from a mask, MAC key, encoded plaintext,
+  intermediate or inverse reaches the server; openings and `t^-1` uniform; no triple reused) with controls proving the audit can
+  fail. `drivers/mutation_check_expr_shared.py` breaks the evaluators on purpose (drop the `e*g` tag term, reuse a triple, skip a MAC
+  check, fix `rho = 1`, ...) and requires the matching tests to fail. Tests of the owner transport connect with `expressionMode: "owner"`.
+- Fixed (TypeScript and Rust): the uniform random scalar used for masks, Beaver triples and the MAC key was 256 random bits reduced
+  mod `n`, which is NOT uniform (`2^256 / n` is about 5.3: the lowest ~29% of the residues were ~20% more likely, a bias the new
+  wire audit's chi-square test detects). It is now exact (254 random bits, rejection sampling). Existing vaults are unaffected;
+  masks drawn before this change keep their slight bias.
+
+### Added - expressions over `FHE` columns, server-side, keyless (dialect v0.6.1; new read RPC `fhe_mul`)
+
+- `SUM((a + 2*b) * (c - d))`, `SUM(a) * SUM(b)`, `(SUM(a) + 2*SUM(b)) * (SUM(c) - 1)`, `AVG(a*b)`, `2*SUM(a*b) - SUM(c*d)/4 + 7`,
+  `GROUP BY` over them: a **depth-1 product of two integer-linear forms** of FHE columns (coefficients and constants `|k| <= 2^40`,
+  <= 16 columns), aggregated, followed by a **public** affine part (scale, add, `/ literal`, AVG's `1/n`) applied at the owner after
+  decryption. The server builds the operand ciphertexts by public linear combination of stored cells and pairs them (4 pairings per
+  row, or 4 in total for `AL*AR`); it holds no key and receives no ciphertext or secret-derived number. Nothing is decrypted or
+  re-encrypted between levels - there is one level. Everything deeper (`SUM(a*b)*SUM(c)`, `SUM(a*b*c)`), any non-literal division,
+  FHE mixed with `PLAIN`/`ENC`/`PAIRED`, per-row FHE products, non-integer operand coefficients and joins is **rejected** with a
+  message naming `FHE`. `SUM(x*y)` over exactly two bare FHE columns (= `DOT(x, y)`) stays rejected with its old text (pinned by the
+  conformance suite and `drivers/expr_vectors.json`; constant `REJECT_BARE_COLUMN_PRODUCT`).
+- Integrity: unchanged rule of `DOT`. Unauthenticated: the server multiplies, no integrity. `authenticated=True` (default
+  `fhe_dot_mode="auto"` = local): the owner recomputes from verified cells / verified `SUM`s; delegated only by explicit opt-in.
+  Range: a term outside the key range raises in both modes, never wraps. No half-way verification of a GT result exists (review log F19).
+- API: `analyze_expr(..., fhe_ok=)`, `ExprInfo.fhe`, `PExpr.fhe`, `torussql_parser.fhe_expr`, `torusdb_core.fhe.mul_cells`,
+  `torusdb_core.fhe_expr.FheExprRunner`, RPC `fhe_mul` (`proto/fhe-wire.md`), `hello.limits.fhe.max_mul_work` / `max_mul_agg_rows`,
+  server options `fhe_max_mul_work`, `fhe_max_mul_work_native`, `fhe_max_mul_agg_rows_native`. Python driver/engine only; the
+  TypeScript and Rust analysers still reject FHE columns in expressions; every FHE case of `drivers/expr_vectors.json` is unchanged
+  (verdict and message), but the newly accepted shapes above are Python-only.
+- Docs: `docs/fhe-columns.md` (who computes what, cost, integrity, security argument), `docs/fhe-review-log.md` round 3 (F14-F22 and
+  open review questions), `docs/threat-model.md`, spec v0.6 sections 5.3/5.9/9/10.
+
 ### Changed - expressions use secret-shared wires (wire protocol 2.1; no dialect change)
 
 - **The owner no longer computes the circuit.** Every wire of a v0.6 expression is now a two-party additive sharing over Z/nZ
@@ -32,8 +86,8 @@ Versioning: [Versioning Policy](docs/versioning.md).
   operands, `mult_combine_batch`; works with any v2 server). A 2.1 driver against a 2.0 server fails with a clear message naming
   `expr_mode="owner"`. `last_expr_cost` gains `mode, openings, wires, requests, reveals`; `max_mult_depth` now counts the extra
   level of a division by an encrypted value.
-- The legacy v0.5 shapes (`a * b`, `DOT`, `SUM(col)`, `k * col`) keep their owner-computed paths. TypeScript and Rust drivers
-  still use the owner-computed transport.
+- The legacy v0.5 shapes (`a * b`, `DOT`, `SUM(col)`, `k * col`) keep their owner-computed paths. The TypeScript and Rust
+  drivers use the shared-wire transport too (next entry).
 - Tests: `core/tests/test_expr_shared.py`, `tests/test_expr_shared_e2e.py`; tests that pinned the owner-computed transport now
   select `expr_mode="owner"` explicitly.
 

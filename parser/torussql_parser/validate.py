@@ -255,7 +255,8 @@ class Schema:
 
     def _expr_info(self, scope: "_Scope", proj: ExprProj):
         """Analyse a general expression projection (v0.6): (folded, ExprInfo)."""
-        return analyze_expr(proj.expr, lambda ref: scope.resolve(ref, "expression"))[1]
+        return analyze_expr(proj.expr, lambda ref: scope.resolve(ref, "expression"),
+                            fhe_ok=len(scope.instances) == 1)[1]
 
     def _validate_on(self, scope: "_Scope", j: Join) -> None:
         li, lc = scope.resolve(j.on_left, "ON")

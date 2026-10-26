@@ -20,8 +20,9 @@ An expression is a tree of ``Lit`` / ``ColRef`` / ``Neg`` / ``BinOp`` /
 
 Policy rules (v0.6):
 
-* STR columns and FHE columns cannot appear in an expression (FHE columns keep
-  their dedicated SUM / AVG / k*SUM / DOT forms).
+* STR columns cannot appear in an expression. FHE columns appear only in the shapes of
+  ``fhe_expr`` (integer-linear operands, ONE server-side product level, aggregated; v0.6.1) and never
+  next to PLAIN / ENC / PAIRED columns; otherwise they keep their dedicated SUM / AVG / k*SUM / DOT forms.
 * A product of two encrypted operands (ciphertext x ciphertext) and a division
   whose denominator is encrypted require every ENC/PAIRED column inside the
   operands involved to be PAIRED (an ENC column is additive-only). Linear
@@ -50,6 +51,7 @@ class ExprInfo:
     depth: int         # multiplicative depth = ciphertext x ciphertext levels
     ct_muls: int       # number of ciphertext x ciphertext products
     inversions: int    # number of owner-assisted inversions (non-constant denominators)
+    fhe: bool = False  # an FHE expression (v0.6.1): products are paired BY THE SERVER, depth/rounds are 0
 
 
 # internal per-node summary: (kind, enc_columns, depth, ct_muls, inversions)
@@ -175,13 +177,53 @@ def _an(e, resolve) -> tuple:
     raise ValidationError(f"unsupported expression node: {type(e).__name__}")
 
 
-def analyze_expr(expr, resolve, *, top: bool = True) -> tuple:
+def _fold(e):
+    """Fold constant subtrees exactly (Fraction arithmetic), as ``_an`` does."""
+    if isinstance(e, Lit):
+        if isinstance(e.value, bool):
+            raise ValidationError("boolean literal in arithmetic expression")
+        _check_const(e.value)
+        return e
+    if isinstance(e, Neg):
+        o = _fold(e.operand)
+        if isinstance(o, Lit):
+            v = _norm(Fraction(-o.value))
+            _check_const(v)
+            return Lit(value=v)
+        return Neg(operand=o)
+    if isinstance(e, AggCall):
+        return e if e.arg is None else AggCall(fn=e.fn, arg=_fold(e.arg))
+    if isinstance(e, BinOp):
+        l, r = _fold(e.left), _fold(e.right)
+        if e.op == "/" and isinstance(r, Lit) and r.value == 0:
+            raise ValidationError("division by zero")
+        if isinstance(l, Lit) and isinstance(r, Lit):
+            a, b = Fraction(l.value), Fraction(r.value)
+            v = a + b if e.op == "+" else a - b if e.op == "-" else a * b if e.op == "*" else a / b
+            v = _norm(v)
+            _check_const(v)
+            return Lit(value=v)
+        return BinOp(op=e.op, left=l, right=r)
+    return e
+
+
+def analyze_expr(expr, resolve, *, top: bool = True, fhe_ok: bool = True) -> tuple:
     """Check ``expr`` and return ``(folded_expr, ExprInfo)``.
 
     ``resolve(name) -> (instance, column)`` looks a (possibly qualified) column
     up and raises the caller's own error type for an unknown column; ``column``
     only needs ``name``, ``type`` and ``policy``. Raises
-    :class:`ValidationError` for every rule violation."""
+    :class:`ValidationError` for every rule violation. ``fhe_ok=False`` (a join: FHE columns
+    cannot be joined) keeps the pre-v0.6.1 rule that FHE columns are rejected."""
+    from . import fhe_expr
+    cols_ = [resolve(n)[1] for n in fhe_expr._columns(expr)]       # an unknown column raises here
+    fcols = [c.name for c in cols_ if c.policy == "fhe"]
+    if fcols:
+        if not fhe_ok:
+            raise ValidationError(fhe_expr.old_message(fcols[0]))
+        fx, folded = fhe_expr.analyze(expr, resolve, _fold)
+        return folded, ExprInfo(kind="agg", enc=True, depth=0, ct_muls=fx.products, inversions=0,
+                                fhe=True)
     node, (kind, cols, depth, muls, invs) = _an(expr, resolve)
     if kind == "const":
         raise ValidationError(

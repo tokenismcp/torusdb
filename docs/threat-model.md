@@ -124,6 +124,14 @@ unverified); with an `integrity_anchor` the row set and freshness are verified t
 either way: malleability (any sum/product of stored cells), and the construction itself has had
 no independent review. Details: `fhe-columns.md`.
 
+**FHE expressions (v0.6.1).** Depth-1 products of integer-linear forms (`SUM((a+2*b)*(c-d))`, `SUM(a)*SUM(b)`, public
+scale/add/divide afterwards) are computed by the server from stored cells and the query's integer literals and opened only by
+the owner. The server receives no ciphertext, tag, mask, key or plaintext-derived number (wire audit in the tests) and holds no
+key; per-row combinations with public coefficients are functions of data it can already compute, so they add no oracle. It sees
+the query shape and access pattern. Integrity: none for a delegated product (as `DOT`); an authenticated connection verifies by
+recomputing from verified cells at the owner (`fhe_dot_mode`, default there). Nothing is ever decrypted or re-encrypted
+between levels because there is only one level; deeper shapes are rejected. Review log round 3.
+
 ### 2.4 Owner-process adversary
 
 If the owner process is compromised, the mask vault is exposed. Mask vault

@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Owner-side evaluation of TorusSQL v0.6 arithmetic expressions: the no-key paper's circuit composition
-//! Pi_C over the blinded database. A port of `core/torusdb_core/expr_eval.py` (the reference); read its
-//! header for the full "who computes what" account. In short:
+//! Owner-computed evaluation of TorusSQL v0.6 arithmetic expressions (`ExprMode::Owner`): the no-key
+//! paper's circuit composition Pi_C over the blinded database. A port of `core/torusdb_core/expr_eval.py`
+//! (the reference); read its header for the full "who computes what" account. The DEFAULT transport is the
+//! shared-wire one in `expr_shared.rs` (every wire a two-party additive sharing, nothing unmasked at the
+//! owner, products computed by both parties). This file also holds the expression compiler and the
+//! public-value evaluator that both modes share. In short:
 //!
 //! * the SERVER holds blinded scalars `s~ = s + r` and plaintext columns, no key, no mask. It only
 //!   (i) sums stored blinded cells for LINEAR `SUM(...)` arguments (Pi_lin) and (ii) multiplies the two
@@ -28,9 +31,35 @@ use std::collections::HashMap;
 
 type Result<T> = std::result::Result<T, Error>;
 
+/// How expressions are evaluated (`ConnectOptions::expression_mode`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ExprMode {
+    /// The paper's circuit composition Pi_C with every wire a two-party ADDITIVE SHARING (needs a server with
+    /// the `wire_exec` RPCs, wire protocol 2.1): the server keeps its share of every wire, products are Beaver
+    /// multiplications that leave the result as a NEW server-resident wire, nothing intermediate is ever
+    /// reconstructed or decrypted by anyone, a division by an ENCRYPTED value costs one extra level, and the
+    /// result is revealed by the server sending its share. The default (as in the Python driver).
+    #[default]
+    Shared,
+    /// The owner-computed transport: the owner unmasks the operand cells, the server only multiplies the
+    /// openings `e*g` (`mult_combine_batch`).
+    Owner,
+}
+
 /// What an expression cost the owner (the last successful `expr` / `join_expr`).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ExprCost {
+    /// which transport ran
+    pub mode: ExprMode,
+    /// ring elements opened (e and g of every product, the t = rho*y of every division) - shared mode only
+    pub openings: usize,
+    /// wires created on the server - shared mode only
+    pub wires: usize,
+    /// `wire_exec` requests sent (one per multiplicative level plus one, more when a cap splits a level) -
+    /// shared mode only
+    pub requests: usize,
+    /// result wires revealed (the result, and one t = rho*y per division level) - shared mode only
+    pub reveals: usize,
     /// sequential ciphertext x ciphertext product levels
     pub depth: usize,
     /// batched `mult_combine_batch` owner round trips (== depth)
@@ -52,10 +81,10 @@ pub enum ExprValue {
     Rows(Vec<Option<Decoded>>),
 }
 
-type Vecn = Vec<Option<BigInt>>;
+pub(crate) type Vecn = Vec<Option<BigInt>>;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Op {
+pub(crate) enum Op {
     Lit,
     Col,
     Count,
@@ -70,26 +99,26 @@ enum Op {
     CMul,
 }
 
-enum Data {
+pub(crate) enum Data {
     None,
     Lit(Frac),
     Col(String),
     Lin(&'static str, Lin),
 }
 
-struct ENode {
-    op: Op,
-    args: Vec<usize>,
-    level: usize,
-    enc: bool,
-    row: bool,
-    data: Data,
+pub(crate) struct ENode {
+    pub(crate) op: Op,
+    pub(crate) args: Vec<usize>,
+    pub(crate) level: usize,
+    pub(crate) enc: bool,
+    pub(crate) row: bool,
+    pub(crate) data: Data,
 }
 
 #[derive(Clone)]
-struct Lin {
-    coef: Vec<(String, Frac)>, // insertion order (the request order depends on it)
-    konst: Frac,
+pub(crate) struct Lin {
+    pub(crate) coef: Vec<(String, Frac)>, // insertion order (the request order depends on it)
+    pub(crate) konst: Frac,
 }
 
 fn scaled(coef: &[(String, Frac)], f: impl Fn(&Frac) -> Frac) -> Vec<(String, Frac)> {
@@ -162,53 +191,25 @@ fn enc_frac(v: &Frac) -> Result<BigInt> {
 /// A folded public coefficient as a ring element WITHOUT the representability check of `encode`: the
 /// coefficient of a linear form may be a product of literals that is not representable on its own (only
 /// the final result has to be).
-fn ring(k: &Frac) -> BigInt {
+pub(crate) fn ring(k: &Frac) -> BigInt {
     md(&(md(&k.num) * mod_inv(&md(&k.den))))
 }
 
-/// Evaluate one planned expression over a list of row tuples.
-pub(crate) struct ExprRunner<'a> {
-    c: &'a mut Client,
-    expr: &'a Expr,
-    info: &'a ExprInfo,
-    /// alias -> table, in tuple order
-    inst: &'a [(String, String)],
-    /// column reference -> (alias, bare column)
-    locs: &'a HashMap<String, (String, String)>,
-    tuples: &'a [Vec<Option<i64>>],
-    nodes: Vec<ENode>,
-    colcache: HashMap<(String, String), Vecn>,
-    cost: ExprCost,
-    zero: Option<String>, // set when a denominator was 0 (raised after the last round)
+/// Compile an expression into a DAG of nodes with multiplicative levels; `inv_levels` extra levels are charged
+/// for a division by an ENCRYPTED value (shared wires: one; owner-computed: none). Returns the nodes and the root.
+pub(crate) fn compile_tree(expr: &Expr, inv_levels: usize, is_enc: &dyn Fn(&str) -> bool) -> (Vec<ENode>, usize) {
+    let mut c = Compiler { nodes: vec![], inv_levels, is_enc };
+    let root = c.compile(expr);
+    (c.nodes, root)
 }
 
-impl<'a> ExprRunner<'a> {
-    pub(crate) fn new(
-        c: &'a mut Client,
-        expr: &'a Expr,
-        info: &'a ExprInfo,
-        inst: &'a [(String, String)],
-        locs: &'a HashMap<String, (String, String)>,
-        tuples: &'a [Vec<Option<i64>>],
-    ) -> Self {
-        ExprRunner { c, expr, info, inst, locs, tuples, nodes: vec![], colcache: HashMap::new(), cost: ExprCost::default(), zero: None }
-    }
+struct Compiler<'e> {
+    nodes: Vec<ENode>,
+    inv_levels: usize,
+    is_enc: &'e dyn Fn(&str) -> bool,
+}
 
-    fn pos(&self, alias: &str) -> usize {
-        self.inst.iter().position(|(a, _)| a == alias).expect("alias in scope")
-    }
-    fn table(&self, alias: &str) -> &str {
-        &self.inst[self.pos(alias)].1
-    }
-    fn loc(&self, name: &str) -> &(String, String) {
-        &self.locs[name]
-    }
-    fn is_enc_col(&self, name: &str) -> bool {
-        let (alias, col) = self.loc(name);
-        self.c.col(self.table(alias), col).map(|c| c.policy != "plain").unwrap_or(true)
-    }
-
-    // ── compile the tree into a DAG with multiplicative levels ──
+impl Compiler<'_> {
     fn add(&mut self, n: ENode) -> usize {
         self.nodes.push(n);
         self.nodes.len() - 1
@@ -221,7 +222,7 @@ impl<'a> ExprRunner<'a> {
         match e {
             Expr::Lit(v) => self.add(Self::node(Op::Lit, vec![], 0, false, false, Data::Lit(v.clone()))),
             Expr::Col(name) => {
-                let enc = self.is_enc_col(name);
+                let enc = (self.is_enc)(name);
                 self.add(Self::node(Op::Col, vec![], 0, enc, true, Data::Col(name.clone())))
             }
             Expr::Neg(o) => {
@@ -234,10 +235,7 @@ impl<'a> ExprRunner<'a> {
                     return self.add(Self::node(Op::Count, vec![], 0, false, false, Data::None));
                 }
                 let arg = arg.as_ref().unwrap();
-                let lin = {
-                    let me: &Self = self;
-                    linear(arg, &|n| me.is_enc_col(n))
-                };
+                let lin = linear(arg, self.is_enc);
                 if let Some(l) = lin {
                     if !l.coef.is_empty() {
                         return self.add(Self::node(Op::LinSum, vec![], 0, true, false, Data::Lin(f, l)));
@@ -260,6 +258,7 @@ impl<'a> ExprRunner<'a> {
                         b = self.add(Self::node(Op::Lit, vec![], 0, false, false, Data::Lit(f)));
                     } else {
                         let (level, enc, row) = (self.nodes[b].level, self.nodes[b].enc, self.nodes[b].row);
+                        let level = level + if enc { self.inv_levels } else { 0 };
                         b = self.add(Self::node(Op::Inv, vec![b], level, enc, row, Data::None));
                     }
                     op = '*';
@@ -278,9 +277,82 @@ impl<'a> ExprRunner<'a> {
             }
         }
     }
+}
+
+/// Evaluate one planned expression over a list of row tuples.
+pub(crate) struct ExprRunner<'a> {
+    pub(crate) c: &'a mut Client,
+    pub(crate) expr: &'a Expr,
+    pub(crate) info: &'a ExprInfo,
+    /// alias -> table, in tuple order
+    inst: &'a [(String, String)],
+    /// column reference -> (alias, bare column)
+    locs: &'a HashMap<String, (String, String)>,
+    pub(crate) tuples: &'a [Vec<Option<i64>>],
+    pub(crate) nodes: Vec<ENode>,
+    colcache: HashMap<(String, String), Vecn>,
+    pub(crate) cost: ExprCost,
+    pub(crate) zero: Option<String>, // set when a denominator was 0 (raised after the last round)
+    /// extra product levels a division by an ENCRYPTED value costs (0: owner-computed; 1: shared wires)
+    inv_levels: usize,
+}
+
+impl<'a> ExprRunner<'a> {
+    pub(crate) fn new(
+        c: &'a mut Client,
+        expr: &'a Expr,
+        info: &'a ExprInfo,
+        inst: &'a [(String, String)],
+        locs: &'a HashMap<String, (String, String)>,
+        tuples: &'a [Vec<Option<i64>>],
+    ) -> Self {
+        ExprRunner {
+            c,
+            expr,
+            info,
+            inst,
+            locs,
+            tuples,
+            nodes: vec![],
+            colcache: HashMap::new(),
+            cost: ExprCost::default(),
+            zero: None,
+            inv_levels: 0,
+        }
+    }
+
+    pub(crate) fn with_inv_levels(mut self, n: usize) -> Self {
+        self.inv_levels = n;
+        self
+    }
+
+    pub(crate) fn pos(&self, alias: &str) -> usize {
+        self.inst.iter().position(|(a, _)| a == alias).expect("alias in scope")
+    }
+    pub(crate) fn table(&self, alias: &str) -> &str {
+        &self.inst[self.pos(alias)].1
+    }
+    pub(crate) fn loc(&self, name: &str) -> &(String, String) {
+        &self.locs[name]
+    }
+    fn is_enc_col(&self, name: &str) -> bool {
+        let (alias, col) = self.loc(name);
+        self.c.col(self.table(alias), col).map(|c| c.policy != "plain").unwrap_or(true)
+    }
+
+    // ── compile the tree into a DAG with multiplicative levels ──
+    /// Compile the runner's expression into `self.nodes`; returns the root.
+    pub(crate) fn compile_root(&mut self) -> usize {
+        let (nodes, root) = {
+            let me: &Self = self;
+            compile_tree(me.expr, me.inv_levels, &|n| me.is_enc_col(n))
+        };
+        self.nodes = nodes;
+        root
+    }
 
     // ── leaves ──
-    fn col_vector(&mut self, name: &str) -> Result<Vecn> {
+    pub(crate) fn col_vector(&mut self, name: &str) -> Result<Vecn> {
         let (alias, col) = self.loc(name).clone();
         let key = (alias.clone(), col.clone());
         if let Some(v) = self.colcache.get(&key) {
@@ -319,7 +391,7 @@ impl<'a> ExprRunner<'a> {
         Ok(out)
     }
 
-    fn valid_tuples(&self, names: &[String]) -> Vec<&'a Vec<Option<i64>>> {
+    pub(crate) fn valid_tuples(&self, names: &[String]) -> Vec<&'a Vec<Option<i64>>> {
         let mut aliases: Vec<&str> = names.iter().map(|n| self.loc(n).0.as_str()).collect();
         aliases.sort_unstable();
         aliases.dedup();
@@ -355,7 +427,7 @@ impl<'a> ExprRunner<'a> {
     }
 
     /// Python `v * n` for a list (repeat it n times) when its length is not already n.
-    fn bc(v: &Vecn, n: usize) -> Vecn {
+    pub(crate) fn bc(v: &Vecn, n: usize) -> Vecn {
         if v.len() == n {
             return v.clone();
         }
@@ -366,7 +438,7 @@ impl<'a> ExprRunner<'a> {
         out
     }
 
-    fn local(&mut self, i: usize, vals: &HashMap<usize, Vecn>) -> Result<Vecn> {
+    pub(crate) fn local(&mut self, i: usize, vals: &HashMap<usize, Vecn>) -> Result<Vecn> {
         let nn = n();
         let op = self.nodes[i].op;
         match op {
@@ -514,7 +586,7 @@ impl<'a> ExprRunner<'a> {
 
     /// Evaluate. Returns the decoded value (agg) or one decoded value (or None) per row.
     pub(crate) fn run(mut self) -> Result<(ExprValue, ExprCost)> {
-        let root = self.compile(self.expr);
+        let root = self.compile_root();
         let depth = self.nodes.iter().map(|n| n.level).max().unwrap_or(0);
         if depth != self.info.depth {
             // planner/engine disagree: never guess
@@ -543,6 +615,7 @@ impl<'a> ExprRunner<'a> {
             return Err(Error::new(Kind::DivisionByZero, format!("division by zero: a denominator is 0{}", sfx)));
         }
         self.cost.depth = depth;
+        self.cost.mode = ExprMode::Owner;
         let out = &vals[&root];
         let dec = |v: &Option<BigInt>| -> Result<Option<Decoded>> {
             match v {

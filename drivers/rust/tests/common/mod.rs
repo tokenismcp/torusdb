@@ -6,7 +6,7 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 pub mod fake;
-use torusdb::Column;
+use torusdb::{Client, Column, ConnectOptions, ExprMode};
 
 pub const ADMIN: &str = "admin-token-0123456789";
 pub const RW: &str = "rw-token-0123456789abc";
@@ -216,4 +216,10 @@ pub fn run_expr_peer(host: &str, port: u16, spec: &serde_json::Value) -> serde_j
         .expect("run expr_peer");
     assert!(out.status.success(), "expr_peer failed: {}", String::from_utf8_lossy(&out.stderr));
     serde_json::from_slice(&out.stdout).expect("peer output")
+}
+
+/// Connect with the owner-computed expression transport (`ExprMode::Owner`): the tests of that transport
+/// (`mult_combine_batch` on the wire, the v0.6 costs) keep their exact assertions.
+pub fn connect_owner(addr: &str) -> Result<Client, torusdb::Error> {
+    Client::connect_with(addr, &ConnectOptions { expression_mode: ExprMode::Owner, ..Default::default() })
 }

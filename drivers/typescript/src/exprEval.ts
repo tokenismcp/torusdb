@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
-// Owner-side evaluation of TorusSQL v0.6 arithmetic expressions: the no-key paper's circuit
-// composition Pi_C over the blinded database. Port of `core/torusdb_core/expr_eval.py` (the
-// reference); read its header for the full "who computes what" account. In short:
+// Owner-computed evaluation of TorusSQL v0.6 arithmetic expressions (`expressionMode: "owner"`): the
+// no-key paper's circuit composition Pi_C over the blinded database. Port of
+// `core/torusdb_core/expr_eval.py` (the reference); read its header for the full "who computes what"
+// account. The DEFAULT transport is the shared-wire one in exprShared.ts (every wire a two-party
+// additive sharing, nothing unmasked at the owner, products computed by both parties). This file also
+// holds the expression compiler and the public-value evaluator that both modes share. In short:
 //
 //  * the SERVER holds blinded scalars s~ = s + r and plaintext columns, no key, no mask. It only
 //    (i) sums stored blinded cells for LINEAR SUM(...) arguments (Pi_lin) and (ii) multiplies the
@@ -33,6 +36,36 @@ export interface Ring {
   inv(a: bigint): bigint;                 // a != 0 (mod N)
 }
 
+/** The server's shared-wire caps, as published in `hello.limits.wires` (wire protocol 2.1). */
+export interface WireLimits {
+  maxWires?: number;
+  maxElements?: number;
+  ttl?: number;
+  maxOps?: number;
+  maxRequestElements?: number;
+}
+
+/** What the shared evaluator needs from the connection besides {@link ExprHost}. */
+export interface SharedHost {
+  /** the owner's MAC key (0n when the connection is not authenticated) */
+  alpha(): bigint;
+  /** `hello.limits.wires` (undefined: the server does not offer the wire RPCs) */
+  wireLimits(): WireLimits | undefined;
+  /** the mask r of the stored cell table[id].col (throws when this vault does not hold it) */
+  mask(table: string, id: number, col: string): bigint;
+  /** one RPC (`wire_exec` / `wire_free`) */
+  rpc(method: string, args: unknown[], maxReply: number): Promise<unknown>;
+}
+
+export interface ENode {
+  op: string;
+  args: number[];
+  level: number;
+  enc: boolean;
+  shape: "scalar" | "row";
+  data?: unknown;
+}
+
 /** What the evaluator needs from the connection. */
 export interface ExprHost {
   authenticated: boolean;
@@ -48,6 +81,8 @@ export interface ExprHost {
   multCombine(openings: Array<[bigint, bigint]>): Promise<bigint[]>;
   /** Is the column PLAIN? */
   isPlain(table: string, col: string): boolean;
+  /** The shared-wire transport (`expressionMode: "shared"`); absent when the host only does owner mode. */
+  shared?: SharedHost;
 }
 
 export interface ExprCost {
@@ -56,18 +91,19 @@ export interface ExprCost {
   products: number;
   inversions: number;
   linearSums: number;
+  /** `"shared"` when the shared-wire transport ran (absent in owner mode, like the Python driver). */
+  mode?: "shared";
+  /** ring elements opened (e and g of every product, the t = rho*y of every division) - shared mode */
+  openings?: number;
+  /** wires created on the server - shared mode */
+  wires?: number;
+  /** `wire_exec` requests sent (one per multiplicative level plus one, more if a cap splits a level) - shared mode */
+  requests?: number;
+  /** result wires revealed (the result, and one t = rho*y per division level) - shared mode */
+  reveals?: number;
 }
 
-type Vec = Array<bigint | null>;
-
-interface ENode {
-  op: string;
-  args: number[];
-  level: number;
-  enc: boolean;
-  shape: "scalar" | "row";
-  data?: unknown;
-}
+export type Vec = Array<bigint | null>;
 
 type Lin = { coef: Map<string, Frac>; konst: Frac };
 
@@ -118,35 +154,37 @@ function linear(e: Expr, isEncCol: (name: string) => boolean): Lin | null {
 }
 
 export class ExprRunner {
-  private nodes: ENode[] = [];
+  /** extra product levels a division by an ENCRYPTED value costs (0: owner-computed; 1: shared wires) */
+  protected readonly invLevels: number = 0;
+  protected nodes: ENode[] = [];
   private colcache = new Map<string, Vec>();
-  private readonly pos = new Map<string, number>();
-  private readonly R: number;
+  protected readonly pos = new Map<string, number>();
+  protected readonly R: number;
   readonly cost: ExprCost = { depth: 0, multRounds: 0, products: 0, inversions: 0, linearSums: 0 };
-  private zero: string | null = null;      // set when a denominator was 0 (raised after the last round)
+  protected zero: string | null = null;      // set when a denominator was 0 (raised after the last round)
 
   /**
    * @param inst   alias -> table, in tuple order
    * @param loc    resolves a column reference of `expr` to its (alias, column)
    * @param tuples one row id (or null: NULL side of a LEFT JOIN) per alias, per row
    */
-  constructor(private readonly host: ExprHost, private readonly ring: Ring, private readonly expr: Expr,
-              private readonly info: ExprInfo, private readonly inst: ReadonlyMap<string, string>,
-              private readonly loc: (name: string) => { alias: string; col: string },
-              private readonly tuples: Array<Array<number | null>>) {
+  constructor(protected readonly host: ExprHost, protected readonly ring: Ring, protected readonly expr: Expr,
+              protected readonly info: ExprInfo, protected readonly inst: ReadonlyMap<string, string>,
+              protected readonly loc: (name: string) => { alias: string; col: string },
+              protected readonly tuples: Array<Array<number | null>>) {
     [...inst.keys()].forEach((a, k) => this.pos.set(a, k));
     this.R = tuples.length;
   }
 
   // ── compile the tree into a DAG with multiplicative levels ──
-  private add(n: ENode): number { this.nodes.push(n); return this.nodes.length - 1; }
+  protected add(n: ENode): number { this.nodes.push(n); return this.nodes.length - 1; }
 
-  private isEncCol(name: string): boolean {
+  protected isEncCol(name: string): boolean {
     const { alias, col } = this.loc(name);
     return !this.host.isPlain(this.inst.get(alias)!, col);
   }
 
-  private compile(e: Expr): number {
+  protected compile(e: Expr): number {
     switch (e.t) {
       case "lit": return this.add({ op: "lit", args: [], level: 0, enc: false, shape: "scalar", data: e.v });
       case "col": return this.add({ op: "col", args: [], level: 0, enc: this.isEncCol(e.name), shape: "row", data: e.name });
@@ -177,7 +215,7 @@ export class ExprRunner {
           op = "*";
         } else if (e.op === "/") {
           const nb = this.nodes[b];
-          b = this.add({ op: "inv", args: [b], level: nb.level, enc: nb.enc, shape: nb.shape });
+          b = this.add({ op: "inv", args: [b], level: nb.level + (nb.enc ? this.invLevels : 0), enc: nb.enc, shape: nb.shape });
           op = "*";
         }
         const na = this.nodes[a], nb = this.nodes[b];
@@ -216,12 +254,12 @@ export class ExprRunner {
     return out;
   }
 
-  private validTuples(names: string[]): Array<Array<number | null>> {
+  protected validTuples(names: string[]): Array<Array<number | null>> {
     const aliases = [...new Set(names.map((n) => this.loc(n).alias))].sort();
     return this.tuples.filter((t) => aliases.every((a) => t[this.pos.get(a)!] !== null));
   }
 
-  private ringOf(k: Frac): bigint {
+  protected ringOf(k: Frac): bigint {
     // a folded public coefficient as a ring element WITHOUT the representability check of encode():
     // the coefficient of a linear form may be a product of literals that is not representable on
     // its own (only the final result has to be)
@@ -251,14 +289,14 @@ export class ExprRunner {
     return [total];
   }
 
-  private bc(v: Vec, n: number): Vec {
+  protected bc(v: Vec, n: number): Vec {
     if (v.length === n) return v;
     const out: Vec = [];
     for (let i = 0; i < n; i++) out.push(...v);                    // Python `v * n`
     return out;
   }
 
-  private async local(node: ENode, vals: Map<number, Vec>): Promise<Vec> {
+  protected async local(node: ENode, vals: Map<number, Vec>): Promise<Vec> {
     const N = this.ring.N;
     switch (node.op) {
       case "lit": return [this.ring.encode(node.data as Frac)];

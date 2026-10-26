@@ -316,12 +316,29 @@ impl Drop for Recorder {
 }
 
 pub fn recorder(target: &str, mutate: Option<Arc<Mutate>>) -> Recorder {
+    recorder_hooks(target, Hooks { reply: mutate, req: None, kill: None })
+}
+
+/// Rewrites the ARGUMENTS of a request in place before it is forwarded (a lying client / man in the middle).
+pub type MutateReq = dyn Fn(&str, &mut Value) + Send + Sync;
+/// (method, nth call of that method) -> true: forward the request, swallow the reply and cut the connection.
+pub type KillReply = dyn Fn(&str, usize) -> bool + Send + Sync;
+
+#[derive(Default)]
+pub struct Hooks {
+    pub reply: Option<Arc<Mutate>>,
+    pub req: Option<Arc<MutateReq>>,
+    pub kill: Option<Arc<KillReply>>,
+}
+
+pub fn recorder_hooks(target: &str, hooks: Hooks) -> Recorder {
     let l = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = l.local_addr().unwrap().to_string();
     let log: Arc<Mutex<Vec<(String, Value)>>> = Arc::new(Mutex::new(vec![]));
     let stop = Arc::new(AtomicBool::new(false));
     let counts = Arc::new(Mutex::new(std::collections::HashMap::<String, usize>::new()));
     let (log2, stop2, t) = (log.clone(), stop.clone(), target.to_string());
+    let (mutate, mutate_req, kill) = (hooks.reply, hooks.req, hooks.kill);
     std::thread::spawn(move || {
         for c in l.incoming() {
             if stop2.load(Ordering::SeqCst) {
@@ -329,24 +346,38 @@ pub fn recorder(target: &str, mutate: Option<Arc<Mutate>>) -> Recorder {
             }
             let Ok(mut client) = c else { break };
             let Ok(mut up) = TcpStream::connect(&t) else { continue };
-            let (log, mutate, counts) = (log2.clone(), mutate.clone(), counts.clone());
+            let (log, mutate, mutate_req, kill, counts) = (log2.clone(), mutate.clone(), mutate_req.clone(), kill.clone(), counts.clone());
             std::thread::spawn(move || {
                 while let Some(fr) = read_frame(&mut client) {
-                    let req: Value = serde_json::from_slice(&fr).unwrap();
+                    let mut req: Value = serde_json::from_slice(&fr).unwrap();
                     let m = req["m"].as_str().unwrap().to_string();
                     log.lock().unwrap().push((m.clone(), req["a"].clone()));
-                    if up.write_all(&frame(&fr)).is_err() {
+                    let nth = {
+                        let mut c = counts.lock().unwrap();
+                        let e = c.entry(m.clone()).or_insert(0);
+                        *e += 1;
+                        *e
+                    };
+                    let out: Vec<u8> = match &mutate_req {
+                        Some(f) => {
+                            f(&m, &mut req["a"]);
+                            req.to_string().into_bytes()
+                        }
+                        None => fr.clone(),
+                    };
+                    if up.write_all(&frame(&out)).is_err() {
                         return;
                     }
                     let Some(rep) = read_frame(&mut up) else { return };
+                    if let Some(k) = &kill {
+                        if k(&m, nth) {
+                            let _ = client.shutdown(Shutdown::Both);
+                            let _ = up.shutdown(Shutdown::Both);
+                            return;
+                        }
+                    }
                     let rep = match &mutate {
                         Some(f) => {
-                            let nth = {
-                                let mut c = counts.lock().unwrap();
-                                let e = c.entry(m.clone()).or_insert(0);
-                                *e += 1;
-                                *e
-                            };
                             let v: Value = serde_json::from_slice(&rep).unwrap();
                             f(&m, &req["a"], v, nth).to_string().into_bytes()
                         }
