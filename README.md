@@ -179,6 +179,17 @@ pytest spec/conformance                     # just the dialect conformance suite
 * **Not in this repository:** the EC-FHE engine used by the full TorusDB product is closed source;
   this repository is the key-less server layer, drivers and spec, and works without it.
 
+## Support the project
+
+TorusDB is developed in the open and is not funded by a product company. Donations go to:
+
+1. an **independent cryptographic audit** of the `FHE` columns and the key-less protocol
+   (see [`docs/audit-scope.md`](docs/audit-scope.md)),
+2. maintenance: CI, releases, security fixes, documentation.
+
+Sponsor via the **Sponsor** button on the repository page. Funding is support for the work, not a
+security guarantee or a support contract, and sponsors get no special access to vulnerability reports.
+
 Contributing: [`CONTRIBUTING.md`](CONTRIBUTING.md) · Security reports:
 [`SECURITY.md`](SECURITY.md) · Changes: [`CHANGELOG.md`](CHANGELOG.md) · Plan:
 [`ROADMAP.md`](ROADMAP.md) · License: Apache-2.0 ([`LICENSE`](LICENSE)).
