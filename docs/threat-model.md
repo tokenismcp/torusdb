@@ -34,7 +34,7 @@ server process — is adversarial.
 | What the server learns | **Nothing** about encrypted values: I(M; V_S) = 0 (unconditional, Thm 30/31) |
 | Adversary assumed to be | **Semi-honest** (follows the protocol, records all traffic) |
 | Honest-but-curious breach | Stolen server database = one-time pad. Zero information. |
-| Malicious server | Cannot forge results undetected in **authenticated mode** except w.p. 1/n (information-theoretic, no computational assumption) |
+| Malicious server | Cannot forge results undetected in **authenticated mode** except w.p. 1/n (information-theoretic, no computational assumption). For shared-wire expressions this covers every stored cell, share, opening and the result (w.p. ≤ (depth+1)·checks/n, sketch: review packet §3.3). **Unauthenticated mode is secure against a semi-honest server only**: a lying server can shift results by a chosen amount and, by shifting a denominator's share, learn whether it equals a guess |
 | Complexity | Post-quantum safe: the one-time-pad guarantee is unconditional, requires no computational hardness assumption |
 
 The server cannot be an "honest evaluator" because it holds no key. It is
@@ -95,6 +95,22 @@ when more than `k` answer (fail-closed otherwise). Reading a cell reveals its ma
 to the owner process; aggregates reveal only the sum. A malicious DB server can
 relabel schema policies — mitigated by the read-only rule for server-learned
 tables (`trust_server_schema`). Details and limits: `masks.md`.
+
+### 2.3f Shared-wire expressions (v0.6 expressions, wire protocol 2.1)
+
+Expressions run on secret-shared wires (spec §5.10, review packet §3.3). The server holds one
+additive share of every intermediate in a per-session store, so a *breach of the server* yields
+shares, stored cells and triple shares that are uniform and independent of every value (including
+every intermediate and the result - the result is never sent to the server). Adversary outcomes:
+
+| Adversary | Outcome |
+|---|---|
+| Passive server / stolen server memory or snapshot | Uniform shares only; I(M; V_S) = 0, unconditional, post-quantum. Wire stores are ephemeral (freed at query end, transaction end, TTL, disconnect). |
+| Server that follows the protocol but records everything | Same. It learns the query shape (levels, products per level, rows, request sizes) - F-21 - and, for a zero denominator, nothing (the opened `t` is replaced by a dummy). |
+| Malicious server, `authenticated=True` | Any tampering with a stored cell, share, opening or reply is detected (`IntegrityError`) except w.p. ≤ (depth+1)·checks/n. Plain data (`WHERE` results, join keys, row existence) is not authenticated. Denial of service remains possible. |
+| Malicious server, **unauthenticated** (default) | Not covered: it can shift any result by an amount of its choice and test a denominator against a guess (the owner's `DivisionByZero` is the oracle). Use `authenticated=True` on any host not trusted to follow the protocol. |
+| Client that tries to exhaust server memory with wires | Per-session and server-wide element caps, a wire-count cap, request-size/op caps and a TTL (`--wire-max-elements`, `--wire-max-total-elements`, `--wire-max-wires`, `--wire-ttl`); a violation is a named `WireError`. Wires are private to a session and are read-only (`ro` role may use them). |
+| The owner process itself | Holds the masks and, as the Beaver dealer, can derive operands and intermediates from the public openings (F-22). Not a boundary this design defends; the owner is the data owner. |
 
 ### 2.3e FHE columns (optional, experimental)
 
@@ -229,12 +245,16 @@ The following are explicitly **not** in scope for this version:
 - **Encrypted predicate evaluation**: WHERE/GROUP BY/ORDER BY on encrypted
   columns is impossible without revealing the server's plaintext comparison
   capability. This is a fundamental FHE limitation.
-- **Offloading deep products and divisions to the server**: dialect v0.6 evaluates products
-  of any depth (up to `max_mult_depth`, default 8) and division, but at the **owner**: it holds
-  both operands of every product (it unmasks them) and inverts every encrypted denominator, so
-  the server does no useful multiplication work (review packet §3.3, F-3). Confidentiality is
-  unaffected; the cost is O(rows) owner work and one round trip per multiplicative level.
-  `FHE` columns still have a single multiplicative level (no expressions over them).
+- **An owner that is blind to intermediates / multi-owner expressions**: dialect v0.6 evaluates products
+  of any depth (up to `max_mult_depth`, default 8) and division on *secret-shared wires*: the server
+  holds its share of every intermediate and never learns a product, quotient or result (unconditional),
+  and the owner's code fetches no operand and unmasks nothing. But the owner is the dealer of the Beaver
+  triples and of the division mask, so the public openings determine every operand and intermediate for
+  an owner that chose to compute them (it is the data owner, so in the single-owner model this reveals
+  nothing it does not already hold). It still does O(rows) share arithmetic per level. A deployment with
+  several mutually distrusting owners, or one that must keep intermediates from the owner, needs triples
+  nobody knows (a third non-colluding dealer, or OT/HE-based generation) - not implemented (review packet
+  F-22, F-9). `FHE` columns still have a single multiplicative level (no expressions over them).
 - **Traffic analysis**: volume/timing of network exchanges can leak query
   structure.
 - **Physical side channels**: power analysis, cache-timing, etc.

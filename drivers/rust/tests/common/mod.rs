@@ -12,9 +12,13 @@ pub const ADMIN: &str = "admin-token-0123456789";
 pub const RW: &str = "rw-token-0123456789abc";
 pub const RO: &str = "ro-token-0123456789abc";
 
-/// Repository root (this crate lives at <root>/drivers/rust).
+/// Repository root (this crate lives at <root>/drivers/rust). `TORUSDB_PY_ROOT` points the Python side
+/// (server, core, parser, python driver) at another checkout (e.g. a pristine release snapshot).
 pub fn repo() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap()
+    match std::env::var("TORUSDB_PY_ROOT") {
+        Ok(p) if !p.is_empty() => PathBuf::from(p).canonicalize().unwrap(),
+        _ => Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap(),
+    }
 }
 
 /// Integration tests must not silently skip where a server is mandatory (CI).
@@ -24,6 +28,11 @@ pub fn require_integration() -> bool {
 
 pub fn vectors_path() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../vectors.json")
+}
+
+/// Cross-language expression vectors generated from the Python reference (drivers/gen_expr_vectors.py).
+pub fn expr_vectors_path() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../expr_vectors.json")
 }
 
 fn python() -> Option<String> {
@@ -189,4 +198,22 @@ pub fn raw_rpc(addr: &str, method: &str, args: serde_json::Value) -> serde_json:
     s.set_read_timeout(Some(std::time::Duration::from_secs(120))).unwrap();
     write_frame(&mut s, serde_json::json!({"m": method, "a": args}).to_string().as_bytes());
     serde_json::from_slice(&read_frame(&mut s).unwrap()).unwrap()
+}
+
+/// Run the Python expression peer (drivers/expr_peer.py): the Python engine evaluates the same expressions
+/// against the same server (its own owner, its own copy of the tables). Returns its JSON output.
+pub fn run_expr_peer(host: &str, port: u16, spec: &serde_json::Value) -> serde_json::Value {
+    let py = python().expect("a Python interpreter is needed for the cross-implementation tests");
+    let root = repo();
+    let pp = ["core", "parser", "drivers/python"].iter().map(|d| root.join(d).to_string_lossy().to_string()).collect::<Vec<_>>().join(":");
+    let out = Command::new(py)
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("../expr_peer.py"))
+        .arg(host)
+        .arg(port.to_string())
+        .arg(spec.to_string())
+        .env("PYTHONPATH", pp)
+        .output()
+        .expect("run expr_peer");
+    assert!(out.status.success(), "expr_peer failed: {}", String::from_utf8_lossy(&out.stderr));
+    serde_json::from_slice(&out.stdout).expect("peer output")
 }

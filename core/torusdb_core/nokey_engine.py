@@ -38,7 +38,8 @@ from .planner import (
     PAvg, PColRef, PCondition, PCountStar, PCtMul, PDot, PExpr, PInList, PMax, PMin,
     PScalarMul, PScaledSum, PSum, PWhere, Plan, plan_query,
 )
-from .expr_eval import ExprRunner
+from .expr_eval import ExprRunner, expr_rounds
+from .wires import WireLimits, WireStore
 
 N = nokey.N
 
@@ -148,7 +149,30 @@ class NoKeyServer:
         return len(items)
 
     def limits(self) -> dict:
-        return {}                                  # in-process: nothing to negotiate
+        return {"wires": self._wire_limits().as_dict()}       # in-process: only the wire caps
+
+    # — shared wires (wire RPCs): the server half of Π_C; see torusdb_core/wires.py —
+    def _wire_limits(self) -> WireLimits:
+        return getattr(self, "_wl", None) or WireLimits()
+
+    def _wire_store(self) -> WireStore:
+        st = self.__dict__.get("_wstore")
+        if st is None:
+            st = self.__dict__["_wstore"] = WireStore(self._wire_limits())
+        return st
+
+    def wire_exec(self, ops: list) -> list:
+        """Run a batch of shared-wire operations (see :class:`WireStore`). The only database
+        access is reading stored (blinded) cells of the named rows."""
+        return self._wire_store().exec(ops, self._wire_cells)
+
+    def wire_free(self, ids=None) -> int:
+        return self._wire_store().free(ids)
+
+    def _wire_cells(self, table: str, col: str, rows: list) -> list:
+        uniq = sorted({r for r in rows if r is not None})
+        got = dict(zip(uniq, self._rows[table].cells(col, uniq))) if uniq else {}
+        return [0 if r is None else got[r] for r in rows]
 
     def delete_rows(self, table: str, idxs: list[int]) -> int:
         return len(self._rows[table].kill(idxs))
@@ -437,6 +461,12 @@ class NoKeyClient:
     # one batched Π_mult exchange each) a single expression may need. Checked at plan time, before
     # any request is sent; raise it deliberately (each level is one round trip).
     max_mult_depth: int = 8
+    # How v0.6 expressions are evaluated. "shared" (default): every wire is a two-party additive
+    # sharing (the server holds one share in a session-scoped wire store, the owner the other);
+    # no operand or intermediate is ever fetched, unmasked or computed in plaintext (spec §5.10).
+    # "owner": the v0.6 behaviour -- the owner fetches and unmasks the operand cells and computes
+    # every product/quotient itself (the server only multiplies two openings); needs no wire RPC.
+    expr_mode: str = "shared"
     # cost of the last SELECT's expression projections, summed over them (and over GROUP BY
     # groups; "depth" is the maximum): {"depth", "mult_rounds", "products", "inversions",
     # "linear_sums"}; None when the statement had none (for tests and tuning)
@@ -846,13 +876,8 @@ class NoKeyClient:
     # server as blinded scalars (Π_lin / Π_mult), never decrypted there.
     def _select(self, plan: Plan) -> "ResultSet":
         self.last_expr_cost = None
-        for p in plan.projections or []:
-            if isinstance(p, PExpr) and p.depth > self.max_mult_depth:
-                raise DepthLimitExceeded(
-                    f"expression {p.text!r} needs {p.depth} sequential ciphertext x ciphertext "
-                    f"product levels (one owner round each) but max_mult_depth is "
-                    f"{self.max_mult_depth}; raise max_mult_depth deliberately or restructure "
-                    f"the expression")
+        if self.expr_mode not in ("shared", "owner"):
+            raise PlanError(f"expr_mode must be 'shared' or 'owner', not {self.expr_mode!r}")
         qualified = plan.instances is not None
         inst = plan.instances or {plan.table: plan.table}
         names = list(inst)
@@ -863,6 +888,17 @@ class NoKeyClient:
                 a, c = col_name.split(".", 1)
                 return a, c
             return names[0], col_name
+
+        for p in plan.projections or []:
+            if isinstance(p, PExpr):
+                rounds = expr_rounds(self, p, inst, names, loc)
+                if rounds > self.max_mult_depth:
+                    raise DepthLimitExceeded(
+                        f"expression {p.text!r} needs {rounds} sequential ciphertext x ciphertext "
+                        f"product levels (one owner round each; a division by an encrypted "
+                        f"value costs one extra level in expr_mode='shared') but "
+                        f"max_mult_depth is {self.max_mult_depth}; raise max_mult_depth "
+                        f"deliberately or restructure the expression")
 
         tuples = self._base_tuples(plan, inst, names, loc, qualified)
 
@@ -1097,6 +1133,9 @@ class NoKeyClient:
         if isinstance(p, PCountStar):
             return len(tuples)
         if isinstance(p, PExpr):
+            if self.expr_mode == "shared":
+                from .expr_shared import SharedExprRunner
+                return SharedExprRunner(self, p, inst, names, loc, tuples).run()
             return ExprRunner(self, p, inst, names, loc, tuples).run()
         if isinstance(p, PColRef):
             table, bare, all_ids = ids(p.name)

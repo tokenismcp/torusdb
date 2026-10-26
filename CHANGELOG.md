@@ -8,6 +8,35 @@ Versioning: [Versioning Policy](docs/versioning.md).
 
 ## [Unreleased]
 
+### Changed - expressions use secret-shared wires (wire protocol 2.1; no dialect change)
+
+- **The owner no longer computes the circuit.** Every wire of a v0.6 expression is now a two-party additive sharing over Z/nZ
+  (the no-key paper's Pi_C): the server keeps its share of each intermediate in a session-scoped wire store, the owner its own.
+  Linear gates (`+ - neg`, public scalar/vector multiply, public add, `SUM`, `AVG`, division by a public value) are local to each
+  party; a product of two encrypted wires is a Beaver exchange (one request/response per multiplicative level, batched over rows
+  and sub-expressions) whose result stays at the server as its share; division by an **encrypted** value never decrypts it
+  (a uniform non-zero `rho` is dealt as a sharing, `t = rho*y` is opened - uniform whatever `y` is, a zero denominator is replaced
+  by a dummy so the request sequence and the server's view do not change - and `1/y = t^-1 * rho` is local; costs one extra
+  level). At the end the server sends its share of the result and the owner adds its own and decodes (strict, `OutOfBudget`).
+  The owner fetches no operand cell and unmasks nothing. Integrity (`authenticated=True`): every wire carries a share of its
+  SPDZ tag; every opening and the result are MAC-checked, the opened `t` before the zero test.
+- **Honest limits** (review packet 3.3, F-18-F-25): the owner still does O(rows) share arithmetic per level (inherent; this mode
+  is slower than `expr_mode="owner"`, e.g. 0.15 s vs 0.06 s for `SUM(a*b*c*d)` over 3 000 rows in-process); the owner is the
+  Beaver dealer and so *could* derive operands from the openings (the code never does; only the server is blind,
+  unconditionally); without `authenticated=True` a lying server can shift results and test a denominator against a guess
+  (pinned by tests). Where the paper's Pi_mult/Pi_C and the implementation differ is listed in 3.3.
+- New RPCs `wire_exec` / `wire_free` (wire protocol **2.1**, a MINOR bump: `proto/torussql-wire-v2.md` section 9, `docs/versioning.md`);
+  `hello.limits.wires`; server flags `--wire-max-elements`, `--wire-max-total-elements`, `--wire-max-wires`, `--wire-ttl`.
+  Per-session and server-wide caps, TTL, freed at query end / COMMIT / ROLLBACK / transaction timeout / disconnect; named `WireError`s.
+- `connect(..., expr_mode="shared" | "owner")` (shell `--expr-mode`): `"owner"` is the previous behaviour (fetch and unmask the
+  operands, `mult_combine_batch`; works with any v2 server). A 2.1 driver against a 2.0 server fails with a clear message naming
+  `expr_mode="owner"`. `last_expr_cost` gains `mode, openings, wires, requests, reveals`; `max_mult_depth` now counts the extra
+  level of a division by an encrypted value.
+- The legacy v0.5 shapes (`a * b`, `DOT`, `SUM(col)`, `k * col`) keep their owner-computed paths. TypeScript and Rust drivers
+  still use the owner-computed transport.
+- Tests: `core/tests/test_expr_shared.py`, `tests/test_expr_shared_e2e.py`; tests that pinned the owner-computed transport now
+  select `expr_mode="owner"` explicitly.
+
 ### Added - SQL dialect v0.6: arithmetic expressions (`spec/TorusSQL-Spec-v0.6.md`)
 
 - Expression grammar in `SELECT` lists and as aggregate arguments: `+ - * /`, unary minus, parentheses, integer and
@@ -35,9 +64,36 @@ Versioning: [Versioning Policy](docs/versioning.md).
   rejected with a clear error naming `FHE`, never a wrong value.
 - Tests: `core/tests/test_expr_v06.py`, `parser/tests/test_expr.py`, `tests/test_expr_e2e.py` (real server), expression
   audits in `core/tests/test_crypto_audit.py`; `examples/payroll.torusql` shows chained products and division.
-- **Not yet in the TypeScript and Rust drivers** (they keep the v0.5 operations; no wire change is needed to port it).
+- TypeScript and Rust drivers: see "TypeScript and Rust drivers: dialect v0.6" below.
 - Docs: README, quickstart, GETTING_STARTED, ops guide, threat model (expression shape, no zero-denominator oracle),
   review packet 3.3 and findings F-18-F-21, ROADMAP, `docs/versioning.md`; spec v0.5 marked superseded.
+
+### Added - TypeScript and Rust drivers: dialect v0.6 expressions (`drivers/typescript`, `drivers/rust`)
+
+- `db.expr(table, "SUM(price*qty)/COUNT(*)", where?)` / `db.joinExpr(joinResult, text)` (TypeScript) and
+  `db.expr(table, text, pred)` / `db.join_expr(&j, text)` (Rust): the v0.6 expression grammar (`+ - * /`, unary minus,
+  parentheses, `FRAC(n, d)`, `SUM`/`AVG`/`COUNT(*)`) is parsed in the driver (ports of `torussql_parser/expr.py` and the
+  expression part of the parser) with the same precedence, exact constant folding, tree-height limit and policy rules
+  (`PAIRED` for ciphertext products and encrypted denominators, `FHE`/`STR` rejected with the same messages).
+  `analyzeExpr` / `analyze_expr` report kind, depth, product and inversion counts without sending anything.
+- Arbitrary-depth products with one batched `mult_combine_batch` owner round per multiplicative level (rounds == depth,
+  chunked to the server's `max_items`), depth cap `maxMultDepth` / `max_mult_depth` (connect option and setter, default 8,
+  error `DepthLimitExceeded` before any request), division by public values (multiply by the inverse) and by encrypted values
+  (owner inversion), exact results (`bigint` / `{num, den}`; `Decoded`), `DivisionByZero` raised only after the protocol ran to its
+  last round with a dummy inverse (a zero denominator does not change the request sequence), `OutOfBudget` never a wrong value,
+  `lastExprCost` / `last_expr_cost()`. Authenticated mode MAC-checks every cell read, every blinded sum and every product
+  term (`IntegrityError`). Linear `SUM(...)` arguments stay Pi_lin aggregates computed by the server. No new RPC.
+- New error kinds: `ParseError`, `DepthLimitExceeded`, `DivisionByZero` (Rust: `Kind::Parse`, `Kind::DepthLimitExceeded`,
+  `Kind::DivisionByZero` - new variants of a non-`#[non_exhaustive]` enum, so an exhaustive `match` needs a new arm).
+- Expressions refuse tables whose policies were only learned from the server (`UntrustedSchema`).
+- Tests: shared vectors `drivers/expr_vectors.json` (generated from the Python reference by `drivers/gen_expr_vectors.py`; ~400
+  static accept/reject cases and ~480 executed cases with results, errors and costs), a live Python peer (`drivers/expr_peer.py`: the
+  same random expressions through the Python engine and each driver against one server, values/errors/costs equal), wire audits
+  (no mask, MAC key, encoded plaintext, intermediate or inverse reaches the server; openings uniform, no triple reused), rounds
+  == depth on the wire, depth cap before any request, abort-oracle trace equality, forged-product and tampered-cell detection.
+  Test knob `TORUSDB_PY_ROOT` points the Python side at another checkout.
+- Not supported in the drivers (documented): `MIN`/`MAX`/`DOT` as expression projections (use `dot()` / `joinDot()`), expressions
+  over `FHE` columns (rejected naming FHE, as in Python), several expressions per call (one `expr` call per SELECT-list item).
 
 - Project logo and social-preview card (`assets/`), README badges and status banner.
 - GitHub issue/PR templates and Dependabot configuration.

@@ -37,7 +37,7 @@ pub(crate) fn md(a: &BigInt) -> BigInt {
     a.mod_floor(n())
 }
 
-fn mod_inv(a: &BigInt) -> BigInt {
+pub(crate) fn mod_inv(a: &BigInt) -> BigInt {
     let m = n();
     let (mut old_r, mut r) = (md(a), m.clone());
     let (mut old_s, mut s) = (BigInt::one(), BigInt::zero());

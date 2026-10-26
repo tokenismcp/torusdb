@@ -27,7 +27,7 @@ that was legal and produced result R will always be legal and produce R.
 | `MAJOR` | A legal statement changes semantics or becomes illegal |
 
 Current: **0.6** (`spec/TorusSQL-Spec-v0.6.md`, unreleased until the next package release; v0.5 and v0.1 kept
-for history). v0.6 adds arithmetic expressions and needs **no new RPC**, so the wire protocol stays at 2.
+for history). v0.6 adds arithmetic expressions; the dialect is unchanged by how they are transported.
 
 ### Surface 2: The wire protocol (`proto/torussql-wire-v*.md`)
 
@@ -45,7 +45,11 @@ with any server that speaks N, regardless of engine internals.
 | `MINOR` | New RPC method added (old clients ignore unknown responses) |
 | `MAJOR` | Existing method renamed, argument schema changed, or framing format changed |
 
-Current: **protocol 2** (`proto/torussql-wire-v2.md`; 4-byte **big-endian** length prefix + JSON envelope). Protocol 1 is the pre-0.5 server (no `hello`, auth or transactions); v2 drivers interoperate with it.
+Current: **protocol 2.1** (`proto/torussql-wire-v2.md`; 4-byte **big-endian** length prefix + JSON envelope).
+Revision 2.1 is a MINOR bump under the rule above: it adds two RPC methods (`wire_exec`, `wire_free`, the
+secret-shared-wire transport for expressions, §9 of the wire document) and a `limits.wires` object in `hello`;
+nothing was renamed or reshaped, the `hello` integer `protocol` stays 2, and a 2.0 client or server interoperates
+(a 2.1 driver talking to a 2.0 server reports a clear error and offers `expr_mode="owner"`). Protocol 1 is the pre-0.5 server (no `hello`, auth or transactions); v2 drivers interoperate with it.
 
 ---
 

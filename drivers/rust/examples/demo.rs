@@ -46,6 +46,12 @@ fn main() -> Result<(), String> {
     println!("DOT(rate, hours)   = {:?}", db.dot("emp", "rate", "hours", all())?); // Int(5900)
     println!("COUNT(*)           = {}", db.count("emp", all())?); // 3
 
+    // dialect v0.6 arithmetic expressions: exact, products of any depth (one owner round per level), division
+    println!("rate*hours/2       = {:?}", db.expr("emp", "rate * hours / 2", all())?); // Rows: 1000, 1050, 900
+    println!("rate*hours*rate    = {:?}", db.expr("emp", "rate * hours * rate", all())?); // depth 2: two Pi_mult rounds
+    println!("SUM(rate*hours)/N  = {:?}", db.expr("emp", "SUM(rate * hours) / COUNT(*)", all())?); // Rational(5900, 3)
+    println!("cost of last expr  = {:?}", db.last_expr_cost());
+
     // all-or-nothing, on the server AND in the local mask vault
     db.transaction(|db| db.update("emp", vec![("salary", CellIn::Int(BigInt::from(8500)))], eq_int("id", 1)))?;
 

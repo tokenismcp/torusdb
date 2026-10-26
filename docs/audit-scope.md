@@ -88,7 +88,7 @@ receives and asserts it is uniform / mask-free), `fuzz/` (parser and wire fuzzin
 *FHE columns have a detailed internal review log with fixed and residual findings: `fhe-review-log.md`. Please start there.*
 
 
-* `Π_mult` offers no server offload and needs owner-held plaintext operands (F-3).
+* `Π_mult` for `DOT` / `a * b` offers no server offload and needs owner-held plaintext operands (F-3). Expressions use secret-shared wires, but the owner is the triple dealer and can derive operands (F-22); the shared-wire proofs are sketches (F-25); unauthenticated mode is semi-honest only (F-23).
 * Integrity is opt-in and does not cover the *set* of rows (a server can omit/duplicate
   rows of a MAC-authenticated table consistently with the row-id list it returns) (F-4).
 * Beaver triples come from the single owner; multi-owner needs MPC preprocessing (F-9).

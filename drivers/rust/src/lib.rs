@@ -26,6 +26,8 @@
 mod anchor;
 mod conn;
 mod error;
+mod expr;
+mod expr_eval;
 mod field;
 mod fhe;
 mod hash;
@@ -42,6 +44,8 @@ pub use fhe::{
 };
 #[doc(hidden)]
 pub use fhe::internals as fhe_internals;
+pub use expr::{analyze_expression, parse_expression, render_expr, Expr, ExprInfo, Frac, MAX_EXPR_HEIGHT};
+pub use expr_eval::{ExprCost, ExprValue};
 pub use field::{decode, encode_int, encode_rational, n, reduce, Decoded};
 
 use conn::{Conn, TransportOpts, HARD_MAX_FRAME};
@@ -304,6 +308,10 @@ pub struct ConnectOptions {
     pub integrity_anchor: Option<AnchorSpec>,
     /// Refuse to anchor a table with more row slots than this (default 1 000 000; ~0.5 KB of owner memory per row).
     pub integrity_anchor_max_rows: Option<usize>,
+    /// Dialect v0.6 expressions: the most sequential ciphertext x ciphertext product levels (= owner round
+    /// trips, one batched Pi_mult exchange each) one expression may need. Default 8. Checked before any
+    /// request is sent; a deeper expression fails with `Kind::DepthLimitExceeded`. Raise it deliberately.
+    pub max_mult_depth: usize,
 }
 
 impl Default for ConnectOptions {
@@ -324,6 +332,7 @@ impl Default for ConnectOptions {
             fhe_allow_unverified_dot: false,
             integrity_anchor: None,
             integrity_anchor_max_rows: None,
+            max_mult_depth: 8,
         }
     }
 }
@@ -346,6 +355,7 @@ impl fmt::Debug for ConnectOptions {
             .field("fhe_allow_unverified_dot", &self.fhe_allow_unverified_dot)
             .field("integrity_anchor", &self.integrity_anchor)
             .field("integrity_anchor_max_rows", &self.integrity_anchor_max_rows)
+            .field("max_mult_depth", &self.max_mult_depth)
             .finish()
     }
 }
@@ -546,6 +556,12 @@ struct BlindedRow {
     tags: Vec<(String, i64, BigInt)>,
 }
 
+struct ExprPlan {
+    expr: Expr,
+    info: ExprInfo,
+    locs: HashMap<String, (String, String)>,
+}
+
 pub struct Client {
     conn: Conn,
     masks: Masks, // (table, rowid, col) -> r   (SECRET)
@@ -562,6 +578,8 @@ pub struct Client {
     alpha: BigInt,        // SECRET MAC key
     update_cells_ok: bool, // false once the server answered "unknown method" for update_cells
     amgr: Option<anchor::AnchorMgr>, // anchored table-state mode (integrity_anchor)
+    max_mult_depth: usize,           // dialect v0.6: deepest expression `expr` / `join_expr` will run
+    last_expr_cost: Option<ExprCost>,
 }
 
 impl fmt::Debug for Client {
@@ -725,6 +743,8 @@ impl Client {
             alpha: BigInt::zero(),
             update_cells_ok: true,
             amgr: None,
+            max_mult_depth: o.max_mult_depth,
+            last_expr_cost: None,
         };
         if let Some(spec) = &o.integrity_anchor {
             if !o.authenticated {
@@ -2462,6 +2482,112 @@ impl Client {
             }
         }
         self.dot_pairs(&j.tables[alias_a], col_a, &la, &j.tables[alias_b], col_b, &lb)
+    }
+
+    // ── dialect v0.6: arithmetic expressions ─────────────────────────────────
+
+    /// The deepest expression (in sequential ciphertext x ciphertext product levels = owner rounds) that
+    /// `expr` / `join_expr` will run; a deeper one fails with `Kind::DepthLimitExceeded` before any request.
+    pub fn max_mult_depth(&self) -> usize {
+        self.max_mult_depth
+    }
+
+    pub fn set_max_mult_depth(&mut self, n: usize) {
+        self.max_mult_depth = n;
+    }
+
+    /// Cost of the last successful `expr` / `join_expr` (depth, owner rounds, products, inversions,
+    /// Pi_lin sums); `None` before one ran or after a failed one.
+    pub fn last_expr_cost(&self) -> Option<&ExprCost> {
+        self.last_expr_cost.as_ref()
+    }
+
+    fn expr_plan(&self, expression: &str, instances: &[(String, String)]) -> Result<ExprPlan> {
+        let tree = parse_expression(expression)?;
+        let mut specs = vec![];
+        for (a, t) in instances {
+            specs.push((a.clone(), self.cols(t)?.clone()));
+        }
+        let scope = expr::Scope::new(specs)?;
+        let (expr, info) = analyze_expression(&tree, &|n: &str| scope.resolve(n).map(|(_, c)| c))?;
+        if info.depth > self.max_mult_depth {
+            return Err(Error::new(
+                Kind::DepthLimitExceeded,
+                format!(
+                    "expression '{}' needs {} sequential ciphertext x ciphertext product levels (one owner round \
+                     each) but max_mult_depth is {}; raise max_mult_depth deliberately or restructure the expression",
+                    info.text, info.depth, self.max_mult_depth
+                ),
+            ));
+        }
+        for (_, t) in instances {
+            if !self.def(t)?.trusted {
+                return Err(Error::new(
+                    Kind::UntrustedSchema,
+                    format!(
+                        "table '{}' was only learned from the server: its column policies are not trusted, so an \
+                         expression over it could silently use a blinded value as a public one; load the owner's \
+                         vault or call trust_table('{}') first",
+                        t, t
+                    ),
+                ));
+            }
+        }
+        let mut locs = HashMap::new();
+        for name in expr::columns_of(&expr) {
+            let (inst, col) = scope.resolve(&name)?;
+            locs.insert(name, (inst, col.name));
+        }
+        Ok(ExprPlan { expr, info, locs })
+    }
+
+    fn run_expr(&mut self, plan: &ExprPlan, inst: &[(String, String)], tuples: &[Vec<Option<i64>>]) -> Result<ExprValue> {
+        self.last_expr_cost = None;
+        let (value, cost) = expr_eval::ExprRunner::new(self, &plan.expr, &plan.info, inst, &plan.locs, tuples).run()?;
+        self.last_expr_cost = Some(cost);
+        Ok(value)
+    }
+
+    /// Parse and check an expression against the table policies WITHOUT sending anything: its kind
+    /// ("row" or "agg"), multiplicative depth, product / inversion counts and canonical text. Errors are
+    /// `Kind::Parse` / `Kind::PlanError` exactly where the Python parser and engine raise them.
+    pub fn analyze_expr(&self, table: &str, expression: &str) -> Result<ExprInfo> {
+        Ok(self.expr_plan(expression, &[(table.to_string(), table.to_string())])?.info)
+    }
+
+    /// `SELECT <expression> FROM table [WHERE pred]` for a v0.6 arithmetic expression: `+ - * /`, unary
+    /// minus, parentheses, integer and `FRAC(n, d)` literals over ENC / PAIRED / PLAIN numeric columns,
+    /// `SUM(expr)`, `AVG(expr)` and `COUNT(*)` (spec/TorusSQL-Spec-v0.6.md). Products of arbitrary depth cost
+    /// one owner round trip per level (cap: `max_mult_depth`, default 8); division is exact (`Decoded::Int`
+    /// when integral, else `Decoded::Rational`); a zero denominator is `Kind::DivisionByZero`. A per-row
+    /// expression returns `ExprValue::Rows` (`None` where an operand is NULL), an aggregate one
+    /// `ExprValue::Scalar` (`None` for an AVG over no rows).
+    ///
+    /// Use `dot()` / `join_dot()` for DOT; MIN / MAX are not provided; FHE columns keep `sum` / `avg` /
+    /// `scaled_sum` / `dot` and are rejected here with an error naming FHE.
+    pub fn expr(&mut self, table: &str, expression: &str, pred: Value) -> Result<ExprValue> {
+        self.expr_as(table, table, expression, pred)
+    }
+
+    /// Like [`Client::expr`], naming the table instance `alias` (so columns can be written `alias.col`).
+    pub fn expr_as(&mut self, table: &str, alias: &str, expression: &str, pred: Value) -> Result<ExprValue> {
+        self.last_expr_cost = None;
+        let inst = vec![(alias.to_string(), table.to_string())];
+        let plan = self.expr_plan(expression, &inst)?;
+        let pred = wire_pred(&pred)?;
+        let ids = self.matching(table, pred)?;
+        let tuples: Vec<Vec<Option<i64>>> = ids.into_iter().map(|i| vec![Some(i)]).collect();
+        self.run_expr(&plan, &inst, &tuples)
+    }
+
+    /// The same over the rows of a `join()`: columns are `alias.col` (or a bare, unambiguous `col`); rows
+    /// whose operand instance is the NULL side of a LEFT JOIN yield `None` per row and are skipped by SUM /
+    /// AVG, but are counted by COUNT(*).
+    pub fn join_expr(&mut self, j: &JoinResult, expression: &str) -> Result<ExprValue> {
+        self.last_expr_cost = None;
+        let inst: Vec<(String, String)> = j.aliases.iter().map(|a| (a.clone(), j.tables[a].clone())).collect();
+        let plan = self.expr_plan(expression, &inst)?;
+        self.run_expr(&plan, &inst, &j.tuples)
     }
 
     /// Live rows on the server this vault cannot decrypt (a crash between the

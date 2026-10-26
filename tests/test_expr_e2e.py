@@ -146,11 +146,13 @@ def test_expressions_after_reconnect_with_the_same_vault(server, tmp_path):
             [[F(sum(x * y * z for x, y, z in zip(col("a"), col("b"), col("c"))), 5)]]
 
 
-def test_server_process_receives_only_blinded_data_for_expressions(server):
+@pytest.mark.parametrize("mode", ["owner", "shared"])
+def test_server_process_receives_only_blinded_data_for_expressions(server, mode):
     """Everything the server process is sent while the owner runs multi-level products and
-    divisions: no mask, no encoded plaintext, no intermediate, no inverse, no quotient, and only
-    pre-existing RPC names."""
-    with torussql.connect(server.host, server.port, authenticated=True) as conn:
+    divisions: no mask, no encoded plaintext, no intermediate, no inverse, no quotient. In
+    expr_mode="owner" only pre-existing RPC names; in the default "shared" mode only the wire RPCs
+    (and never a read of an operand cell)."""
+    with torussql.connect(server.host, server.port, authenticated=True, expr_mode=mode) as conn:
         seed(conn)
         queries = ["SELECT a*b*c*d FROM t", "SELECT SUM(a*b*c*a) FROM t", "SELECT a/b FROM t",
                    "SELECT r/c * a FROM t", "SELECT SUM(a*b)/COUNT(*) FROM t",
@@ -163,10 +165,16 @@ def test_server_process_receives_only_blinded_data_for_expressions(server):
         alpha = conn.client._alpha
 
     methods = {m for m, _ in sent}
-    # (blinded_scaled_sum is the pre-existing authenticated-mode MAC check of a Π_lin sum)
-    assert methods <= {"blinded_cells", "blinded_sum", "blinded_scaled_sum", "mult_combine_batch",
-                       "matching_rowids", "plain_cells", "schema", "tables"}, methods
-    assert "mult_combine_batch" in methods
+    if mode == "owner":
+        # (blinded_scaled_sum is the pre-existing authenticated-mode MAC check of a Π_lin sum)
+        assert methods <= {"blinded_cells", "blinded_sum", "blinded_scaled_sum", "mult_combine_batch",
+                           "matching_rowids", "plain_cells", "schema", "tables"}, methods
+        assert "mult_combine_batch" in methods
+    else:
+        assert methods <= {"wire_exec", "wire_free", "matching_rowids", "plain_cells", "schema",
+                           "tables"}, methods
+        assert "wire_exec" in methods and not methods & {"blinded_cells", "blinded_cell",
+                                                         "blinded_sum", "mult_combine_batch"}
 
     def ints(x, out):
         if isinstance(x, bool):
@@ -197,12 +205,20 @@ def test_server_process_receives_only_blinded_data_for_expressions(server):
             e = encode(v)
             if not 0 <= e < 1000:                          # tiny values would collide with row ids
                 secrets_.add(e)
+    # the shared mode sends the PUBLIC constants of the query (1/4, -1/2, 1/COUNT(*) = 1/5, ...) as
+    # scalars; they may coincide with the reciprocal of some cell: that is not a leak
+    public = {encode(F(1, 4)), encode(F(1, 2)), encode(F(-1, 2)), encode(F(1, 5)), encode(F(-1, 4))}
+    secrets_ -= public
     assert not (secrets_ & seen), "an encoded plaintext/intermediate reached the server process"
     # the openings that did reach it are huge uniform-looking residues, not small numbers
     opened = []
     for m, args in sent:
         if m == "mult_combine_batch":
             opened += [int(x) for pair in args[0] for x in pair]
+        elif m == "wire_exec":                            # the owner's shares of the openings
+            for op in args[0]:
+                if op[0] == "mul":
+                    opened += [int(x) for x in op[4]["eo"] + op[4]["go"]]
     assert opened
     assert sum(1 for x in opened if x > N // 100) > 0.95 * len(opened)
 

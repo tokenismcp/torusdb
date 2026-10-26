@@ -13,11 +13,15 @@ torussql --vault ./demo.vault            # interactive shell (psql-style), conso
 ```
 
 Dialect v0.6 (arithmetic expressions): `SELECT SUM(rate * hours * (1 - tax)) / COUNT(*) FROM payroll`,
-`SELECT salary / hours FROM payroll`, ... Products of any depth between `PAIRED` columns cost one owner
-round trip per multiplicative level (`connect(..., max_mult_depth=8)` is the cap); division by an
-encrypted value is done by the owner; the server only sums blinded cells and does `e*g mod n`. The
-owner already holds the operands of every product, so nothing is offloaded
-(`docs/crypto-review-packet.md` section 3.3). `conn.client.last_expr_cost` reports rounds and products.
+`SELECT salary / hours FROM payroll`, ... Every intermediate is a two-party additive sharing (server
+share + owner share; wire protocol 2.1): products of any depth between `PAIRED` columns cost one
+request/response per multiplicative level (`connect(..., max_mult_depth=8)` is the cap; dividing by an
+encrypted value costs one more level and never decrypts it), and nothing is unmasked at the owner. The
+owner still does O(rows) share arithmetic per level and, as Beaver dealer, could derive operands from the
+openings (`docs/crypto-review-packet.md` section 3.3). Pass `authenticated=True` against a server you do not
+trust to follow the protocol. `connect(..., expr_mode="owner")` selects the previous owner-computed transport
+(works with any v2 server). `conn.client.last_expr_cost` reports mode, rounds, products, openings, wires and
+requests.
 
 New to it? `docs/GETTING_STARTED.md` in the repository is the tested 10-minute path.
 

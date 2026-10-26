@@ -8,7 +8,8 @@ This file states what is *not* done as plainly as what is.
 | Area | Status |
 |---|---|
 | Dialect: DDL/DML, SUM/AVG/MIN/MAX/COUNT, `k*col`, `a*b`, `DOT`, WHERE (AND/OR/IN), GROUP BY/HAVING, ORDER BY/LIMIT/DISTINCT, aliases | ✅ spec v0.5 + executable conformance |
-| **Dialect v0.6 (unreleased)**: arithmetic expressions `+ - * /`, products of arbitrary depth (one batched owner round per level, default max depth 8), division by public and by encrypted values, `SUM(expr)`/`AVG(expr)` | ✅ Python driver/engine + conformance; the owner computes the products (no server offload, F-3), the server only does Π_lin sums and the `e·g` step; not yet in the TypeScript/Rust drivers |
+| **Dialect v0.6 (unreleased)**: arithmetic expressions `+ - * /`, products of arbitrary depth (one batched round per level, default max depth 8), division by public and by encrypted values, `SUM(expr)`/`AVG(expr)` | ✅ Python driver/engine + conformance, now with **secret-shared wires** (wire protocol 2.1: the server holds its share of every intermediate, nothing is unmasked at the owner; F-18 addressed). Residuals: the owner is the Beaver dealer and so *can* derive operands (F-22), shared mode needs `authenticated=True` against a malicious server (F-23). The TypeScript and Rust drivers still use the owner-computed transport (`mult_combine_batch`), same grammar/results/costs of that mode, cross-checked against the Python engine's `expr_mode="owner"` |
+| **Wire protocol 2.1**: `wire_exec` / `wire_free` (session-scoped secret-shared wire store, caps, TTL) | ✅ server + Python driver; ⬜ TypeScript and Rust drivers |
 | Joins: INNER/LEFT, aliases, self-joins, multi-join, grouping over joins | ✅ (hash join at the owner on PLAIN keys) |
 | Exactness contract with loud overflow errors | ✅ |
 | Open parser + validator, engine-agreement tests | ✅ |
@@ -23,7 +24,8 @@ This file states what is *not* done as plainly as what is.
 ## Next — required before calling it 1.0
 
 1. ⬜ **Independent cryptographic review** of the review packet; resolve findings
-   F-3 (Π_mult offload), F-4 (make authenticated mode the default?), F-10 (standard AEAD for the vault).
+   F-3 (Π_mult offload for `DOT` / `a * b`), F-22 (owner-blind triple generation), F-25 (shared-wire
+   proof sketches), F-4 (make authenticated mode the default?), F-10 (standard AEAD for the vault).
 2. ⬜ **CI evidence**: the workflow is committed but has not yet run on a hosted
    runner; first green run + required checks on `main`.
 3. ⬜ **Vault log with passphrase sealing in the TypeScript and Rust drivers** (their MAC mode exists; their vault
@@ -47,8 +49,9 @@ This file states what is *not* done as plainly as what is.
 * ⬜ Multi-owner deployments (needs MPC triple preprocessing).
 * ⬜ Schema migration tooling (ALTER TABLE).
 * 🔬 Encrypted predicates / ordering (needs an FHE comparison circuit).
-* 🔬 Offloading products to the server (server-resident blinded wires, sub-linear owner work).
-* ⬜ Expressions in the TypeScript and Rust drivers.
+* 🔬 Sub-linear owner work for products (shared wires keep the intermediates at the server, but the owner still does O(rows) share arithmetic per level), and an owner that is *blind* to intermediates (needs a third non-colluding dealer or computational OT/HE triple generation; F-22).
+* ⬜ Shared-wire expressions in the TypeScript and Rust drivers (wire protocol 2.1).
+* ✅ Expressions in the TypeScript and Rust drivers (owner-computed mode; `drivers/expr_vectors.json`, live Python peer).
 * 🔬 Expressions over `FHE` columns (the pairing scheme has one multiplicative level).
 * 🔬 Access-pattern hiding (ORAM-style) — the largest remaining leakage.
 

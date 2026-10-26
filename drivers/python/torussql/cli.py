@@ -164,6 +164,9 @@ def _parser() -> argparse.ArgumentParser:
     ap.add_argument("--trust-server-schema", action="store_true",
                     help="allow writes to tables whose schema was learned from the server")
     ap.add_argument("--authenticated", action="store_true", help="enable integrity MACs")
+    ap.add_argument("--expr-mode", choices=("shared", "owner"), default="shared",
+                    help="how arithmetic expressions run: 'shared' (default; secret-shared wires, no "
+                         "operand is ever unmasked) or 'owner' (v0.6: the owner unmasks the operands)")
     ap.add_argument("--integrity-anchor", metavar="PATH",
                     help="owner-trusted anchor file (needs --authenticated and an FHE key): verifies "
                          "the row set and freshness of FHE tables; keep it away from the server")
@@ -319,7 +322,8 @@ def _main(argv=None) -> int:
                              authenticated=a.authenticated,
                              trust_server_schema=a.trust_server_schema, fhe_key=fhe_key,
                              integrity_anchor=anchor,
-                             integrity_recheck_seconds=a.integrity_recheck_seconds)
+                             integrity_recheck_seconds=a.integrity_recheck_seconds,
+                             expr_mode=a.expr_mode)
     except Exception as exc:                                    # noqa: BLE001
         print(f"torussql: could not connect to {a.host}:{a.port}: {exc}", file=sys.stderr)
         return 1

@@ -38,9 +38,9 @@ def _lit(v):
         else str(int(v))
 
 
-def make(auth=False, rows=ROWS, server=None):
+def make(auth=False, rows=ROWS, server=None, expr_mode="shared"):
     srv = server or NoKeyServer()
-    cli = NoKeyClient(srv, authenticated=auth)
+    cli = NoKeyClient(srv, authenticated=auth, expr_mode=expr_mode)
     cli.execute(SCHEMA)
     for row in rows:
         cli.execute(f"INSERT INTO t ({', '.join(COLS)}) VALUES ({', '.join(_lit(v) for v in row)})")
@@ -138,9 +138,10 @@ class CallSpy(NoKeyServer):
 
 
 def test_every_server_call_is_a_pre_existing_rpc():
-    """Expressions add no RPC: only blinded reads, Π_lin sums and Π_mult combines."""
+    """expr_mode="owner" (the v0.6 transport) adds no RPC: only blinded reads, Π_lin sums and
+    Π_mult combines. (The default shared-wire mode has its own RPC audit in test_expr_shared.py.)"""
     srv = CallSpy()
-    _, cli = make(server=srv)
+    _, cli = make(server=srv, expr_mode="owner")
     srv.calls.clear()
     for sql in ["SELECT a*b*c + s/2 FROM t", "SELECT SUM(a*b*c)/COUNT(*) FROM t",
                 "SELECT a/b FROM t", "SELECT SUM(a+2*b-s/4) FROM t"]:
@@ -178,7 +179,7 @@ def test_aggregate_expressions(cli, agg, fn, where, subset):
 
 def test_linear_sum_is_a_pi_lin_aggregate_not_a_row_download():
     srv = CallSpy()
-    _, cli = make(server=srv)
+    _, cli = make(server=srv, expr_mode="owner")
     srv.calls.clear()
     assert one(cli, "SELECT SUM(a+2*b) FROM t")[0] == sum(R(i)["a"] + 2 * R(i)["b"] for i in range(5))
     assert "blinded_cells" not in srv.calls, "a linear SUM must use server-side sums, not per-row cells"
@@ -416,7 +417,7 @@ def test_forged_product_term_at_any_level_is_detected(level):
             if calls["n"] == level:
                 return [(e * g + 1) % N for e, g in openings]
             return [e * g % N for e, g in openings]
-    _, cli = make(True, server=Forger())
+    _, cli = make(True, server=Forger(), expr_mode="owner")
     calls["n"] = 0
     with pytest.raises(IntegrityError, match="forged product"):
         cli.execute("SELECT a*b*c*d FROM t")
@@ -428,7 +429,7 @@ def test_unauthenticated_mode_does_not_detect_a_forged_product_term():
         @staticmethod
         def mult_combine_batch(openings):
             return [(e * g + 1) % N for e, g in openings]
-    _, cli = make(False, server=Forger())
+    _, cli = make(False, server=Forger(), expr_mode="owner")
     got = per_row(cli, "a*b*c")                                 # wrong, and silently so
     assert got != [R(i)["a"] * R(i)["b"] * R(i)["c"] for i in range(5)]
 
@@ -606,7 +607,7 @@ def test_a_zero_denominator_does_not_change_what_the_server_sees():
     encrypted denominator was 0 (a data-dependent bit). The protocol therefore runs to its
     last round with a dummy value and only then raises."""
     srv = CallSpy()
-    _, cli = make(server=srv)
+    _, cli = make(server=srv, expr_mode="owner")
 
     def trace(sql, expect_error):
         srv.calls.clear()

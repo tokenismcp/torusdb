@@ -26,11 +26,12 @@ Types: `INT`, `RATIONAL` (exact fractions), `STR` (always `PLAIN`).
 `AVG` accepts any numeric column (`PLAIN`, `ENC`, `PAIRED`).
 
 What the *reference engine* does with these (informative; the dialect fixes the
-meaning of the result, not the method): sums and public-scalar multiples of
-blinded cells are affine forms (Π_lin) that the server evaluates; every product
-of two encrypted operands is a Beaver-triple exchange (Π_mult) with one owner
-round per multiplicative level; inversion of an encrypted denominator is done by
-the owner. §5.10 states exactly which party computes what.
+meaning of the result, not the method): every intermediate of an expression is
+a two-party additive sharing (the server holds one share, the owner the other);
+sums and public-scalar multiples are local to each party (Π_lin); every product
+of two encrypted operands is a Beaver-triple exchange (Π_mult) with one round per
+multiplicative level; a division by an encrypted denominator opens only a
+uniform masked product. §5.10 states exactly which party computes what.
 
 ## 2. Lexical
 
@@ -211,8 +212,9 @@ products on any path from a leaf to the result:
 | public / encrypted (`100/c`) | depth of the denominator |
 
 `a*b*c*d` (left-associative) has depth 3; `(a*b)*(c*d)` has depth 2 with three
-products. Depth is the number of **owner round trips** the reference engine
-spends on products (§5.10); the number of products is `ct_muls` per row.
+products. Depth is the number of **request/response exchanges** the reference engine
+spends on products (§5.10; one more per division by an encrypted value in
+`expr_mode="shared"`); the number of products is `ct_muls` per row.
 An engine MAY refuse expressions deeper than a configured maximum, MUST do so
 with a depth error (`DepthLimitExceeded`, a `PlanError`) **before** sending any
 request, and MUST support at least depth 3. The reference engine's default is
@@ -227,8 +229,8 @@ when integral and `Fraction` otherwise.
 
 * **By a public value** (`s/2`, `a/FRAC(2,3)`, `a/q` with `q PLAIN`): multiplication
   by the inverse of the denominator. No ciphertext product, no extra round.
-* **By an encrypted value** (`a/b`, `100/c`, `SUM(a)/SUM(c)`): owner-assisted, §5.10.
-  If the numerator is also encrypted this is one more ciphertext product (depth +1).
+* **By an encrypted value** (`a/b`, `100/c`, `SUM(a)/SUM(c)`): without decrypting the
+  denominator, §5.10. If the numerator is also encrypted this is one more ciphertext product (depth +1).
 * **Zero.** If a denominator evaluates to `0` in any row the query selects, the
   engine raises `DivisionByZero` (a `ZeroDivisionError` and an `ExecError`; DB-API
   `DataError`). Rows removed by `WHERE` do not count; `NULL` operands propagate
@@ -267,45 +269,75 @@ also defined for `RATIONAL` columns.
 needs a ciphertext scheme with a server-side multiplication of products, which
 the `FHE` column type does not have.
 
-### 5.10 Who computes what (informative: reference engine)
+### 5.10 Who computes what (informative: reference engine, `expr_mode="shared"`)
 
-* **Server** (holds blinded cells `s̃ = s + r` and plaintext columns; no key, no
-  mask): (i) Π_lin — sums of stored blinded cells, used for a *linear* `SUM(...)`
-  (`SUM(a + 2*b - s/4)` is one blinded sum per column); (ii) Π_mult — for each
-  ciphertext product, the step `e·g mod n` on the two *openings* it is sent.
-* **Owner** (the driver; holds the masks and the MAC key): removes the masks of
-  every cell it reads; applies every linear gate and every public multiplication
-  or division locally; draws a fresh Beaver triple `(u, v, w = uv)` per product,
-  sends `e = s − u`, `g = s' − v`, and reconstructs `s·s' = w + e·v + g·u + e·g`;
-  inverts encrypted denominators; decodes and checks the final result.
-* **Not offloaded.** The owner reconstructs both operands of every product before
-  opening them, so the server's `e·g` is a product of two numbers the owner already
-  holds. Products therefore cost the owner O(rows) work and bandwidth; the round
-  trip is kept because it is the protocol of the no-key paper (Π_C) and, in
-  authenticated mode, checks that the server computed `e·g` (§9 of the paper).
-  Review packet §3.2 and finding F-3.
-* **Intermediates** (a product, a quotient) exist only at the owner. They reach the
-  server only inside the next level's opening `e = x − u` with fresh uniform `u`
-  (the Π_boot re-mask) and never in any other form; the server holds no
-  intermediate, decrypts nothing, and receives no mask.
-* **Division by an encrypted `y`.** Inversion does not commute with an additive
-  mask, so the server cannot invert a blinded `y`. The owner unmasks `y` (it holds
-  the mask; an intermediate it already holds), tests `y = 0`, computes `y⁻¹ mod n`,
-  and uses it as an operand: `x · y⁻¹` is a public multiplication if `x` is public,
-  otherwise one more ciphertext product. The owner thereby learns `y` — it is the
-  data owner and learns the cells it reads anyway; the server learns nothing new
-  (its view is the same uniform openings).
-* **Rounds.** `mult_rounds = depth`: all products of one level (every row, every
-  subexpression) share one `mult_combine_batch` exchange (chunked to the server's
-  `max_items`). The reference client exposes `last_expr_cost` =
-  `{depth, mult_rounds, products, inversions, linear_sums}` for the last `SELECT`.
-* **Integrity.** Authenticated mode MAC-checks every stored cell the owner reads
-  and every blinded sum, and checks `e·g` of every product. An intermediate has no
-  MAC (it never leaves the owner); without `authenticated=True` a lying server can
-  alter a product term undetected (as for `DOT`).
-* **No new RPC.** Expressions use only `blinded_cells`, `blinded_sum`,
-  `blinded_scaled_sum` (authenticated MAC check), `mult_combine_batch`,
-  `matching_rowids` and `plain_cells`.
+*Transport revision (wire protocol 2.1, no dialect change).* The first v0.6 engine evaluated
+expressions at the owner (the owner unmasked every operand and computed every product itself;
+that transport is still available as `expr_mode="owner"`, below). The reference engine now
+implements the no-key paper's circuit composition Π_C: **every wire of the expression is a
+two-party additive sharing over Z/nZ, and no operand, product or quotient is ever fetched,
+unmasked or computed in plaintext by anyone's code.** Results, grammar, errors and caps are
+unchanged; only who holds what changes. `docs/crypto-review-packet.md` §3.3 has the proof sketch.
+
+**Wires.** A wire `X` is `X = X_S + X_O (mod n)`. A stored cell `x̃ = x + r` is the wire with
+`X_S = x̃` (the server's own stored value) and `X_O = −r` (the mask the owner already holds); a
+literal or plain value is public (`X_S = v`, `X_O = 0`). The server keeps its shares in a
+**session-scoped wire store** (below); the owner keeps its shares locally.
+
+| gate | server (on its shares) | owner (on its shares) | communication |
+|---|---|---|---|
+| `+`, `−`, unary `−`, × public, ÷ public (× `k⁻¹ mod n`), + public, `SUM`, `AVG`, broadcast | same operation on `X_S` | same operation on `X_O` (a public `+c` is added by the server only) | none |
+| linear `SUM(Σκ·col)` | one `loadsum` (Σ of stored cells) | `−Σ r`, public coefficients | none beyond the batch |
+| `X · Y` (encrypted × encrypted) | `e_S = X_S − u_S`, `g_S = Y_S − v_S`; then `Z_S = w_S + e·v_S + g·u_S + e·g`, **stored as a new wire** | deals a fresh Beaver triple `(u, v, w=uv)` per product element, additively shared (the server gets only its shares); `e_O = X_O − u_O`, `g_O = Y_O − v_O`; `Z_O = w_O + e·v_O + g·u_O` | one request/response **per multiplicative level**, batched over every row and sub-expression of the level; `e = e_S + e_O`, `g = g_S + g_O` are learned by both, uniform and independent of `X, Y` |
+| `X / Y` (encrypted `Y`) | `[ρ]·[Y]` as above; then × `t⁻¹` | deals a uniform **non-zero** `ρ` (shared); sees `t = ρ·Y` (uniform on non-zero values); if `t = 0` (a zero denominator) substitutes a fresh random non-zero dummy; `[1/Y] = t⁻¹·[ρ]` | `t` is opened to the owner inside the product's request; the server learns only `t⁻¹` (a dummy when `Y = 0`): nothing about `Y`, not even whether it was zero. Then `x/Y = x·[1/Y]` is one more product level |
+| result | sends **its share** of the result wire(s) (`wire_exec reveal`) | adds its own share, strict decode (`OutOfBudget`), `DivisionByZero` raised only after the last request | the server never receives the result or any intermediate |
+
+* **Rounds.** `mult_rounds` = the sequential product levels = `depth` (§5.4) + one per sequential
+  division by an **encrypted** value (the product `ρ·Y` is a level of its own). Dividing by a public
+  value costs nothing. A query exchanges `mult_rounds + 1` requests (the last one reveals), chunked
+  to the server's advertised `max_request_elements`. The reference client exposes
+  `last_expr_cost = {mode, depth, mult_rounds, products, inversions, linear_sums, openings, wires,
+  requests, reveals}`; `max_mult_depth` caps `mult_rounds` and is checked before any request.
+* **Work.** The server does O(rows) ring operations per level on its shares; the owner does O(rows)
+  local ring arithmetic per level on its shares (a fresh triple per product element, one opening
+  pair) and sends/receives O(rows) openings per level. This O(rows) owner work is inherent to
+  unconditionally secure two-party computation; what the owner does **not** do is fetch an operand
+  cell, remove an operand's mask, or compute any product or quotient. There is no speed-up claim:
+  the guarantee is *where the intermediates live*.
+* **What each party learns.** The server: query shape (δ, products per level, row count, which
+  rows), and uniform values only (`x̃`, its triple shares, `e_O`, `g_O`, `ρ_S`, `t⁻¹`); I(M; V_S)=0,
+  unconditionally. The owner, **as the dealer of `(u, v)` and `ρ`**: the openings
+  `e = X−u`, `g = Y−v` and `t = ρY`, together with values it dealt, determine the operands — so an
+  owner *willing to compute them could*; this engine never does (nothing but the result is decoded;
+  `tests/test_expr_shared*.py` pin it). Making the owner cryptographically blind to intermediates needs
+  a third party or a computational assumption (OT/HE triple generation) and is out of scope (review
+  packet §3.3, question (d)). A **multi-owner** deployment cannot use a single owner as dealer
+  either (see the threat model).
+* **Server state.** The wire store is per session, capped (`--wire-max-wires` 4096, `--wire-max-elements`
+  4 000 000 per session and `--wire-max-total-elements` 32 000 000 server-wide; a tagged wire counts
+  twice), expires unused wires after `--wire-ttl` (120 s), and is emptied at query end, on
+  `COMMIT`/`ROLLBACK`/transaction timeout and on disconnect. Exceeding a cap is a `WireError`
+  (DB-API `OperationalError`) naming the cap; nothing is silently truncated. The advertised limits
+  are in `hello` → `limits.wires`. The store holds no key, mask, MAC key or plaintext, and the wire
+  RPCs are `ro`-permitted reads (they read only the stored cells of the rows they are asked to load).
+* **Integrity (`authenticated=True`).** Every wire also carries shares of its SPDZ tag `α·X` (the
+  stored MAC cells are loaded exactly like the values; `α` is never sent). Every opening is
+  MAC-checked by the owner, a division's opened `t` is MAC-checked **before** it is tested for zero
+  (so an active attacker gets `IntegrityError`, never a zero oracle), and the revealed result is
+  MAC-checked before it is decoded: a server that tampers with a stored cell, a share, an opening or
+  a reply is detected except with probability ≤ (depth+1)·#checks/n (sketch: review packet §3.3).
+  **Without `authenticated=True` the engine is secure against a semi-honest server only**: a lying
+  server can shift any result by an amount it chooses and, by shifting a denominator's share, learn
+  whether that denominator equals a guess (the owner's `DivisionByZero` is the oracle). Row sets
+  (`WHERE`, joins, which rows exist) are plain data and are not authenticated in either mode.
+* **Abort oracle.** A zero denominator does not change the request sequence the server sees
+  (`tests/test_expr_shared*.py` compare the traces): the dummy `t` has the same distribution as a real one.
+* **`expr_mode="owner"`** (driver option, `connect(..., expr_mode="owner")`, shell `--expr-mode owner`):
+  the v0.6 transport — the owner reads and unmasks the operand cells, computes every product and
+  quotient in plaintext, and the server only multiplies two openings (`mult_combine_batch`). It needs
+  no wire RPC (works with any v2 server) and is kept for compatibility; its server view is also
+  uniform, but nothing is held at the server and every operand is unmasked at the owner (review
+  packet F-3 / F-18). Both modes return identical results.
 
 ## 6. Predicates
 
@@ -370,7 +402,7 @@ other than `COUNT(*)`.
 | 0.5+ | column policy `FHE` (INT; `SUM`, `AVG`, `COUNT`, `DOT`, projection — see docs/fhe-columns.md) |
 | 0.5+ | `CREATE/DROP INDEX`, `IF [NOT] EXISTS`, `OFFSET`, `BETWEEN`, `NOT IN`, `IS [NOT] NULL`, `[NOT] LIKE` |
 | 0.5 | table aliases, self-joins, multiple joins, `LEFT [OUTER] JOIN`, `GROUP BY`/`HAVING` over joins, `WHERE` on any joined table, `DOT`/`a*b` across tables, `ORDER BY` an unselected column, qualified names on single-table queries, strict exactness errors (`OutOfBudget`) |
-| **0.6** | **arithmetic expressions** `+ - * /`, unary minus, parentheses, literals (`int`, `FRAC`); **products of arbitrary depth** (one owner round per level, configurable maximum, default 8); **division** by public and by encrypted values with `DivisionByZero`; `SUM(expr)`, `AVG(expr)`, aggregate expressions (`SUM(a*b)/COUNT(*)`, `SUM(a)*SUM(b)`); `col * col` with one `PLAIN` factor |
+| **0.6** | **arithmetic expressions** `+ - * /`, unary minus, parentheses, literals (`int`, `FRAC`); **products of arbitrary depth** (one round per level, configurable maximum, default 8; transport revised to secret-shared wires in wire protocol 2.1 without any dialect change, §5.10); **division** by public and by encrypted values with `DivisionByZero`; `SUM(expr)`, `AVG(expr)`, aggregate expressions (`SUM(a*b)/COUNT(*)`, `SUM(a)*SUM(b)`); `col * col` with one `PLAIN` factor |
 
 All v0.1–v0.5 statements keep their meaning and result. v0.6 only makes some
 previously illegal statements legal (anything that used `/`, a product of more than

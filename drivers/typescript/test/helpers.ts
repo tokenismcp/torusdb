@@ -6,10 +6,12 @@ import * as os from "os";
 import * as path from "path";
 import { Column } from "../src/torusdb";
 
-// compiled to <root>/drivers/typescript/build-test/test -> repo root is 4 up
-const REPO = path.resolve(__dirname, "../../../..");
+// compiled to <root>/drivers/typescript/build-test/test -> repo root is 4 up. TORUSDB_PY_ROOT points the
+// Python side (server, core, parser, python driver) at another checkout (e.g. a pristine release snapshot).
+const REPO = process.env.TORUSDB_PY_ROOT ? path.resolve(process.env.TORUSDB_PY_ROOT) : path.resolve(__dirname, "../../../..");
 export const SERVER_PY = path.join(REPO, "server/nokey_server.py");
 export const VECTORS = path.resolve(__dirname, "../../../vectors.json");
+export const EXPR_VECTORS = path.resolve(__dirname, "../../../expr_vectors.json");
 
 export const ADMIN = "admin-token-0123456789";
 export const RO = "ro-token-0123456789abc";
@@ -121,5 +123,16 @@ export function runPeer(host: string, port: number, spec: unknown): any {
   const r = spawnSync(py, [script, host, String(port), JSON.stringify(spec)],
     { env: pythonEnv(), encoding: "utf8", timeout: 240000 });
   if (r.status !== 0) throw new Error(`fhe_peer failed (${r.status}): ${r.stderr}`);
+  return JSON.parse(r.stdout);
+}
+
+/** Run the Python expression peer (drivers/expr_peer.py): the Python engine evaluates the same expressions
+ *  against the same server (its own owner, its own copy of the tables). */
+export function runExprPeer(host: string, port: number, spec: unknown): any {
+  const py = findPython()!;
+  const script = path.resolve(__dirname, "../../../expr_peer.py");
+  const r = spawnSync(py, [script, host, String(port), JSON.stringify(spec)],
+    { env: pythonEnv(), encoding: "utf8", timeout: 240000, maxBuffer: 64 * 1024 * 1024 });
+  if (r.status !== 0) throw new Error(`expr_peer failed (${r.status}): ${r.stderr}`);
   return JSON.parse(r.stdout);
 }

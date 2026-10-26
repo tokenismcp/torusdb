@@ -287,3 +287,77 @@ pub fn raw_rpc(addr: &str, method: &str, args: Value) -> Value {
     s.write_all(&frame(body.as_bytes())).unwrap();
     serde_json::from_slice(&read_frame(&mut s).unwrap()).unwrap()
 }
+
+// ── recording pass-through proxy (optionally a lying one) ────────────────────
+/// Rewrites a reply: (method, args, reply, nth call of that method) -> reply.
+pub type Mutate = dyn Fn(&str, &Value, Value, usize) -> Value + Send + Sync;
+
+/// Logs every request (method, args) exactly as the server receives it, in order.
+pub struct Recorder {
+    pub addr: String,
+    pub log: Arc<Mutex<Vec<(String, Value)>>>,
+    stop: Arc<AtomicBool>,
+}
+
+impl Recorder {
+    pub fn log(&self) -> Vec<(String, Value)> {
+        self.log.lock().unwrap().clone()
+    }
+    pub fn len(&self) -> usize {
+        self.log.lock().unwrap().len()
+    }
+}
+
+impl Drop for Recorder {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        let _ = TcpStream::connect(&self.addr);
+    }
+}
+
+pub fn recorder(target: &str, mutate: Option<Arc<Mutate>>) -> Recorder {
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = l.local_addr().unwrap().to_string();
+    let log: Arc<Mutex<Vec<(String, Value)>>> = Arc::new(Mutex::new(vec![]));
+    let stop = Arc::new(AtomicBool::new(false));
+    let counts = Arc::new(Mutex::new(std::collections::HashMap::<String, usize>::new()));
+    let (log2, stop2, t) = (log.clone(), stop.clone(), target.to_string());
+    std::thread::spawn(move || {
+        for c in l.incoming() {
+            if stop2.load(Ordering::SeqCst) {
+                break;
+            }
+            let Ok(mut client) = c else { break };
+            let Ok(mut up) = TcpStream::connect(&t) else { continue };
+            let (log, mutate, counts) = (log2.clone(), mutate.clone(), counts.clone());
+            std::thread::spawn(move || {
+                while let Some(fr) = read_frame(&mut client) {
+                    let req: Value = serde_json::from_slice(&fr).unwrap();
+                    let m = req["m"].as_str().unwrap().to_string();
+                    log.lock().unwrap().push((m.clone(), req["a"].clone()));
+                    if up.write_all(&frame(&fr)).is_err() {
+                        return;
+                    }
+                    let Some(rep) = read_frame(&mut up) else { return };
+                    let rep = match &mutate {
+                        Some(f) => {
+                            let nth = {
+                                let mut c = counts.lock().unwrap();
+                                let e = c.entry(m.clone()).or_insert(0);
+                                *e += 1;
+                                *e
+                            };
+                            let v: Value = serde_json::from_slice(&rep).unwrap();
+                            f(&m, &req["a"], v, nth).to_string().into_bytes()
+                        }
+                        None => rep,
+                    };
+                    if client.write_all(&frame(&rep)).is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    Recorder { addr, log, stop }
+}

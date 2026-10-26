@@ -449,8 +449,9 @@ class OpeningRecorder(Recording):
 
 
 def test_expression_openings_are_uniform_at_every_level_and_never_reuse_a_triple():
+    """expr_mode="owner" (v0.6 transport); the shared-wire equivalent is in test_expr_shared.py."""
     srv = OpeningRecorder()
-    cli = NoKeyClient(srv)
+    cli = NoKeyClient(srv, expr_mode="owner")
     cli.execute("CREATE TABLE z (a INT PAIRED, b INT PAIRED, c INT PAIRED, d INT PAIRED)")
     for _ in range(1200):                                           # identical plaintexts on purpose
         cli.execute("INSERT INTO z (a, b, c, d) VALUES (7, 7, 7, 7)")
@@ -471,7 +472,7 @@ def test_expression_openings_are_uniform_at_every_level_and_never_reuse_a_triple
 
 def test_openings_of_two_different_plaintexts_are_indistinguishable_across_levels():
     srv = OpeningRecorder()
-    cli = NoKeyClient(srv)
+    cli = NoKeyClient(srv, expr_mode="owner")
     cli.execute("CREATE TABLE z (k INT PLAIN, a INT PAIRED, b INT PAIRED, c INT PAIRED)")
     for _ in range(1500):
         cli.execute("INSERT INTO z (k, a, b, c) VALUES (0, 0, 0, 0)")

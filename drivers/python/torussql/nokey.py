@@ -93,6 +93,7 @@ _SERVER_ERR_MAP = {
     "BadRequest":      DataError,
     "InternalError":   InternalError,
     "ExecError":       DataError,
+    "WireError":       OperationalError,     # shared-wire cap reached / wire expired
 }
 
 # Engine exception types — mapped by class name so we don't hard-import them
@@ -104,6 +105,7 @@ _ENGINE_TYPE_MAP = {
     "IntegrityError":  IntegrityError,
     "OutOfBudget":     DataError,
     "ExecError":       DataError,
+    "WireError":       OperationalError,
     "AnchorMissingError": ProgrammingError,
     "AnchorConflict":  OperationalError,
     "AnchorQuorumError": OperationalError,
@@ -384,6 +386,18 @@ class RemoteNoKeyServer:
         enc = [[str(e), str(g)] for (e, g) in openings]
         return [int(x) for x in self._c.call("mult_combine_batch", [enc])]
 
+    # shared-wire expressions (wire protocol 2.1): the server holds one additive share of every
+    # wire of the circuit, the owner the other (torusdb_core/wires.py, spec §5.10)
+    def supports_wires(self) -> bool:
+        return bool((self._c.server_info.get("limits") or {}).get("wires"))
+
+    def wire_exec(self, ops):
+        from torusdb_core.wires import ops_to_wire, results_from_wire
+        return results_from_wire(ops, self._c.call("wire_exec", [ops_to_wire(ops)]))
+
+    def wire_free(self, ids=None):
+        return self._c.call("wire_free", [ids])
+
 
 # ── DB-API 2.0 Cursor ─────────────────────────────────────────────────────────
 
@@ -650,7 +664,10 @@ class Connection:
                  integrity_anchor_max_rows: int | None = None,
                  integrity_recheck_seconds: float | None = None,
                  max_mult_depth: int = 8,
+                 expr_mode: str = "shared",
                  timeout: float | None = 30.0):
+        if expr_mode not in ("shared", "owner"):
+            raise ProgrammingError("expr_mode must be 'shared' or 'owner'")
         if integrity_anchor is not None and not authenticated:
             raise ProgrammingError("integrity_anchor needs authenticated=True")
         if integrity_anchor is not None and fhe_key is None:
@@ -686,7 +703,7 @@ class Connection:
                                       integrity_anchor=integrity_anchor,
                                       integrity_anchor_max_rows=integrity_anchor_max_rows,
                                       integrity_recheck_seconds=integrity_recheck_seconds,
-                                      max_mult_depth=max_mult_depth)
+                                      max_mult_depth=max_mult_depth, expr_mode=expr_mode)
             self._amgr = self.client._amgr
             if self._amgr is not None:
                 self._amgr.managed = True
@@ -1218,6 +1235,7 @@ def connect(host: str = "127.0.0.1", port: int = 8533, *,
             integrity_anchor_max_rows: int | None = None,
             integrity_recheck_seconds: float | None = None,
             max_mult_depth: int = 8,
+            expr_mode: str = "shared",
             timeout: float | None = 30.0) -> Connection:
     """Open a PEP 249 connection to a no-key TorusDB server.
 
@@ -1268,7 +1286,15 @@ def connect(host: str = "127.0.0.1", port: int = 8533, *,
             trusted. A stateless ``mask_cluster`` owner needs this flag.
         max_mult_depth: the most sequential ciphertext x ciphertext product levels one
             v0.6 expression may need (default 8). Each level is one batched owner round
-            trip (Π_mult); a deeper expression is refused before any request is sent.
+            trip (Π_mult); a deeper expression is refused before any request is sent. In the default
+            ``expr_mode="shared"`` a division by an ENCRYPTED value costs one extra level.
+        expr_mode: how v0.6 expressions are evaluated. ``"shared"`` (default): every wire is a
+            two-party additive sharing -- the server keeps one share of each intermediate in a
+            session-scoped store, the owner the other; no operand cell is fetched or unmasked and no
+            product/quotient is ever computed in plaintext (needs a server that offers the wire RPCs,
+            protocol 2.1). ``"owner"``: the v0.6 behaviour -- the owner fetches and unmasks the
+            operand cells and computes every product/quotient itself, the server only multiplies two
+            openings; works with any server. See spec §5.10.
         timeout: socket timeout in seconds (default 30; None = block forever)
     """
     return Connection(host, port, authenticated=authenticated,
@@ -1282,4 +1308,4 @@ def connect(host: str = "127.0.0.1", port: int = 8533, *,
                       fhe_dot_mode=fhe_dot_mode, integrity_anchor=integrity_anchor,
                       integrity_anchor_max_rows=integrity_anchor_max_rows,
                       integrity_recheck_seconds=integrity_recheck_seconds,
-                      max_mult_depth=max_mult_depth, timeout=timeout)
+                      max_mult_depth=max_mult_depth, expr_mode=expr_mode, timeout=timeout)

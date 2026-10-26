@@ -28,6 +28,13 @@ pub enum Kind {
     Timeout,
     /// The peer sent something malformed or unsupported.
     Protocol,
+    /// Dialect v0.6: the expression text is not valid syntax (the engine's `ParseError`).
+    Parse,
+    /// Dialect v0.6: the expression needs more sequential ciphertext x ciphertext product levels (owner
+    /// rounds) than `max_mult_depth` allows; raised before any request. (A plan error in the Python engine.)
+    DepthLimitExceeded,
+    /// Dialect v0.6: a denominator evaluated to zero (raised after the protocol ran to its last round).
+    DivisionByZero,
     /// Client misuse: unknown table/column, closed client, bad join, ...
     Interface,
     /// A value or aggregate outside the exactly representable range.
@@ -110,6 +117,9 @@ impl Error {
             Kind::Connection => "ConnectionError".into(),
             Kind::Timeout => "TimeoutError".into(),
             Kind::Protocol => "ProtocolError".into(),
+            Kind::Parse => "ParseError".into(),
+            Kind::DepthLimitExceeded => "DepthLimitExceeded".into(),
+            Kind::DivisionByZero => "DivisionByZero".into(),
             Kind::Interface => "InterfaceError".into(),
             Kind::OutOfBudget => "OutOfBudget".into(),
             Kind::Integrity => "IntegrityError".into(),

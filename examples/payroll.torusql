@@ -5,9 +5,11 @@
 -- Pass --vault PATH if you want to read the encrypted data again from a later session.
 --
 -- Every value in `rate`/`hours`/`overtime`/`tax`/`salary` stays encrypted on the server.
--- Sums of blinded cells are done by the server; every product and quotient below is
--- reconstructed by YOU (the owner) from fresh-masked openings, one round trip per
--- multiplicative level - the server never sees an intermediate. See spec v0.6 section 5.10.
+-- Every intermediate below (a sum, a product, a quotient) is a two-party additive sharing: the server
+-- holds its share, you (the owner) hold the other, and nobody unmasks an operand. One
+-- request/response per multiplicative level; the server only ever sends back its share of the final
+-- result. Add --authenticated if you do not trust the server to follow the protocol.
+-- See spec v0.6 section 5.10 and docs/crypto-review-packet.md section 3.3.
 
 CREATE TABLE payroll (
     id       INT      PLAIN,
@@ -38,11 +40,11 @@ SELECT DOT(rate, hours) FROM payroll;
 
 -- ---- dialect v0.6: expressions --------------------------------------------------------------
 
--- Mixed + - * with a public fraction: pay with overtime at 1.5x (depth 1: one owner round)
+-- Mixed + - * with a public fraction: pay with overtime at 1.5x (depth 1: one round)
 -- -> [2375, 2280, 2070]
 SELECT rate * (hours + overtime * FRAC(3,2)) FROM payroll;
 
--- Chained multiplication, depth 2 (two owner rounds): net pay after tax
+-- Chained multiplication, depth 2 (two rounds): net pay after tax
 -- gross * (1 - tax) -> [1600, 1575, 1440]
 SELECT rate * hours * (1 - tax) FROM payroll;
 
@@ -55,7 +57,7 @@ SELECT SUM(rate * hours * (1 - tax)) FROM payroll;
 -- Division by a public constant: monthly salary, exact rationals -> [2000/3, 750, 1750/3]
 SELECT salary / 12 FROM payroll;
 
--- Division by an ENCRYPTED value (the owner inverts the denominator): salary per hour
+-- Division by an ENCRYPTED value (never decrypted: only a uniform masked product is opened): salary per hour
 -- -> [200, 1800/7, 175].  A zero denominator is an error, never a wrong number.
 SELECT salary / hours FROM payroll;
 

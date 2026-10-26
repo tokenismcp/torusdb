@@ -29,6 +29,12 @@ async function main() {
   console.log("DOT(rate, hours)       =", await db.dot("emp", "rate", "hours"));     // 5900n
   console.log("COUNT(*)               =", await db.count("emp"));                    // 3
 
+  // dialect v0.6 arithmetic expressions: exact, products of any depth (one owner round per level), division
+  console.log("rate*hours/2           =", await db.expr("emp", "rate * hours / 2"));        // [1000n, 1050n, 900n]
+  console.log("rate*hours*rate        =", await db.expr("emp", "rate * hours * rate"));     // depth 2: two Pi_mult rounds
+  console.log("SUM(rate*hours)/COUNT  =", await db.expr("emp", "SUM(rate * hours) / COUNT(*)"));  // { num: 5900n, den: 3n }
+  console.log("cost of the last expr  =", db.lastExprCost);
+
   // all-or-nothing, on the server AND in the local mask vault
   await db.transaction(async () => {
     await db.update("emp", { salary: { num: 8500n, den: 1n } }, eq("id", 1));

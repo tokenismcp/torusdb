@@ -70,11 +70,12 @@ cur.execute("""SELECT d.dname, e.name FROM dept d
 
 Rules of thumb: `PLAIN` columns can be filtered, grouped, ordered and joined but the
 server can read them; `ENC`/`PAIRED` columns are hidden but support `SUM`, `AVG`, scaling, and arithmetic
-expressions: `+ - * /`, products of any depth between `PAIRED` columns (one owner round trip
-per multiplicative level, default maximum depth 8) and division (by a public value or an
-encrypted one; exact rationals, a zero denominator is an error). For example
+expressions: `+ - * /`, products of any depth between `PAIRED` columns (every intermediate is a
+secret-shared wire; one request/response per multiplicative level, default maximum depth 8) and
+division (by a public value or an encrypted one - which is never decrypted; exact rationals, a zero
+denominator is an error). Use `authenticated=True` if the server is not trusted to follow the protocol. For example
 `SELECT SUM(rate * hours * 2) / COUNT(*) FROM emp`. `FHE` columns keep only `SUM`/`AVG`/`DOT`.
-See `spec/TorusSQL-Spec-v0.6.md`; section 5.10 there says which party computes what.
+See `spec/TorusSQL-Spec-v0.6.md`; section 5.10 there says which party computes what and what each learns.
 
 ## 5. Transactions
 

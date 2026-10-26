@@ -313,8 +313,15 @@ or sharding by table across servers; there is no clustering or multi-writer (see
 * Joins run at the owner on plaintext keys; encrypted-key joins, encrypted
   predicates, and arithmetic on `FHE` columns beyond `SUM`/`AVG`/`DOT` are not supported. Products
   deeper than `max_mult_depth` (default 8, `connect(..., max_mult_depth=N)`) are refused; each
-  multiplicative level is one owner round trip, and the owner does O(rows) work per product
-  (`docs/crypto-review-packet.md` §3.3).
+  multiplicative level is one request/response (a division by an encrypted value costs one more
+  level), and the owner does O(rows) share arithmetic per level
+  (`docs/crypto-review-packet.md` §3.3). Expressions hold secret-shared intermediates in a
+  per-session server-side wire store: size it with `--wire-max-elements` (ring elements per session,
+  default 4 000 000; a query over R rows with W live wires needs about R·W, double with
+  `authenticated=True`), `--wire-max-total-elements` (all sessions, default 32 000 000),
+  `--wire-max-wires` and `--wire-ttl`; exceeding a cap fails the query with a `WireError` naming the
+  cap (evaluate over fewer rows with `WHERE`/`GROUP BY`, or raise the cap). The `wire_*` entries of
+  `stats`/Prometheus latencies show the load. Clients may fall back to `expr_mode="owner"`.
 * Metadata (schema, row counts, access patterns, join keys, timing) is visible
   to the server.
 * No external cryptographic audit has been completed.

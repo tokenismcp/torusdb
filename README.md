@@ -74,19 +74,26 @@ aliases, `INNER`/`LEFT` joins (any number, self-joins), transactions. Full
 reference and the list of what is *not* supported:
 [`spec/TorusSQL-Spec-v0.6.md`](spec/TorusSQL-Spec-v0.6.md).
 
-**Expressions (v0.6) — who computes what.** The server holds blinded cells and does exactly
-two kinds of arithmetic: sums of blinded cells (Π_lin, used for linear `SUM(...)`) and the step
-`e·g mod n` of each Beaver multiplication, on openings that are uniform and independent of the
-data. The **owner** (the driver) unmasks the cells it reads, applies all additions and public
-scalar operations, draws the triples, reconstructs every product and **inverts encrypted
-denominators**. So products and divisions are *not offloaded*: the owner already holds both
-operands, does O(rows) work per product, and the server's step is kept for protocol fidelity and
-the authenticated-mode check ([review packet](docs/crypto-review-packet.md) §3.3, finding F-3).
-Cost: **one batched owner round trip per multiplicative level** (default maximum depth 8,
-`connect(..., max_mult_depth=N)`); intermediates never leave the owner except inside the next
-level's fresh-masked opening. `x / 0` and out-of-range results are errors, never wrong values.
-`FHE` columns keep depth-1 `SUM`/`AVG`/`DOT` and reject deeper products and division.
-The TypeScript and Rust drivers do not evaluate expressions yet.
+**Expressions (v0.6) — who computes what.** Every intermediate of an expression is a *two-party
+additive sharing* over Z/nZ (the no-key paper's Π_C): the server keeps one share of each wire in a
+session-scoped store, the owner keeps the other. Additions, subtractions, public scalar operations and
+`SUM` are local to each party; a product of two encrypted wires is a Beaver exchange whose result
+stays at the server as *its share* of a new wire; division by an encrypted value opens only
+`t = ρ·y` for a fresh random non-zero `ρ` (uniform whatever `y` is — a zero denominator is replaced by a
+dummy so even that is hidden) and never decrypts `y`. At the end the server sends its share of the result
+and the owner adds its own and decodes. One request/response per multiplicative level (default
+maximum 8, `connect(..., max_mult_depth=N)`; a division by an encrypted value costs one extra level).
+**Honest accounting:** the owner still does O(rows) ring arithmetic per level on its own shares (inherent
+to unconditionally secure two-party computation — this mode is not faster than the old one) and, being the
+*dealer* of the Beaver triples, is **not cryptographically blind** to operands and intermediates (the
+openings determine them; the code never computes them) — only the server is, unconditionally. Without
+`authenticated=True` the server is trusted to follow the protocol (a lying server can shift results and
+test a denominator against a guess); with it every opening and the result are MAC-checked. Details:
+spec §5.10, [review packet](docs/crypto-review-packet.md) §3.3 (findings F-18…F-25). The old owner-computed
+transport remains as `connect(..., expr_mode="owner")` (works with any v2 server). `x / 0` and out-of-range
+results are errors, never wrong values. `FHE` columns keep depth-1 `SUM`/`AVG`/`DOT` and reject deeper
+products and division.
+The TypeScript (`db.expr(table, "SUM(a*b)/COUNT(*)")`) and Rust (`db.expr(...)`) drivers evaluate the same expressions with the same grammar, results, errors and cost model (`drivers/typescript/README.md`, `drivers/rust/README.md`).
 
 ## Repository layout
 

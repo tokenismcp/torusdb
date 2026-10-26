@@ -25,6 +25,9 @@ import { TorusError } from "./errors";
 import {
   Anchor, AnchorManager, AnchorValue, FhePart, FileAnchor, Snapshot, schemaDigest, sha256 as anchorSha,
 } from "./anchor";
+import { parseExpression, analyzeExpression, scopeResolver } from "./expr";
+import { ExprRunner, ExprHost, ExprCost, Ring } from "./exprEval";
+import type { ExprInfo } from "./expr";
 import {
   FheKey, FheBackend, newNonce, FHE_CELL_BYTES, FHE_DOT_BYTES, FHE_SUM_BYTES, addSums as fheAddSums, mulDots as fheMulDots,
 } from "./fhe";
@@ -38,6 +41,9 @@ export {
   FileAnchor, MemoryAnchor, StaleServerError, ANCHOR_FORMAT, ANCHOR_FORMAT_VERSION, canonValue, rowMaterial, schemaDigest,
 } from "./anchor";
 export type { Anchor, Entry as AnchorEntry, Pending as AnchorPending, Change as AnchorChange } from "./anchor";
+export { parseExpression, analyzeExpression, renderExpr, MAX_EXPR_HEIGHT } from "./expr";
+export type { Expr, ExprInfo, ExprColumn, Frac } from "./expr";
+export type { ExprCost } from "./exprEval";
 
 /** Newest wire protocol this driver speaks. */
 export const PROTOCOL_VERSION = 2;
@@ -381,6 +387,10 @@ export interface ConnectOptions {
   integrityAnchorMaxRows?: number;
   /** Backward-compatible alias: with `authenticated: true` and mode "auto", selects "delegated". */
   fheAllowUnverifiedDot?: boolean;
+  /** Dialect v0.6 expressions: the most sequential ciphertext x ciphertext product levels (= owner round
+   *  trips, one batched Pi_mult exchange each) one expression may need. Default 8. Checked before any request
+   *  is sent; a deeper expression fails with kind "DepthLimitExceeded". Raise it deliberately. */
+  maxMultDepth?: number;
 }
 
 const DEFAULT_TIMEOUT_MS = 30_000;
@@ -746,9 +756,13 @@ export class Client {
   #fhe: FheKey | undefined;                      // SECRET key of the FHE columns
   #fheDotMode: "local" | "delegated";
   #amgr: AnchorManager | undefined;
+  #maxMultDepth = 8;
   #updateCells = true;                           // false once the server answered "unknown method" for update_cells
   #als = new AsyncLocalStorage<boolean>();
   #tail: Promise<void> = Promise.resolve();
+  /** Cost of the last successful expression (`expr` / `joinExpr`): depth, owner rounds, products,
+   *  inversions, Pi_lin sums. `null` before one ran or after a failed one. */
+  lastExprCost: ExprCost | null = null;
   /** What the server said in `hello` (protocol 1 servers: {protocol:1,...}). */
   serverInfo: { protocol: number; server?: string; auth_required: boolean;
                 max_frame?: number; persistent?: boolean; limits?: ServerLimits } =
@@ -770,6 +784,7 @@ export class Client {
     this.#fheDotMode = mode !== "auto" ? mode
       : this.#authenticated && o.fheAllowUnverifiedDot !== true ? "local" : "delegated";
     if (this.#authenticated) this.#alpha = 1n + (randScalar() % (N - 1n));
+    if (o.maxMultDepth !== undefined) this.maxMultDepth = o.maxMultDepth;
     if (o.integrityAnchor !== undefined) {
       if (!this.#authenticated) throw usage("integrityAnchor needs authenticated: true (the anchor protects the authenticated FHE tables)");
       if (!this.#fhe) throw usage("integrityAnchor needs an FHE key (fheKey): the anchor's leaves are keyed by the owner's MAC secret");
@@ -2076,6 +2091,107 @@ export class Client {
     });
   }
 
+  // ── dialect v0.6: arithmetic expressions ───────────────────────────────────
+  /** The deepest expression (in sequential ciphertext x ciphertext product levels = owner rounds) that
+   *  `expr` / `joinExpr` will run; a deeper one fails with kind "DepthLimitExceeded" before any request. */
+  get maxMultDepth(): number { return this.#maxMultDepth; }
+  set maxMultDepth(n: number) {
+    if (typeof n !== "number" || !Number.isSafeInteger(n) || n < 0) throw usage("maxMultDepth must be an integer >= 0");
+    this.#maxMultDepth = n;
+  }
+
+  /** Parse and check an expression against the table policies WITHOUT sending anything: its kind
+   *  ("row" or "agg"), multiplicative depth, product / inversion counts and canonical text. Throws
+   *  "ParseError" / "PlanError" exactly where the Python parser and engine do. */
+  analyzeExpr(table: string, expression: string, opts: { alias?: string } = {}): ExprInfo {
+    return this.exprPlan(expression, [[opts.alias ?? table, table]]).info;
+  }
+
+  private exprPlan(expression: string, instances: Array<[string, string]>) {
+    const tree = parseExpression(expression);
+    const scope = scopeResolver(instances.map(([a, t]) => [a, this.cols(t)] as [string, Column[]]));
+    const { expr, info } = analyzeExpression(tree, (n) => scope(n).col);
+    if (info.depth > this.#maxMultDepth) {
+      throw new TorusError("DepthLimitExceeded",
+        `expression '${info.text}' needs ${info.depth} sequential ciphertext x ciphertext product levels ` +
+        `(one owner round each) but maxMultDepth is ${this.#maxMultDepth}; raise maxMultDepth ` +
+        `deliberately or restructure the expression`);
+    }
+    for (const [, t] of instances) {
+      if (!this.def(t).trusted) {
+        throw new TorusError("UntrustedSchema",
+          `table '${t}' was only learned from the server: its column policies are not trusted, so an ` +
+          `expression over it could silently use a blinded value as a public one; load the owner's vault ` +
+          `or call trustTable('${t}') first`);
+      }
+    }
+    return { expr, info, loc: (n: string) => { const r = scope(n); return { alias: r.inst, col: r.col.name }; } };
+  }
+
+  private exprHost(): ExprHost {
+    return {
+      authenticated: this.#authenticated,
+      maxItems: () => this.serverInfo.limits?.maxItems ?? LIST_CHUNK,
+      plainColumn: (t, c, ids) => this.columnIn(t, c, ids),
+      encScalars: (t, c, ids) => this.unblindCells(t, c, ids),
+      linSum: (t, c, ids) => this.sumScalar(t, c, ids),
+      multCombine: async (openings) => {
+        const wire = openings.map(([e, g]) => [e.toString(), g.toString()]);
+        return arr(await this.call("mult_combine_batch", [wire], wire.length * (MAX_DIGITS + 8) + 4096), "mult_combine_batch")
+          .map((x) => parseBig(x, "mult_combine_batch"));
+      },
+      isPlain: (t, c) => this.col(t, c).policy === "plain",
+    };
+  }
+
+  private async runExpr(plan: ReturnType<Client["exprPlan"]>, inst: Array<[string, string]>,
+                        tuples: Array<Array<number | null>>): Promise<ExprValue> {
+    this.lastExprCost = null;
+    const ring: Ring = {
+      N, mod, rand: randScalar, inv: (a) => modInv(a),
+      encode: (f) => (f.den === 1n ? encodeInt(f.num) : encodeRational(f.num, f.den)),
+      decode,
+    };
+    const runner = new ExprRunner(this.exprHost(), ring, plan.expr, plan.info, new Map(inst), plan.loc, tuples);
+    const out = await runner.run() as ExprValue;
+    this.lastExprCost = { ...runner.cost };
+    return out;
+  }
+
+  /**
+   * `SELECT <expression> FROM table [WHERE where]` for a v0.6 arithmetic expression: `+ - * /`,
+   * unary minus, parentheses, integer and `FRAC(n, d)` literals over ENC / PAIRED / PLAIN numeric
+   * columns, `SUM(expr)`, `AVG(expr)` and `COUNT(*)` (spec/TorusSQL-Spec-v0.6.md). Products of
+   * arbitrary depth cost one owner round trip per level (default cap `maxMultDepth` = 8); division is
+   * exact (`bigint` when integral, else `{num, den}`); a zero denominator throws kind "DivisionByZero".
+   * A per-row expression returns one array (null where an operand is NULL), an aggregate expression one
+   * value (null for an AVG over no rows).
+   *
+   * Use `dot()` / `joinDot()` for DOT; MIN / MAX are not provided; FHE columns keep `sum` / `avg` /
+   * `scaledSum` / `dot` and are rejected here with an error naming FHE.
+   */
+  expr(table: string, expression: string, where?: WirePred | null, opts: { alias?: string } = {}): Promise<ExprValue> {
+    return this.exclusive(async () => {
+      this.lastExprCost = null;
+      const inst: Array<[string, string]> = [[opts.alias ?? table, table]];
+      const plan = this.exprPlan(expression, inst);
+      const ids = await this.matching(table, wirePred(where));
+      return this.runExpr(plan, inst, ids.map((i) => [i]));
+    });
+  }
+
+  /** The same over the rows of a `join()`: columns are `alias.col` (or a bare, unambiguous `col`);
+   *  rows whose operand instance is the NULL side of a LEFT JOIN yield null per row and are skipped by
+   *  SUM / AVG, but are counted by COUNT(*). */
+  joinExpr(j: JoinResult, expression: string): Promise<ExprValue> {
+    return this.exclusive(async () => {
+      this.lastExprCost = null;
+      const inst: Array<[string, string]> = j.aliases.map((a) => [a, j.tables[a]] as [string, string]);
+      const plan = this.exprPlan(expression, inst);
+      return this.runExpr(plan, inst, j.tuples);
+    });
+  }
+
   // — orphans: live rows on the server this vault cannot decrypt (crash between
   //   the server accepting an INSERT and the vault being saved). Driven by the
   //   live row ids the server returns, never by a server-claimed row count. —
@@ -2201,6 +2317,9 @@ export class Client {
   /** Number of masks currently held (diagnostics/tests). */
   get maskCount(): number { return this.#masks.size; }
 }
+
+/** What `expr` / `joinExpr` return: a number (aggregate expression), or one number per row. */
+export type ExprValue = Decoded | null | Array<Decoded | null>;
 
 /** a / d as an exact rational (reduced; bigint when integral). */
 function divide(a: Decoded, d: bigint): Decoded {

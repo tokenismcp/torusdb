@@ -107,8 +107,23 @@ def _linear(e, is_enc_col):
     return None
 
 
+def expr_rounds(client, pexpr, inst, names, loc) -> int:
+    """Sequential ciphertext x ciphertext product levels the expression needs under the client's
+    ``expr_mode`` (``shared``: a division by an ENCRYPTED value costs one extra level, the product
+    rho*y that is opened). Pure compilation -- no request is sent."""
+    if getattr(client, "expr_mode", "shared") == "shared":
+        from .expr_shared import SharedExprRunner as cls
+    else:
+        cls = ExprRunner
+    r = cls(client, pexpr, inst, names, loc, [])
+    r._compile(pexpr.expr)
+    return max((n.level for n in r.nodes), default=0)
+
+
 class ExprRunner:
-    """Evaluate one ``PExpr`` over a list of row tuples."""
+    """Evaluate one ``PExpr`` over a list of row tuples (expr_mode="owner": the v0.6 behaviour)."""
+
+    INV_LEVELS = 0            # extra product levels per division by an encrypted value
 
     def __init__(self, client, pexpr, inst, names, loc, tuples) -> None:
         self.c = client
@@ -162,7 +177,8 @@ class ExprRunner:
                 op = "*"
             elif e.op == "/":
                 nb = self.nodes[b]
-                b = add(_Node("inv", [b], nb.level, nb.enc, nb.shape))
+                b = add(_Node("inv", [b], nb.level + (self.INV_LEVELS if nb.enc else 0),
+                              nb.enc, nb.shape))
                 op = "*"
             else:
                 op = e.op

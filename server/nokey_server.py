@@ -65,6 +65,8 @@ from torussql import nokey_wire as w                         # noqa: E402
 from torussql.framing import read_frame, write_frame         # noqa: E402
 from torusdb_core.protocol import N                                    # noqa: E402
 from torusdb_core.nokey_engine import CommittedView, NoKeyServer   # noqa: E402
+from torusdb_core.wires import (WireBudget, WireError, WireLimits, WireStore,   # noqa: E402
+                                results_to_wire)
 from torussql_parser.predicate import LIKE_OPS, PRED_OPS   # noqa: E402
 from torusdb_core.store import DiskStorage, StoreCorrupt, TxOverlay  # noqa: E402
 import durability as dur                                     # noqa: E402
@@ -80,7 +82,9 @@ READ_RPCS = frozenset({
     "schema", "tables", "table_info", "matching_rowids", "plain_cells", "blinded_cell",
     "blinded_cells", "blinded_sum", "blinded_scaled_sum",
     "blinded_per_row_scaled", "mult_combine_batch", "fhe_sum", "fhe_dot", "fhe_rows",
+    "wire_exec", "wire_free",
 })
+WIRE_RPCS = frozenset({"wire_exec", "wire_free"})
 WRITE_RPCS = frozenset({
     "create", "insert", "insert_many", "update_cell", "update_cells", "delete_rows",
     "create_index", "drop_index",
@@ -147,6 +151,14 @@ class ServerConfig:
     sync_replicas: int = 0            # commits wait for this many replicas to confirm
     sync_timeout: float = 10.0        # ... at most this long
     sync_strict: bool = False         # on timeout: error (commit stays) instead of degrading
+    # shared-wire expressions (wire_exec): per-session and server-wide caps on the secret-shared
+    # wires a session may hold; a wire is dropped after wire_ttl seconds without use
+    wire_max_wires: int = 4096
+    wire_max_elements: int = 4_000_000        # ring elements per session (a tagged wire counts twice)
+    wire_max_total_elements: int = 32_000_000     # ... across all sessions
+    wire_ttl: float = 120.0
+    wire_max_ops: int = 20_000
+    wire_max_request_elements: int = 150_000
 
 
 def repl_fhe():
@@ -249,6 +261,7 @@ class Session:
     role: str | None = None
     in_tx: bool = False
     tx_id: str | None = None
+    wires: WireStore | None = None     # secret-shared wires of the query in flight (session-scoped)
 
 
 _MISSING = object()
@@ -277,6 +290,13 @@ class Engine:
         self._overlay: TxOverlay | None = None          # what the open tx changed
         self._txids: collections.OrderedDict[str, bool] = collections.OrderedDict()
         self._timed_out: set[int] = set()              # sessions whose tx was aborted
+        self._sessions: dict[int, Session] = {}        # live sessions (wire sweeps, tx expiry)
+        self._wire_budget = WireBudget(self.cfg.wire_max_total_elements)
+        self._wire_limits = WireLimits(
+            max_wires=self.cfg.wire_max_wires, max_elements=self.cfg.wire_max_elements,
+            ttl=self.cfg.wire_ttl, max_ops=self.cfg.wire_max_ops,
+            max_request_elements=self.cfg.wire_max_request_elements)
+        self._wire_sweep_at = 0.0
         self._ids = itertools.count(1)
         self._fail: dict[str, list] = {}               # ip -> [count, locked_until, window_end]
         self._fail_lock = threading.Lock()
@@ -520,9 +540,13 @@ class Engine:
         s = Session(id=next(self._ids), peer=peer)
         if self._tokens is None:
             s.role = "admin"                           # auth disabled
+        self._sessions[s.id] = s
         return s
 
     def close_session(self, s: Session) -> None:
+        if s.wires is not None:
+            s.wires.free()                             # the session's own thread: nobody else runs
+        self._sessions.pop(s.id, None)
         with self._cv:
             if self._tx_owner == s.id:
                 with self._lock:
@@ -622,7 +646,46 @@ class Engine:
             return self._tx(s, method, args)
         if method == "tx_status":
             return self._tx_status(args)
+        if method in WIRE_RPCS:
+            return self._wire_rpc(s, method, args)
         return self._run(s, method, args)
+
+    # ── shared wires (expressions) ───────────────────────────────────────────
+    def _wire_rpc(self, s: Session, method: str, args: list):
+        """``wire_exec`` / ``wire_free``: the server half of Π_C (torusdb_core/wires.py). The
+        session's wires hold only this server's additive SHARES; nothing here is a key, a mask,
+        a MAC key or a plaintext."""
+        if self._closing:
+            raise Busy("server is shutting down")
+        if method == "wire_free":
+            if len(args) != 1 or not (args[0] is None or isinstance(args[0], list)):
+                raise BadRequest("wire_free takes one argument: a list of wire ids, or null")
+            return s.wires.free(args[0]) if s.wires is not None else 0
+        if len(args) != 1:
+            raise BadRequest("wire_exec takes one argument: a list of operations")
+        self._sweep_wires()
+        if s.wires is None:
+            s.wires = WireStore(self._wire_limits, self._wire_budget)
+        ops = args[0]
+        res = s.wires.exec(ops, lambda table, col, rows:
+                           self._run(s, "wire_cells", [table, col, rows]))
+        return results_to_wire(ops, res)
+
+    def _sweep_wires(self) -> None:
+        """Drop expired wires of every session (about once a second)."""
+        now = time.monotonic()
+        if now < self._wire_sweep_at:
+            return
+        self._wire_sweep_at = now + 1.0
+        for other in list(self._sessions.values()):
+            if other.wires is not None:
+                other.wires.sweep()
+
+    def _end_of_tx_wires(self, session_id: int | None) -> None:
+        """A transaction ended (commit / rollback / timeout): the owning session's wires go."""
+        other = self._sessions.get(session_id) if session_id is not None else None
+        if other is not None and other.wires is not None:
+            other.wires.request_clear()
 
     # ── replication ──────────────────────────────────────────────────────────
     def _repl_rpc(self, method: str, args: list):
@@ -756,6 +819,7 @@ class Engine:
             owner = self._tx_owner
             with self._lock:
                 self._rollback_locked()
+            self._end_of_tx_wires(owner)
             self._timed_out.add(owner)
             self.stats.bump("tx_rollbacks")
             log.warning("transaction of session %s timed out; rolled back", owner)
@@ -840,6 +904,7 @@ class Engine:
                 self._tx_id = None
                 self._overlay = None
             s.in_tx, s.tx_id = False, None
+            self._end_of_tx_wires(s.id)
             self._cv.notify_all()
         if method == "tx_commit":
             self._maybe_checkpoint()
@@ -957,6 +1022,7 @@ class Engine:
         import importlib.util
         have_native = importlib.util.find_spec("mclbn256") is not None
         return {"max_items": self.cfg.max_items,
+                "wires": self._wire_limits.as_dict(),
                 "fhe": {"max_sum_rows": self.cfg.fhe_max_sum_rows,
                         "max_scan_rows": self.cfg.fhe_max_scan_rows,
                         "max_dot_rows": {"pyecc": self.cfg.fhe_max_dot_rows,
@@ -1397,6 +1463,16 @@ class Engine:
         backend = be.name
         return lambda: _b64e(repl_fhe().dot_cells(left, right, backend))
 
+    # — shared wires: stored cells of the named rows as ring elements (internal; reached only
+    #   through wire_exec, which runs it as a snapshot read like every other read) —
+    def _rpc_wire_cells(self, table, col, rows):
+        self._col(table, col)
+        if not isinstance(rows, list):
+            raise BadRequest("rows must be a list")
+        uniq = sorted({r for r in rows if r is not None})
+        got = dict(zip(uniq, self.srv.blinded_cells(table, col, self._check_ids(table, uniq))))
+        return [0 if r is None else got[r] for r in rows]
+
     # — Π_mult (combine opened operands; no key) —
     def _rpc_mult_combine_batch(self, openings):
         if not isinstance(openings, list) or len(openings) > self.cfg.max_items:
@@ -1492,7 +1568,7 @@ def _client_error_text(exc: Exception) -> str:
     so internals never leak to a client."""
     if isinstance(exc, ServerError):
         return f"{type(exc).__name__}: {exc}"
-    if type(exc).__name__ in ("PlanError", "ParseError", "ExecError"):
+    if type(exc).__name__ in ("PlanError", "ParseError", "ExecError", "WireError"):
         return f"{type(exc).__name__}: {exc}"
     if isinstance(exc, (RecursionError, OverflowError, MemoryError)):
         return f"BadRequest: request too complex or too large ({type(exc).__name__})"
@@ -1710,6 +1786,15 @@ def main(argv: list[str] | None = None) -> None:
                     help="on sync timeout answer Busy (commit stays) instead of degrading to async")
     ap.add_argument("--repl-ring", type=int, default=200_000,
                     help="commits kept in memory for replicas to catch up from")
+    ap.add_argument("--wire-max-elements", type=int, default=4_000_000,
+                    help="ring elements of secret-shared expression wires one session may hold "
+                         "(a tagged wire counts twice); the query is refused beyond it")
+    ap.add_argument("--wire-max-total-elements", type=int, default=32_000_000,
+                    help="the same cap across all sessions")
+    ap.add_argument("--wire-max-wires", type=int, default=4096,
+                    help="live expression wires per session")
+    ap.add_argument("--wire-ttl", type=float, default=120.0,
+                    help="seconds an unused expression wire is kept before it is dropped")
     ap.add_argument("--tx-idle-timeout", type=float, default=30.0,
                     help="abort a transaction idle for this many seconds (0 = off)")
     ap.add_argument("--storage", choices=("memory", "disk"), default="memory",
@@ -1789,7 +1874,10 @@ def main(argv: list[str] | None = None) -> None:
                        replica_of=replica_of, repl_conn=repl_conn, repl_ring=args.repl_ring,
                        sync_replicas=args.sync_replicas, sync_timeout=args.sync_timeout,
                        sync_strict=args.sync_strict,
-                       fhe_allow_client_backend=args.fhe_allow_client_backend)
+                       fhe_allow_client_backend=args.fhe_allow_client_backend,
+                       wire_max_elements=args.wire_max_elements,
+                       wire_max_total_elements=args.wire_max_total_elements,
+                       wire_max_wires=args.wire_max_wires, wire_ttl=args.wire_ttl)
     ssl_ctx = _build_ssl_ctx(args)
     try:
         srv = NoKeyTCPServer(args.host, args.port, args.db, ssl_ctx=ssl_ctx,

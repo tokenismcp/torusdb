@@ -4,18 +4,16 @@
 
 No-key TorusDB client (wire protocol v2). Connects to a **keyless** server,
 holds the mask vault locally, blinds on insert and unblinds results - the
-server never holds a key and never decrypts. Programmatic API (no SQL parser;
-that lives in the Python `torussql-parser`); exact mod-n arithmetic via
+server never holds a key and never decrypts. Programmatic API (full statement parsing
+lives in the Python `torussql-parser`; the one piece of SQL this crate parses is the v0.6
+*arithmetic expression*, `db.expr("emp", "rate * hours / 2", all())`); exact mod-n arithmetic via
 `num-bigint`; wire format and framing match the other drivers.
 
-> **Not yet in this driver (dialect v0.6).** The Python driver/engine evaluates arithmetic
-> expressions (`+ - * /`, products of arbitrary depth, division by public and encrypted values,
-> `SUM(a*b*c)`; [`spec/TorusSQL-Spec-v0.6.md`](../../spec/TorusSQL-Spec-v0.6.md)). This driver
-> offers the v0.5 operations only - `sum`, `avg`, scaling, `dot` and `join_dot` (depth-1
-> Pi_mult) - and has no expression evaluator, no division and no multi-level products. The
-> expressions need **no new RPC** (the wire is unchanged), so a port is purely owner-side work
-> (`core/torusdb_core/expr_eval.py` is the reference). Statements in this README about "one
-> multiplicative level" describe the FHE (pairing) columns and the v0.5 Pi_mult API.
+> **Dialect v0.6 is supported**: arithmetic expressions `+ - * /` with products of arbitrary multiplicative
+> depth, division by public and by encrypted values, `SUM(expr)` / `AVG(expr)` - see
+> [Arithmetic expressions](#arithmetic-expressions-dialect-v06) and
+> [`spec/TorusSQL-Spec-v0.6.md`](../../spec/TorusSQL-Spec-v0.6.md). Statements in this README about "one
+> multiplicative level" describe the FHE (pairing) columns and the depth-1 `dot`.
 
 ## Install and first run
 
@@ -51,6 +49,61 @@ db.avg("emp", "salary", all())?;            // Some(exact rational), None when e
 db.dot("emp", "rate", "hours", all())?;     // Beaver-triple Pi_mult
 db.count("emp", eq_int("dept", 5))?;
 ```
+
+## Arithmetic expressions (dialect v0.6)
+
+`db.expr(table, text, pred)` evaluates ONE SELECT-list expression over the selected rows;
+`db.join_expr(&join_result, text)` does the same over the rows of a `join()` (columns `alias.col`).
+The text is parsed here with exactly the grammar, precedence, constant folding and policy rules of the
+Python parser/engine (`src/expr.rs` is a port of `torussql_parser/expr.py`; the two are checked against each
+other on `../expr_vectors.json`, ~400 accept/reject cases, and on a live Python peer):
+
+```rust
+let mut db = Client::connect_with(addr, &ConnectOptions { authenticated: true, max_mult_depth: 8, ..Default::default() })?;
+// emp(dept PLAIN, rate PAIRED, hours PAIRED, tax RATIONAL PAIRED, bonus RATIONAL ENC)
+db.expr("emp", "rate * hours * (1 - tax) + bonus / 2", all())?;            // ExprValue::Rows: one entry per row (None where an operand is NULL)
+db.expr("emp", "SUM(rate * hours * (1 - tax)) / COUNT(*)", eq_int("dept", 5))?; // ExprValue::Scalar(Some(Decoded)): exact
+db.expr("emp", "AVG(rate + hours)", all())?;                               // Scalar(None) over zero rows
+db.expr("emp", "100 / rate", all())?;                                      // exact rational, never truncated
+db.analyze_expr("emp", "rate * hours * rate")?;                            // ExprInfo { kind: "row", depth: 2, ct_muls: 2, .. } - sends nothing
+db.last_expr_cost();                                                       // Some(ExprCost { depth, mult_rounds, products, inversions, linear_sums })
+```
+
+* **Grammar** (spec section 5.1): `+ - * /`, unary minus, parentheses, integer and `FRAC(n, d)` literals, `SUM(expr)`,
+  `AVG(expr)`, `COUNT(*)`, columns `col` / `alias.col`; `*` `/` bind tighter than `+` `-`, all left-associative; `-5` in
+  operator position is a subtraction (`a-1`), `--` starts a comment (write `a - -1`); tree height <= 100. `MIN`, `MAX`, `DOT` are
+  whole projections, not expressions (use `dot()` / `join_dot()`); strings, `%`, functions and a trailing `;` are `Parse` errors.
+* **Policy rules** (checked before any request, identical to the Python validator and engine): `PLAIN` columns and
+  literals are public operands; `ENC`/`PAIRED` columns may appear in any linear position (`+ -`, public scalar multiples,
+  division by a public value); a product of two encrypted operands and a division by an encrypted denominator need every
+  encrypted column involved to be `PAIRED`; `STR` and `FHE` columns are rejected (an `FHE` column keeps `sum`, `avg`,
+  `scaled_sum`, `dot` - the error names FHE); a per-row expression needs an `ENC`/`PAIRED` column; per-row columns and aggregates
+  cannot be mixed; constants fold exactly and a constant zero denominator or a constant beyond 2^126 is a `PlanError`.
+* **Depth and rounds.** The depth of an expression is its number of sequential ciphertext x ciphertext products
+  (`a*b*c*d` is 3, `(a*b)*(c*d)` is 2). The driver runs ONE batched `mult_combine_batch` round trip per level
+  (chunked to the server's `max_items`), so `last_expr_cost().mult_rounds == depth`. `ConnectOptions::max_mult_depth`
+  (or `set_max_mult_depth`, default 8) caps it: a deeper expression fails with `Kind::DepthLimitExceeded` **before any
+  request**. In `expr()` a plain `a*b` is an expression like any other, so it counts toward the cap (the Python
+  engine keeps its v0.5 `a*b` form outside it).
+* **Division** is exact: `7/2` is `Decoded::Rational(7, 2)`. By a public value it is a multiplication by the inverse (no round);
+  by an encrypted value the owner (this process) unmasks the denominator and inverts it, then multiplies (one more level if
+  the numerator is encrypted). A denominator that is 0 in any selected row returns `Kind::DivisionByZero` - but only **after the
+  protocol ran to its last round with a dummy inverse**, so the sequence of requests the server sees does not reveal that a
+  zero occurred (no abort oracle). A result outside the exactness contract (|num|, den <= 2^126, |num|*den < 2^189) is
+  `OutOfBudget`, never a wrong number; a transient intermediate outside it is harmless when the final result is back inside.
+* **Who computes what** (spec section 5.10; the Python engine's owner mode). The server holds blinded cells and only
+  (i) sums stored cells for a *linear* `SUM(...)` (`SUM(a + 2*b - s/4)`: one `blinded_sum` per column) and (ii) multiplies the
+  two openings `e*g` of each Beaver product. **Products and quotients are not offloaded**: the owner unmasks and holds both
+  operands of every product and every encrypted denominator (it learns the cells it reads anyway), O(rows) work and
+  bandwidth. Intermediates exist only here; they reach the server only inside the next level's opening `e = x - u` with a fresh
+  uniform `u`. No key, mask, MAC key or plaintext-derived value is ever sent. **No new RPC** (`blinded_cells`, `blinded_sum`,
+  `mult_combine_batch`, `matching_rowids`, `plain_cells`); the wire audit tests assert this.
+* **Integrity.** With `authenticated` every cell the owner reads and every blinded sum is MAC-checked and the server's
+  `e*g` of every product is checked (`Kind::Integrity`, also for a reply with the wrong number of terms). An intermediate has
+  no MAC (it never leaves the owner); without `authenticated` a lying server can alter a product term undetected, as for `dot`.
+* **Trust.** Expressions refuse a table whose policies were only learned from the server (`Kind::UntrustedSchema`, unlike a
+  plain read): a lying server could label an encrypted column "plain" and have a blinded value used as a public operand.
+  Transactions work as for everything else (an open transaction sees its own writes; rollback restores).
 
 ## Connecting: auth, TLS, timeouts
 
@@ -89,7 +142,11 @@ implements `Display` + `std::error::Error`. `Kind` is `Unauthenticated`,
 `Forbidden`, `Busy`, `BadRequest`, `InternalError`, `PlanError`,
 `Server(String)` (other server classes), or local: `Connection`, `Timeout`,
 `Protocol`, `Interface` (misuse, unknown table/column, closed client, bad
-join), `OutOfBudget` (see below).
+join), `OutOfBudget` (see below), and for v0.6 expressions `Parse` (syntax),
+`PlanError` (illegal under the policy / type / scope rules), `DepthLimitExceeded`
+(a plan error in the Python engine: more product levels than `max_mult_depth`) and
+`DivisionByZero`. `Kind` gained these three variants in this release (it is not
+`#[non_exhaustive]`: an exhaustive `match` on it needs a new arm).
 
 Source compatibility: `From<String> for Error` and `From<Error> for String`
 exist, so old `fn main() -> Result<(), String>` code with `?` keeps compiling.
@@ -314,7 +371,10 @@ local transaction at once.
 
 ## Differences from the Python driver
 
-* No SQL / PEP 249 cursor; no GROUP BY, ORDER BY, MIN/MAX (`scaled_sum` exists for FHE columns only). Join
+* No SQL / PEP 249 cursor; no GROUP BY, ORDER BY, MIN/MAX (`scaled_sum` exists for FHE columns only). v0.6 expressions are
+  evaluated one per call (`expr` / `join_expr`) rather than as a SELECT list; `MIN`/`MAX`/`DOT` are not expression operands in
+  either driver, and `FHE` columns are rejected inside an expression (the Python engine's `SUM(f)` / `DOT(f, g)` forms are the
+  `sum()` / `dot()` methods here). Join
   WHERE over joined tables is a client-side post-filter on PLAIN columns
   (`cmp_in("d", "dname", "=", &v)`).
 * Vault is a plain JSON snapshot written on demand (atomic, 0600, directory
@@ -341,7 +401,12 @@ Integration tests start a real server subprocess (`$TORUSDB_PYTHON`, else
 `server/nokey_server.py --port 0`; it must be Python >= 3.11 with `py_ecc`, so on a machine whose
 `python3` is older set `TORUSDB_PYTHON=/path/to/python3.12`). When none is found they print
 `SKIP` and return (they show as passed - check stderr). The vector tests read
-`../vectors.json` and `../../proto/fhe-vectors.json`, so they only run from a checkout of the repository; the published crate ships no tests (`include` omits `tests/`). Set `TORUSDB_REQUIRE_INTEGRATION=1` to fail instead of skip.
+`../vectors.json`, `../expr_vectors.json` and `../../proto/fhe-vectors.json`, so they only run from a checkout of the repository; the published crate ships no tests (`include` omits `tests/`). Set `TORUSDB_REQUIRE_INTEGRATION=1` to fail instead of skip.
+
+`TORUSDB_PY_ROOT=/path/to/checkout` runs the Python side (server, core, parser, python driver) from another checkout.
+The v0.6 expression tests (`tests/expr*.rs`) are driven by `../expr_vectors.json` (regenerate with `PYTHONPATH=core:parser
+python drivers/gen_expr_vectors.py > drivers/expr_vectors.json`) and a live Python peer (`../expr_peer.py`: the same random
+expressions through the Python engine and this crate against one server; seed via `TORUSDB_PEER_SEED`).
 
 The FHE tests also run the Python reference as a cross-implementation peer (`tests/fhe_peer.py`, with
 `PYTHONPATH=<repo>/core:<repo>/parser:<repo>/drivers/python`); set `TORUSDB_MCL_PATH=<dir containing mclbn256>`

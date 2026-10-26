@@ -175,3 +175,60 @@ export async function rawRpc(port: number, method: string, args: unknown[], toke
     return await call(method, args);
   } finally { sock.destroy(); }
 }
+
+/** A recording pass-through proxy in front of a real server: every request (method + args) is logged in
+ *  order, as the server receives it; `mutate` may rewrite a reply (a lying server). */
+export interface Recorder {
+  port: number;
+  log: Array<{ m: string; a: any[] }>;
+  close(): void;
+}
+
+export async function recorder(target: { host: string; port: number },
+                               mutate?: (m: string, a: any[], reply: any, nth: number) => any): Promise<Recorder> {
+  const log: Array<{ m: string; a: any[] }> = [];
+  const conns = new Set<net.Socket>();
+  const counts = new Map<string, number>();
+  const server = net.createServer((client) => {
+    const up = net.connect(target.port, target.host);
+    conns.add(client); conns.add(up);
+    client.on("error", () => {}); up.on("error", () => {});
+    client.on("close", () => { up.destroy(); conns.delete(client); });
+    up.on("close", () => { client.destroy(); conns.delete(up); });
+    let cbuf = Buffer.alloc(0), ubuf = Buffer.alloc(0);
+    const pending: Array<{ m: string; a: any[] }> = [];
+    client.on("data", (c) => {
+      cbuf = Buffer.concat([cbuf, c]);
+      while (cbuf.length >= 4 && cbuf.length >= 4 + cbuf.readUInt32BE(0)) {
+        const n = cbuf.readUInt32BE(0);
+        const fr = cbuf.subarray(0, 4 + n);
+        cbuf = cbuf.subarray(4 + n);
+        const req = JSON.parse(fr.subarray(4).toString());
+        log.push({ m: req.m, a: req.a });
+        pending.push({ m: req.m, a: req.a });
+        up.write(fr);
+      }
+    });
+    up.on("data", (c) => {
+      ubuf = Buffer.concat([ubuf, c]);
+      while (ubuf.length >= 4 && ubuf.length >= 4 + ubuf.readUInt32BE(0)) {
+        const n = ubuf.readUInt32BE(0);
+        let fr = ubuf.subarray(0, 4 + n);
+        ubuf = ubuf.subarray(4 + n);
+        const req = pending.shift();
+        if (mutate && req) {
+          const k = (counts.get(req.m) ?? 0) + 1; counts.set(req.m, k);
+          const reply = JSON.parse(fr.subarray(4).toString());
+          const out = mutate(req.m, req.a, reply, k);
+          if (out !== reply) fr = frame(Buffer.from(JSON.stringify(out)));
+        }
+        client.write(fr);
+      }
+    });
+  });
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+  return {
+    port: (server.address() as net.AddressInfo).port, log,
+    close: () => { server.close(); conns.forEach((s) => s.destroy()); },
+  };
+}
