@@ -14,13 +14,14 @@ can reject illegal queries before they reach the closed TorusDB engine.
 from __future__ import annotations
 
 from .ast import (
-    AvgExpr, ColRef, Condition, CountStar, CreateIndex, CreateTable, CtMulExpr, Delete,
-    DotExpr, DropIndex, DropTable, Having, InList, Insert, MaxExpr, MinExpr, OrderBy,
+    AggCall, AvgExpr, BinOp, ColRef, Condition, CountStar, CreateIndex, CreateTable, CtMulExpr, Delete,
+    DotExpr, DropIndex, DropTable, ExprProj, Having, InList, Insert, Lit, MaxExpr, MinExpr, Neg, OrderBy,
     Query, ScalarMulExpr, ScaledSumExpr, Select, SumExpr, Update, Where,
     POLICIES, TYPES, WHERE_OPS,
 )
 from .errors import ParseError, TorusSQLError, ValidationError
 from .parser import parse
+from .expr import ExprInfo, analyze_expr, render as render_expr
 from .validate import Column, Schema, Table, validate_script
 
 __version__ = "0.1.0"
@@ -34,6 +35,7 @@ __all__ = [
     "Having", "Query",
     "ColRef", "SumExpr", "DotExpr", "ScalarMulExpr", "ScaledSumExpr",
     "CtMulExpr", "CountStar", "AvgExpr", "MinExpr", "MaxExpr",
+    "ExprProj", "Lit", "Neg", "BinOp", "AggCall", "ExprInfo", "analyze_expr", "render_expr",
     "Where", "Condition", "InList", "OrderBy",
     "TYPES", "POLICIES", "WHERE_OPS",
 ]

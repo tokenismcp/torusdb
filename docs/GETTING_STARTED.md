@@ -72,8 +72,9 @@ torussql> \q
 ```
 
 `PLAIN` columns are visible to the server (and can be filtered, grouped, joined);
-`ENC`/`PAIRED` columns are hidden and support `SUM`, `AVG`, scaling and (`PAIRED`)
-one multiplication. The same thing non-interactively:
+`ENC`/`PAIRED` columns are hidden and support `SUM`, `AVG`, scaling and arithmetic
+expressions (`+ - * /`, products of any depth between `PAIRED` columns, division; see
+`spec/TorusSQL-Spec-v0.6.md`). The same thing non-interactively:
 
 ```bash
 torussql --vault ./demo.vault -c "SELECT SUM(v) FROM t"

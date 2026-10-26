@@ -8,6 +8,37 @@ Versioning: [Versioning Policy](docs/versioning.md).
 
 ## [Unreleased]
 
+### Added - SQL dialect v0.6: arithmetic expressions (`spec/TorusSQL-Spec-v0.6.md`)
+
+- Expression grammar in `SELECT` lists and as aggregate arguments: `+ - * /`, unary minus, parentheses, integer and
+  `FRAC(n, d)` literals, over `ENC`/`PAIRED`/`PLAIN` numeric columns, with `SUM(expr)`, `AVG(expr)`, `COUNT(*)` and
+  aggregate expressions (`SUM(price*qty)/COUNT(*)`, `SUM(a)*SUM(b)`). Every pre-v0.6 projection keeps its AST node and
+  result (`col`, `SUM(col)`, `k*col`, `k*SUM(col)`, `a*b`, `DOT`, ...); `col * col` with one `PLAIN` factor is now legal.
+- **Products of arbitrary multiplicative depth** (the no-key paper's composition Pi_C): all products of one level, over all
+  rows and sub-expressions, share one batched Pi_mult owner round trip (`mult_rounds == depth`). Configurable maximum depth
+  (`NoKeyClient.max_mult_depth` / `connect(max_mult_depth=...)`, default 8) enforced before any request, error
+  `DepthLimitExceeded`. `conn.client.last_expr_cost` reports depth, rounds, products, inversions.
+- **Division**: by a public value (multiplication by its inverse mod n, no round), and by an encrypted value (owner-assisted
+  inversion, then a product). Results are exact rationals, never truncated. A zero denominator raises `DivisionByZero`
+  (a `ZeroDivisionError`/`ExecError`; DB-API `DataError`) *after* the protocol has run to its last round, so the request
+  sequence does not reveal it to the server; a constant zero denominator is rejected at validation time. Out-of-range
+  results raise `OutOfBudget`.
+- Linear `SUM(...)` arguments (`SUM(a + 2*b - s/4)`) stay Pi_lin aggregates computed by the server; non-linear ones are
+  evaluated per row at the owner.
+- Open validator and planner share one rule set (`torussql_parser.analyze_expr`); conformance cases added
+  (`spec/conformance`: accept/reject parity, depth-3 products, rational chains, public/encrypted division, zero, budget).
+- Honesty: the owner unmasks and holds both operands of every product and inverts every encrypted denominator, so
+  **products and quotients are not offloaded to the server** (review packet 3.3, F-3, F-18-F-21); the server does
+  Pi_lin sums and the `e*g` step on uniform openings. No new RPC. Intermediates never reach the server except inside the
+  next level's fresh-masked opening.
+- `FHE` columns are unchanged (depth-1 `SUM`/`AVG`/`DOT`); deeper products, division and any arithmetic around them are
+  rejected with a clear error naming `FHE`, never a wrong value.
+- Tests: `core/tests/test_expr_v06.py`, `parser/tests/test_expr.py`, `tests/test_expr_e2e.py` (real server), expression
+  audits in `core/tests/test_crypto_audit.py`; `examples/payroll.torusql` shows chained products and division.
+- **Not yet in the TypeScript and Rust drivers** (they keep the v0.5 operations; no wire change is needed to port it).
+- Docs: README, quickstart, GETTING_STARTED, ops guide, threat model (expression shape, no zero-denominator oracle),
+  review packet 3.3 and findings F-18-F-21, ROADMAP, `docs/versioning.md`; spec v0.5 marked superseded.
+
 - Project logo and social-preview card (`assets/`), README badges and status banner.
 - GitHub issue/PR templates and Dependabot configuration.
 - CI: the TypeScript and Rust jobs install the repo packages; the Rust TLS test signs its

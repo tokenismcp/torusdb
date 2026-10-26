@@ -311,7 +311,10 @@ or sharding by table across servers; there is no clustering or multi-writer (see
 * Integrity (`authenticated=True`) is **opt-in**; without it a malicious server
   can return wrong answers undetected.
 * Joins run at the owner on plaintext keys; encrypted-key joins, encrypted
-  predicates, and multiplication depth >1 are not supported.
+  predicates, and arithmetic on `FHE` columns beyond `SUM`/`AVG`/`DOT` are not supported. Products
+  deeper than `max_mult_depth` (default 8, `connect(..., max_mult_depth=N)`) are refused; each
+  multiplicative level is one owner round trip, and the owner does O(rows) work per product
+  (`docs/crypto-review-packet.md` §3.3).
 * Metadata (schema, row counts, access patterns, join keys, timing) is visible
   to the server.
 * No external cryptographic audit has been completed.

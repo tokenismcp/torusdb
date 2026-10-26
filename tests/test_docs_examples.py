@@ -228,3 +228,35 @@ def test_first_run_error_messages_say_what_to_do(tmp_path):
         nokey_server.main(["--port", str(s.getsockname()[1])])
     s.close()
     assert "cannot listen" in str(ei.value) and "--port" in str(ei.value)
+
+
+def test_payroll_example_file_runs_with_the_documented_results(conn):
+    """examples/payroll.torusql: every statement runs and the results quoted in its comments hold."""
+    from torussql.cli import split_statements
+    text = (ROOT / "examples" / "payroll.torusql").read_text()
+    stmts, rest = split_statements(text)
+    assert not rest.strip() and len(stmts) > 15
+    got = {}
+    for sql in stmts:
+        got[" ".join(sql.split())] = conn.execute(sql).rows if sql.lstrip().upper().startswith("SELECT") \
+            else conn.execute(sql)
+    F = Fraction
+    sel = {k: v for k, v in got.items() if k.upper().startswith("SELECT")}
+
+    def rows(prefix):
+        return next(v for k, v in sel.items() if k.startswith(prefix))
+    assert rows("SELECT SUM(salary)") == [[24000]]
+    assert rows("SELECT 12 * salary") == [[[96000, 108000, 84000]]]
+    assert rows("SELECT DOT(rate, hours)") == [[5900]]
+    assert rows("SELECT rate * (hours + overtime") == [[[2375, 2280, 2070]]]
+    assert rows("SELECT rate * hours * (1 - tax) FROM") == [[[1600, 1575, 1440]]]
+    assert rows("SELECT rate * hours * (1 - tax) * overtime") == [[[8000, 3150, 5760]]]
+    assert rows("SELECT SUM(rate * hours * (1 - tax))") == [[4615]]
+    assert rows("SELECT salary / 12") == [[[F(2000, 3), 750, F(1750, 3)]]]
+    assert rows("SELECT salary / hours") == [[[200, F(1800, 7), 175]]]
+    assert rows("SELECT SUM(rate * hours) / COUNT(*)") == [[F(5900, 3), F(4800, 23)]]
+    assert rows("SELECT rate * hours + salary / 12") == \
+        [[[2000 + F(2000, 3) - 5, 2100 + 750 - 2, 1800 + F(1750, 3) - 4]]]
+    # depth = rounds: the depth-3 query used three batched owner round trips
+    conn.execute("SELECT rate * hours * (1 - tax) * overtime FROM payroll")
+    assert conn.client.last_expr_cost["mult_rounds"] == 3

@@ -15,6 +15,18 @@ class ExecError(TorusDBError):
     """Runtime failure during query execution."""
 
 
+class DivisionByZero(ExecError, ZeroDivisionError):
+    """A denominator evaluated to zero (v0.6 division). Raised at the owner,
+    after it has unmasked the denominator; the server learns nothing from it
+    (the failing query simply stops issuing requests)."""
+
+
+class DepthLimitExceeded(PlanError):
+    """The expression needs more sequential ciphertext x ciphertext product
+    levels (owner rounds) than the client's ``max_mult_depth`` allows. Raised
+    before any request is sent."""
+
+
 class IntegrityError(TorusDBError):
     """A result failed its information-theoretic MAC check — the server
     returned a forged/incorrect value (no-key paper §IX)."""

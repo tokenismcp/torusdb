@@ -26,7 +26,8 @@ that was legal and produced result R will always be legal and produce R.
 | `MINOR` | New statement or projection added (backward-compatible) |
 | `MAJOR` | A legal statement changes semantics or becomes illegal |
 
-Current: **0.5** (`spec/TorusSQL-Spec-v0.5.md`; v0.1 kept for history).
+Current: **0.6** (`spec/TorusSQL-Spec-v0.6.md`, unreleased until the next package release; v0.5 and v0.1 kept
+for history). v0.6 adds arithmetic expressions and needs **no new RPC**, so the wire protocol stays at 2.
 
 ### Surface 2: The wire protocol (`proto/torussql-wire-v*.md`)
 

@@ -4,30 +4,64 @@
 -- The file creates table `payroll`; to run it again use a fresh server (or `DROP TABLE payroll;`).
 -- Pass --vault PATH if you want to read the encrypted data again from a later session.
 --
--- Every value in `rate`/`hours`/`salary` stays encrypted on the server.
--- The aggregates and products below are all computed over ciphertext.
+-- Every value in `rate`/`hours`/`overtime`/`tax`/`salary` stays encrypted on the server.
+-- Sums of blinded cells are done by the server; every product and quotient below is
+-- reconstructed by YOU (the owner) from fresh-masked openings, one round trip per
+-- multiplicative level - the server never sees an intermediate. See spec v0.6 section 5.10.
 
 CREATE TABLE payroll (
-    id     INT      PLAIN,
-    rate   INT      PAIRED,
-    hours  INT      PAIRED,
-    salary RATIONAL ENC
+    id       INT      PLAIN,
+    rate     INT      PAIRED,
+    hours    INT      PAIRED,
+    overtime INT      PAIRED,
+    tax      RATIONAL PAIRED,
+    salary   RATIONAL PAIRED       -- PAIRED works wherever ENC does, and also in products/quotients
 );
 
-INSERT INTO payroll (id, rate, hours, salary) VALUES (1, 50, 40, FRAC(8000,1));
-INSERT INTO payroll (id, rate, hours, salary) VALUES (2, 60, 35, FRAC(9000,1));
-INSERT INTO payroll (id, rate, hours, salary) VALUES (3, 45, 40, FRAC(7000,1));
+INSERT INTO payroll (id, rate, hours, overtime, tax, salary) VALUES (1, 50, 40, 5, FRAC(1,5), FRAC(8000,1));
+INSERT INTO payroll (id, rate, hours, overtime, tax, salary) VALUES (2, 60, 35, 2, FRAC(1,4), FRAC(9000,1));
+INSERT INTO payroll (id, rate, hours, overtime, tax, salary) VALUES (3, 45, 40, 4, FRAC(1,5), FRAC(7000,1));
 
 -- Encrypted aggregation: total payroll, never decrypted server-side.
-SELECT SUM(salary) FROM payroll;
+SELECT SUM(salary) FROM payroll;                                  -- 24000
 
 -- Public scalar x encrypted column, per row: each salary times 12
 -- -> [96000, 108000, 84000]  (use `12 * SUM(salary)` for the scaled total, 288000).
 SELECT 12 * salary FROM payroll;
 
--- Encrypted x encrypted, per row (depth-1): each person's gross pay -> [2000, 2100, 1800].
+-- Encrypted x encrypted, per row (depth 1): each person's gross pay -> [2000, 2100, 1800].
 SELECT id, rate * hours FROM payroll;
 
 -- Encrypted inner product (INT PAIRED): total gross across everyone,
 -- = 50*40 + 60*35 + 45*40 = 2000 + 2100 + 1800 = 5900, computed in one step.
 SELECT DOT(rate, hours) FROM payroll;
+
+-- ---- dialect v0.6: expressions --------------------------------------------------------------
+
+-- Mixed + - * with a public fraction: pay with overtime at 1.5x (depth 1: one owner round)
+-- -> [2375, 2280, 2070]
+SELECT rate * (hours + overtime * FRAC(3,2)) FROM payroll;
+
+-- Chained multiplication, depth 2 (two owner rounds): net pay after tax
+-- gross * (1 - tax) -> [1600, 1575, 1440]
+SELECT rate * hours * (1 - tax) FROM payroll;
+
+-- Depth 3 (three rounds): net pay times overtime hours -> [8000, 3150, 5760]
+SELECT rate * hours * (1 - tax) * overtime FROM payroll;
+
+-- Aggregate of a chained product: total net pay = 4615
+SELECT SUM(rate * hours * (1 - tax)) FROM payroll;
+
+-- Division by a public constant: monthly salary, exact rationals -> [2000/3, 750, 1750/3]
+SELECT salary / 12 FROM payroll;
+
+-- Division by an ENCRYPTED value (the owner inverts the denominator): salary per hour
+-- -> [200, 1800/7, 175].  A zero denominator is an error, never a wrong number.
+SELECT salary / hours FROM payroll;
+
+-- Aggregate division: mean gross pay = 5900/3 ; salary per hour overall = 4800/23
+SELECT SUM(rate * hours) / COUNT(*), SUM(salary) / SUM(hours) FROM payroll;
+
+-- Everything together, with an alias: gross + monthly salary - overtime
+-- -> [2000 + 2000/3 - 5, 2100 + 750 - 2, 1800 + 1750/3 - 4]
+SELECT rate * hours + salary / 12 - overtime AS total FROM payroll;

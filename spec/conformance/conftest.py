@@ -19,7 +19,8 @@ for _pkg in ("core", "parser"):
     if _p.is_dir() and str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
 
-from torusdb_core.errors import ParseError, PlanError       # noqa: E402
+from torusdb_core.errors import DivisionByZero, ParseError, PlanError   # noqa: E402
+from torusdb_core.protocol import OutOfBudget                             # noqa: E402
 from torusdb_core.nokey_engine import NoKeyClient, NoKeyServer  # noqa: E402
 
 
@@ -30,6 +31,8 @@ class EngineSeam:
 
     PARSE = ParseError      # → wire ErrorKind PARSE
     POLICY = PlanError      # → wire ErrorKind POLICY
+    ZERO_DIVISION = DivisionByZero    # v0.6 §3.4 — a denominator evaluated to 0
+    BUDGET = OutOfBudget              # §6 — result outside the exactness contract
 
     def __init__(self):
         self._client = NoKeyClient(NoKeyServer())

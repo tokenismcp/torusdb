@@ -363,3 +363,128 @@ def test_without_authentication_a_lying_server_is_NOT_detected():
     cli.execute("CREATE TABLE t (v INT ENC)")
     cli.execute("INSERT INTO t (v) VALUES (10)")
     assert cli.execute("SELECT SUM(v) FROM t").rows == [[11]]   # silently wrong
+
+
+# ── v0.6 expressions: multi-level products and division ─────────────────────
+# No new RPC exists for expressions. These tests pin what the server is handed by the
+# existing ones when the owner evaluates Π_C (several Beaver levels, owner-assisted
+# inversion): masks, encoded plaintexts, encoded INTERMEDIATES and inverses never reach it,
+# and the openings of every level are uniform and never reuse a triple.
+_EXPR_ROWS = [(1, 1_000_003, 2_000_011, 3_000_017, Fraction(5_000_011, 7), Fraction(9_000_001, 3)),
+              (2, 1_000_033, -2_000_029, 3_000_041, Fraction(-5_000_021, 11), Fraction(7_000_003, 5)),
+              (3, -1_000_037, 2_000_039, -3_000_043, Fraction(5_000_047, 13), Fraction(-6_000_001, 7)),
+              (4, 1_000_051, 2_000_057, 3_000_059, Fraction(5_000_063, 17), Fraction(8_000_009, 9))]
+
+
+def _lit(v):
+    return f"FRAC({v.numerator},{v.denominator})" if isinstance(v, Fraction) and v.denominator != 1 else str(int(v))
+
+
+def expr_workload(client):
+    client.execute("CREATE TABLE u (id INT PLAIN, a INT PAIRED, b INT PAIRED, c INT PAIRED, "
+                   "y RATIONAL PAIRED, s RATIONAL ENC)")
+    for (i, a, b, c, y, s) in _EXPR_ROWS:
+        client.execute(f"INSERT INTO u (id, a, b, c, y, s) VALUES ({i}, {a}, {b}, {c}, {_lit(y)}, {_lit(s)})")
+    client.execute("UPDATE u SET b = 2000099 WHERE id = 2")        # also an UPDATE'd cell
+    out = {}
+    for sql in ["SELECT a*b*c FROM u",                             # depth 2
+                "SELECT a*b*c*a FROM u",                           # depth 3
+                "SELECT (a+b)*(c-a)*b + s/3 FROM u",               # mixed
+                "SELECT SUM(a*b*c*b) FROM u",
+                "SELECT a/b FROM u",                               # encrypted denominator
+                "SELECT s/c, y/y FROM u",                          # (s is ENC: rejected below)
+                "SELECT SUM(a*b)/COUNT(*) FROM u",
+                "SELECT SUM(a+2*b-s/4), SUM(s)/4 FROM u",
+                "SELECT a/(b*c)*y FROM u"]:
+        try:
+            out[sql] = client.execute(sql).rows
+        except Exception as exc:                                    # noqa: BLE001
+            out[sql] = type(exc).__name__
+    assert out["SELECT s/c, y/y FROM u"] == "PlanError"            # ENC numerator of an encrypted division
+    assert all(v != "PlanError" for k, v in out.items() if k != "SELECT s/c, y/y FROM u"), out
+    return out
+
+
+def _expr_secrets():
+    """Encoded plaintexts, intermediates, inverses and results the server must never see."""
+    from torusdb_core.protocol import Owner
+    vals = set()
+    rows = [list(r) for r in _EXPR_ROWS]
+    rows[1][2] = 2_000_099                                          # the UPDATE
+    for (_i, a, b, c, y, s) in rows:
+        for v in (a, b, c, y, s, a * b, a * b * c, a * b * c * a, a * b * c * b, a + b, c - a,
+                  (a + b) * (c - a), (a + b) * (c - a) * b, Fraction(a, b), Fraction(1, b),
+                  Fraction(1, b * c), Fraction(a, b * c), Fraction(a, b * c) * y, Fraction(1, y),
+                  s / 3, s / 4, a * b + c, (a + b) * (c - a) * b + s / 3):
+            vals.add(encode(v))
+        vals.add(Owner.invert(encode(b)))
+        vals.add(Owner.invert(encode(y)))
+    return vals
+
+
+@pytest.mark.parametrize("auth", [False, True], ids=["plain", "authenticated"])
+def test_server_never_receives_a_mask_intermediate_or_inverse_in_expressions(auth):
+    srv = Recording()
+    cli = NoKeyClient(srv, authenticated=auth)
+    expr_workload(cli)
+    masks = set(cli._masks.values())
+    assert masks
+    assert not (masks & srv.seen), "a mask value reached the server"
+    leaked = _expr_secrets() & srv.seen
+    assert not leaked, f"{len(leaked)} plaintext/intermediate/inverse encodings reached the server"
+    if auth:
+        assert cli._alpha not in srv.seen
+    # the cost model really ran several levels (so the check above covers them)
+    assert cli.last_expr_cost is not None
+
+
+class OpeningRecorder(Recording):
+    def __init__(self):
+        super().__init__()
+        self.rounds = []                                            # one list of (e, g) per request
+
+    def mult_combine_batch(self, openings):
+        self.rounds.append(list(openings))
+        return [e * g % N for (e, g) in openings]
+
+
+def test_expression_openings_are_uniform_at_every_level_and_never_reuse_a_triple():
+    srv = OpeningRecorder()
+    cli = NoKeyClient(srv)
+    cli.execute("CREATE TABLE z (a INT PAIRED, b INT PAIRED, c INT PAIRED, d INT PAIRED)")
+    for _ in range(1200):                                           # identical plaintexts on purpose
+        cli.execute("INSERT INTO z (a, b, c, d) VALUES (7, 7, 7, 7)")
+    srv.rounds.clear()
+    cli.execute("SELECT a*b*c*d FROM z")                            # 3 levels
+    assert len(srv.rounds) == 3 and all(len(r) == 1200 for r in srv.rounds)
+    allv = []
+    for lvl in srv.rounds:
+        es, gs = [e for e, _ in lvl], [g for _, g in lvl]
+        assert chi2_uniform(es, 8) < 40 and chi2_uniform(gs, 8) < 40     # df=7: P(>40) ~ 1e-6
+        allv += es + gs
+    assert len(set(allv)) == len(allv), "an opening value repeated: a triple was reused"
+    srv.rounds.clear()
+    cli.execute("SELECT a/b FROM z")                                # inversion + 1 level
+    assert len(srv.rounds) == 1
+    assert chi2_uniform([e for e, _ in srv.rounds[0]], 8) < 40
+
+
+def test_openings_of_two_different_plaintexts_are_indistinguishable_across_levels():
+    srv = OpeningRecorder()
+    cli = NoKeyClient(srv)
+    cli.execute("CREATE TABLE z (k INT PLAIN, a INT PAIRED, b INT PAIRED, c INT PAIRED)")
+    for _ in range(1500):
+        cli.execute("INSERT INTO z (k, a, b, c) VALUES (0, 0, 0, 0)")
+        cli.execute("INSERT INTO z (k, a, b, c) VALUES (1, 10000000000000, -4, 123456789)")
+    srv.rounds.clear()
+    cli.execute("SELECT a*b*c FROM z")
+    lvl2 = srv.rounds[1]                                            # the level whose operand is an intermediate
+    # rows alternate 0-plaintext, big-plaintext: split by parity of row order
+    zero_e = [lvl2[i][0] for i in range(0, len(lvl2), 2)]
+    big_e = [lvl2[i][0] for i in range(1, len(lvl2), 2)]
+    ca, cb = [0] * 16, [0] * 16
+    for v in zero_e:
+        ca[v * 16 // N] += 1
+    for v in big_e:
+        cb[v * 16 // N] += 1
+    assert sum((x - y) ** 2 / max(1, x + y) for x, y in zip(ca, cb)) < CHI2_LIMIT

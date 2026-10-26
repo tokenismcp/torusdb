@@ -29,7 +29,8 @@ except ValidationError as e:
 ## What it checks
 
 - Grammar (CREATE / DROP / INSERT / UPDATE / DELETE / SELECT with joins, GROUP BY, ORDER BY, indexes,
-  transactions) per the current spec, [v0.5](../spec/TorusSQL-Spec-v0.5.md).
+  transactions) per the current spec, [v0.6](../spec/TorusSQL-Spec-v0.6.md) (which adds the arithmetic expression
+  grammar and its policy rules, `torussql_parser.analyze_expr`).
 - Policy rules: `SUM`/`k*col` need `ENC`/`PAIRED`; `*` and `DOT` need
   `PAIRED`; `WHERE` only on `PLAIN`.
 - Type rules: `DOT` is `INT`-only; `STR` must be `PLAIN`.

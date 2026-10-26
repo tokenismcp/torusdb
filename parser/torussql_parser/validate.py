@@ -18,15 +18,14 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from .ast import (
-    AvgExpr, ColRef, CountStar, CreateTable, CtMulExpr, Delete, DotExpr,
+    AvgExpr, BinOp, ColRef, CountStar, CreateTable, CtMulExpr, Delete, DotExpr, ExprProj,
     DropTable, CreateIndex, DropIndex, InList, Insert, Join, MaxExpr, MinExpr, Query, ScalarMulExpr,
     ScaledSumExpr, Select, SumExpr, Update,
 )
+from .expr import MAX_SCALAR, analyze_expr
 from .predicate import LIKE_OPS, NULL_OPS
 from .errors import ValidationError
 
-
-MAX_SCALAR = 1 << 126          # |k| bound for k*col / k*SUM(col) (exactness contract)
 
 
 def _describe(lit) -> str:
@@ -193,14 +192,16 @@ class Schema:
                 self._validate_proj(scope, proj)
         agg_like = (not q.star and not q.group_by and any(
             isinstance(p, (SumExpr, AvgExpr, MinExpr, MaxExpr, CountStar, DotExpr,
-                           ScaledSumExpr, ScalarMulExpr, CtMulExpr))
+                           ScaledSumExpr, ScalarMulExpr, CtMulExpr, ExprProj))
             for p in q.projections))
         if agg_like and q.order_by is not None:
             raise ValidationError(
                 "ORDER BY has no effect on an aggregate result — use GROUP BY or "
                 "select plain rows")
         if (not q.star and not q.group_by and (q.limit is not None or q.offset is not None) and any(
-                isinstance(p, (ScalarMulExpr, CtMulExpr)) for p in q.projections)):
+                isinstance(p, (ScalarMulExpr, CtMulExpr))
+                or (isinstance(p, ExprProj) and self._expr_info(scope, p).kind == "row")
+                for p in q.projections)):
             raise ValidationError(
                 "LIMIT/OFFSET do not apply to per-row encrypted expressions (k*col, a*b), "
                 "which are returned as one list")
@@ -251,6 +252,10 @@ class Schema:
                     raise ValidationError(
                         "ORDER BY column must appear in GROUP BY or the "
                         "select list")
+
+    def _expr_info(self, scope: "_Scope", proj: ExprProj):
+        """Analyse a general expression projection (v0.6): (folded, ExprInfo)."""
+        return analyze_expr(proj.expr, lambda ref: scope.resolve(ref, "expression"))[1]
 
     def _validate_on(self, scope: "_Scope", j: Join) -> None:
         li, lc = scope.resolve(j.on_left, "ON")
@@ -361,7 +366,11 @@ class Schema:
         elif isinstance(proj, CtMulExpr):
             _i, a = scope.resolve(proj.left, "col * col")
             _j, b = scope.resolve(proj.right, "col * col")
-            if a.policy != "paired" or b.policy != "paired":
+            if "plain" in (a.policy, b.policy):
+                # v0.6: a PLAIN factor makes it a public-scalar product (an expression)
+                self._expr_info(scope, ExprProj(expr=BinOp(
+                    op="*", left=ColRef(name=proj.left), right=ColRef(name=proj.right))))
+            elif a.policy != "paired" or b.policy != "paired":
                 raise ValidationError(
                     f"ciphertext × ciphertext ({a.name} * {b.name}) requires "
                     f"both columns to be PAIRED")
@@ -388,6 +397,9 @@ class Schema:
                     f"DOT requires INT columns in v0.1 (column {bad!r} is "
                     f"{(a if a.type != 'int' else b).type}); use per-row "
                     f"`a * b` for rational products")
+
+        elif isinstance(proj, ExprProj):
+            self._expr_info(scope, proj)
 
         else:
             raise ValidationError(f"unsupported projection: {proj}")

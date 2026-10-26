@@ -147,6 +147,17 @@ tables (all rows of the right table, the matching rows of the left) — never an
 encrypted value. Aggregates over a join reveal, via the row-id sets sent to
 Π_lin, exactly which row combinations were aggregated.
 
+**Expressions (v0.6).** For `a*b*c + s/2`-style queries the server receives the ids of the rows
+read (as for any query), the blinded cells it already stores, and per multiplicative level a batch
+of openings `(e, g) = (x − u, y − v)` with fresh uniform `u, v` (never reused; tested for
+uniformity and for the absence of any mask, encoded plaintext, intermediate, inverse or quotient in
+everything it receives: `core/tests/test_crypto_audit.py`, `tests/test_expr_e2e.py`). It also sees
+the **shape** of the expression: the number of levels (rounds), the number of products per level
+and the number of rows involved. A zero encrypted denominator does not change what the server sees
+— the owner finishes the remaining rounds with a dummy value and raises the error afterwards — so
+a division by zero is not an oracle for the server. The owner learns every operand it reads
+(denominators included); that is the data owner's own data.
+
 **Transactions and the journal** contain the same blinded/plaintext data the
 server already stores; they add timing (when rows were written) but no new
 plaintext.
@@ -218,8 +229,12 @@ The following are explicitly **not** in scope for this version:
 - **Encrypted predicate evaluation**: WHERE/GROUP BY/ORDER BY on encrypted
   columns is impossible without revealing the server's plaintext comparison
   capability. This is a fundamental FHE limitation.
-- **Depth ≥ 2 multiplication**: only depth-1 ct×ct is supported. Deeper
-  circuits require a different scheme.
+- **Offloading deep products and divisions to the server**: dialect v0.6 evaluates products
+  of any depth (up to `max_mult_depth`, default 8) and division, but at the **owner**: it holds
+  both operands of every product (it unmasks them) and inverts every encrypted denominator, so
+  the server does no useful multiplication work (review packet §3.3, F-3). Confidentiality is
+  unaffected; the cost is O(rows) owner work and one round trip per multiplicative level.
+  `FHE` columns still have a single multiplicative level (no expressions over them).
 - **Traffic analysis**: volume/timing of network exchanges can leak query
   structure.
 - **Physical side channels**: power analysis, cache-timing, etc.

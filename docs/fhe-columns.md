@@ -10,6 +10,13 @@
 > * **public scalar × ciphertext** (`k * SUM(col)`) is plain EC scalar multiplication of the
 >   ciphertext points — cheap, and a different operation.
 
+> **Limits (dialect v0.6).** `FHE` columns support `SUM`, `AVG`, `k * SUM(col)` and a single `DOT`
+> between two `FHE` columns. They cannot appear in the v0.6 arithmetic expressions: `x*y*x`,
+> `x/2`, `x+1`, `SUM(x)/COUNT(*)` and `SUM(x*y)` are rejected with an error naming `FHE` (never a
+> wrong answer), because a pairing product lands in the target group GT and cannot be multiplied
+> again. Products of arbitrary depth and division are available for `ENC`/`PAIRED` columns only
+> (computed at the owner; `crypto-review-packet.md` §3.3).
+
 `ENC`/`PAIRED` columns use the *no-key delegation* protocol: the server stores one-time
 pads and the owner finishes every computation. **`FHE` columns** are the other, complementary
 mode: the server itself adds ciphertexts (EC point addition), scales them by public scalars

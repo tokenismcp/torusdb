@@ -98,4 +98,4 @@ methods fail with `BadRequest: unknown method`.
 Adding a method or a result field is a MINOR change; renaming/removing a method,
 changing an argument shape, or changing framing is MAJOR. Clients ignore unknown
 result fields. Current: **protocol 2**; the dialect is versioned separately
-(`spec/TorusSQL-Spec-v0.5.md`).
+(`spec/TorusSQL-Spec-v0.6.md`; dialect v0.6 added expressions without any new RPC).

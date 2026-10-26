@@ -6,6 +6,8 @@ Encrypted-column compatibility rules:
     DOT(a, b)         : both must be policy=paired  (★_ct needs G1+G2)
     col1 * col2       : same as DOT
     k * c             : c must be encrypted or paired; k is plain int
+    expressions (v0.6): + - * / over columns/literals/aggregates; the rules live in
+                        torussql_parser.expr.analyze_expr (shared with the open validator)
     WHERE c = lit     : c must be policy=plain  (no encrypted equality
                         circuit in this engine — that needs FHE bootstrap
                         of an equality predicate)
@@ -23,8 +25,10 @@ from .parser import (
     Query, ScalarMulExpr, Select, SumExpr, Update,
 )
 from torussql_parser.ast import (
-    AvgExpr, CountStar, InList, MaxExpr, MinExpr, ScaledSumExpr,
+    AggCall, AvgExpr, BinOp, ColRef as _ColRef, CountStar, ExprProj, InList, MaxExpr, MinExpr, Neg,
+    ScaledSumExpr,
 )
+from torussql_parser.expr import analyze_expr, render as _render_expr
 from torussql_parser.errors import ValidationError as _OpenValidationError
 from torussql_parser.predicate import LIKE_OPS, NULL_OPS
 from torussql_parser.validate import MAX_SCALAR, check_literal, check_predicate_literal
@@ -114,8 +118,24 @@ class PJoin:
     kind: str = "inner" # "inner" | "left"
 
 
+@dataclass
+class PExpr:
+    """A v0.6 arithmetic expression projection. ``expr`` is the constant-folded
+    tree (``torussql_parser.ast`` nodes) whose column names are already
+    qualified like every other planned column ('inst.col' in a join).
+    ``kind`` is "row" (one value per row, returned as one list like ``a * b``)
+    or "agg" (one value per query/group)."""
+    expr: object
+    kind: str
+    enc: bool
+    depth: int            # sequential ciphertext x ciphertext product levels = owner rounds
+    ct_muls: int          # ciphertext x ciphertext products per row (Beaver triples per row)
+    inversions: int       # owner-assisted inversions (non-constant denominators)
+    text: str
+
+
 PProj = Union[PColRef, PSum, PDot, PCtMul, PScalarMul, PScaledSum, PCountStar,
-              PAvg, PMin, PMax]
+              PAvg, PMin, PMax, PExpr]
 
 
 @dataclass
@@ -198,6 +218,21 @@ class _Scope:
             return self.specs[inst].column(cname)
         except KeyError:
             raise PlanError(f"no such column: {cname!r} in table {inst!r}")
+
+
+def _qualify(e, scope: "_Scope", qn):
+    """Copy of an expression tree with every column name replaced by its planned
+    (qualified) name."""
+    if isinstance(e, _ColRef):
+        inst, col = scope.resolve(e.name)
+        return _ColRef(name=qn(inst, col.name))
+    if isinstance(e, Neg):
+        return Neg(operand=_qualify(e.operand, scope, qn))
+    if isinstance(e, BinOp):
+        return BinOp(op=e.op, left=_qualify(e.left, scope, qn), right=_qualify(e.right, scope, qn))
+    if isinstance(e, AggCall):
+        return AggCall(fn=e.fn, arg=None if e.arg is None else _qualify(e.arg, scope, qn))
+    return e
 
 
 def plan_query(q: Query, catalog: Catalog) -> Plan:
@@ -395,6 +430,12 @@ def _plan_select(q: Select, cat: Catalog) -> Plan:
                 projs.append(PColRef(name=qn(inst, c.name), policy=c.policy))
     else:
         for proj in q.projections:
+            if isinstance(proj, CtMulExpr):
+                # v0.6: `col * col` with a PLAIN factor is a public-scalar product, planned as
+                # an expression; with two encrypted factors it keeps its v0.5 rule below
+                if "plain" in (scope.resolve(proj.left)[1].policy, scope.resolve(proj.right)[1].policy):
+                    proj = ExprProj(expr=BinOp(op="*", left=_ColRef(name=proj.left),
+                                               right=_ColRef(name=proj.right)))
             if isinstance(proj, ColRef):
                 qname, col = _rcol(proj.name)
                 _no_fhe_in_join(is_join, col)
@@ -462,6 +503,14 @@ def _plan_select(q: Select, cat: Catalog) -> Plan:
                 _no_fhe_in_join(is_join, col)
                 projs.append(PScaledSum(scalar=proj.scalar, column=qname,
                                         policy=col.policy))
+            elif isinstance(proj, ExprProj):
+                try:
+                    folded, info = analyze_expr(proj.expr, scope.resolve)
+                except _OpenValidationError as exc:
+                    raise PlanError(str(exc)) from None
+                projs.append(PExpr(expr=_qualify(folded, scope, qn), kind=info.kind,
+                                   enc=info.enc, depth=info.depth, ct_muls=info.ct_muls,
+                                   inversions=info.inversions, text=_render_expr(folded)))
             elif isinstance(proj, CountStar):
                 projs.append(PCountStar())
             elif isinstance(proj, AvgExpr):
@@ -494,12 +543,13 @@ def _plan_select(q: Select, cat: Catalog) -> Plan:
                         "columns and aggregates explicitly")
     agg_like = (not q.star and not q.group_by and any(
         isinstance(p, (PSum, PAvg, PMin, PMax, PCountStar, PDot, PScaledSum,
-                       PScalarMul, PCtMul)) for p in projs))
+                       PScalarMul, PCtMul, PExpr)) for p in projs))
     if agg_like and q.order_by is not None:
         raise PlanError("ORDER BY has no effect on an aggregate result — use GROUP BY "
                         "or select plain rows")
     if (not q.group_by and (q.limit is not None or q.offset is not None)
-            and any(isinstance(p, (PScalarMul, PCtMul)) for p in projs)):
+            and any(isinstance(p, (PScalarMul, PCtMul))
+                    or (isinstance(p, PExpr) and p.kind == "row") for p in projs)):
         raise PlanError("LIMIT/OFFSET do not apply to per-row encrypted expressions "
                         "(k*col, a*b), which are returned as one list")
 

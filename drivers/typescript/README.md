@@ -6,6 +6,15 @@ No-key TorusDB client. Connects to a **keyless** server (wire protocol v2),
 holds the mask vault locally, blinds on insert and unblinds results - the
 server never holds a key and never decrypts.
 
+> **Not yet in this driver (dialect v0.6).** The Python driver/engine evaluates arithmetic
+> expressions (`+ - * /`, products of arbitrary depth, division by public and encrypted values,
+> `SUM(a*b*c)`; [`spec/TorusSQL-Spec-v0.6.md`](../../spec/TorusSQL-Spec-v0.6.md)). This driver
+> offers the v0.5 operations only - `sum`, `avg`, scaling, `dot` and `joinDot` (depth-1
+> Pi_mult) - and has no expression evaluator, no division and no multi-level products. The
+> expressions need **no new RPC** (the wire is unchanged), so a port is purely owner-side work
+> (`core/torusdb_core/expr_eval.py` is the reference). Statements in this README about "one
+> multiplicative level" describe the FHE (pairing) columns and the v0.5 Pi_mult API.
+
 ## Install and first run
 
 Node >= 18, and a running server (Python >= 3.11; from the repository root

@@ -27,10 +27,11 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from fractions import Fraction
 from typing import Any, Sequence
 
 from .ast import (
-    AvgExpr, ColRef, Condition, CountStar, CreateTable, CtMulExpr, Delete,
+    AggCall, AvgExpr, BinOp, ColRef, ExprProj, Lit, Neg, Condition, CountStar, CreateTable, CtMulExpr, Delete,
     DotExpr, DropTable, CreateIndex, DropIndex, Having, InList, Insert, Join, MaxExpr, MinExpr, OrderBy,
     POLICY_KEYWORDS, Proj, Query, ScalarMulExpr, ScaledSumExpr, Select, SumExpr,
     TYPE_KEYWORDS, Update, Where, WHERE_OPS,
@@ -46,7 +47,7 @@ _TOK_RE = re.compile(r"""
     (?P<num>-?[0-9]+)           |
     (?P<str>'(?:[^']|'')*')     |
     (?P<id>[A-Za-z_][A-Za-z_0-9]*) |
-    (?P<sym>==|!=|<>|<=|>=|[(),*=<>?.;])
+    (?P<sym>==|!=|<>|<=|>=|[(),*=<>?.;+\-/])
 """, re.VERBOSE | re.DOTALL)
 
 
@@ -84,6 +85,7 @@ class _P:
     def __init__(self, toks: Sequence[Tok]):
         self.toks = list(toks)
         self.i = 0
+        self.nest = 0           # open parentheses / unary minus signs (bounds recursion)
 
     def peek(self, *, kind: str | None = None, value: Any = None) -> Tok | None:
         if self.i >= len(self.toks):
@@ -108,6 +110,13 @@ class _P:
 
     def eof(self) -> bool:
         return self.i >= len(self.toks)
+
+    def split_neg(self) -> None:
+        """In operator position the tokeniser's negative literal (`a-1` lexes as
+        `a`, `-1`) is really a binary minus: split it into `-` and `1`."""
+        t = self.toks[self.i] if self.i < len(self.toks) else None
+        if t is not None and t.kind == "num" and t.value < 0:
+            self.toks[self.i:self.i + 1] = [Tok("sym", "-", t.pos), Tok("num", -t.value, t.pos)]
 
 
 def parse(sql: str) -> Query:
@@ -496,54 +505,183 @@ def _parse_atom(p: _P) -> list:
     return [Condition(column=col, op=op_tok.value, value=_literal(p, "WHERE value"))]
 
 
-def _parse_proj(p: _P) -> Proj:
-    if p.peek(kind="id", value="COUNT"):
+# ── projections and arithmetic expressions (v0.6) ────────────────────────────
+#
+#   expr    ::= term { ('+' | '-') term }
+#   term    ::= unary { ('*' | '/') unary }
+#   unary   ::= '-' unary | primary
+#   primary ::= int | FRAC(int, int) | colref | '(' expr ')'
+#             | SUM(expr) | AVG(expr) | COUNT(*)
+#   proj    ::= expr | MIN(colref) | MAX(colref) | DOT(colref, colref)
+#
+# The pre-v0.6 projection shapes (col, SUM(col), AVG(col), k*col, k*SUM(col),
+# col*col, COUNT(*)) are still returned as their own AST nodes (_classify);
+# anything else becomes an ExprProj.
+
+MAX_EXPR_HEIGHT = 100     # tree height limit (bounds recursion in every consumer)
+
+
+def _too_deep() -> ParseError:
+    return ParseError(f"expression is nested too deeply (tree height limit {MAX_EXPR_HEIGHT})")
+
+
+def _is_op(p: _P, *ops: str) -> bool:
+    t = p.peek(kind="sym")
+    return t is not None and t.value in ops
+
+
+def _parse_expr(p: _P) -> tuple[Any, int]:
+    left, h = _parse_term(p)
+    while True:
+        p.split_neg()
+        if not _is_op(p, "+", "-"):
+            return left, h
+        op = p.eat().value
+        right, h2 = _parse_term(p)
+        h = max(h, h2) + 1
+        if h > MAX_EXPR_HEIGHT:
+            raise _too_deep()
+        left = BinOp(op=op, left=left, right=right)
+
+
+def _parse_term(p: _P) -> tuple[Any, int]:
+    left, h = _parse_unary(p)
+    while _is_op(p, "*", "/"):
+        op = p.eat().value
+        right, h2 = _parse_unary(p)
+        h = max(h, h2) + 1
+        if h > MAX_EXPR_HEIGHT:
+            raise _too_deep()
+        left = BinOp(op=op, left=left, right=right)
+    return left, h
+
+
+def _enter(p: _P) -> None:
+    p.nest += 1
+    if p.nest > MAX_EXPR_HEIGHT:
+        raise _too_deep()
+
+
+def _parse_unary(p: _P) -> tuple[Any, int]:
+    if _is_op(p, "-"):
         p.eat()
-        p.eat(kind="sym", value="(")
-        p.eat(kind="sym", value="*")
-        p.eat(kind="sym", value=")")
-        return CountStar()
-    for kw, node in (("SUM", SumExpr), ("AVG", AvgExpr),
-                     ("MIN", MinExpr), ("MAX", MaxExpr)):
-        if p.peek(kind="id", value=kw):
-            p.eat()
-            p.eat(kind="sym", value="(")
-            col = _parse_col_ref(p)
-            p.eat(kind="sym", value=")")
-            return node(column=col)
-    if p.peek(kind="id", value="DOT"):
-        p.eat()
-        p.eat(kind="sym", value="(")
-        a = _parse_col_ref(p)
-        p.eat(kind="sym", value=",")
-        b = _parse_col_ref(p)
-        p.eat(kind="sym", value=")")
-        return DotExpr(left=a, right=b)
+        _enter(p)
+        operand, h = _parse_unary(p)
+        p.nest -= 1
+        if isinstance(operand, Lit):
+            return Lit(value=-operand.value), h
+        if h + 1 > MAX_EXPR_HEIGHT:
+            raise _too_deep()
+        return Neg(operand=operand), h + 1
+    return _parse_primary(p)
+
+
+def _contains_agg(e) -> bool:
+    if isinstance(e, AggCall):
+        return True
+    if isinstance(e, BinOp):
+        return _contains_agg(e.left) or _contains_agg(e.right)
+    if isinstance(e, Neg):
+        return _contains_agg(e.operand)
+    return False
+
+
+def _parse_primary(p: _P) -> tuple[Any, int]:
     if p.peek(kind="num"):
-        n = p.eat().value
-        p.eat(kind="sym", value="*")
-        if p.peek(kind="id", value="SUM"):           # k * SUM(col)  — aggregate
-            p.eat()
-            p.eat(kind="sym", value="(")
+        return Lit(value=p.eat().value), 0
+    if _is_op(p, "("):
+        p.eat()
+        _enter(p)
+        e, h = _parse_expr(p)
+        p.eat(kind="sym", value=")")
+        p.nest -= 1
+        return e, h
+    t = p.peek(kind="id")
+    if t is None:
+        raise ParseError(f"could not parse an expression at token {p.peek()}")
+    nxt = p.toks[p.i + 1] if p.i + 1 < len(p.toks) else None
+    is_call = nxt is not None and nxt.kind == "sym" and nxt.value == "("
+    kw = t.value.upper()
+    if kw == "FRAC" and is_call:
+        n, d = _parse_literal(p)[1:]
+        f = Fraction(n, d)
+        return Lit(value=int(f) if f.denominator == 1 else f), 0
+    if is_call:
+        if kw == "COUNT":
+            p.eat(); p.eat(kind="sym", value="(")
+            p.eat(kind="sym", value="*")
+            p.eat(kind="sym", value=")")
+            return AggCall(fn="COUNT"), 0
+        if kw in ("SUM", "AVG"):
+            p.eat(); p.eat(kind="sym", value="(")
+            _enter(p)
+            arg, h = _parse_expr(p)
+            p.nest -= 1
+            p.eat(kind="sym", value=")")
+            if _contains_agg(arg):
+                raise ParseError(f"{kw}(...) cannot contain another aggregate")
+            if h + 1 > MAX_EXPR_HEIGHT:
+                raise _too_deep()
+            return AggCall(fn=kw, arg=arg), h + 1
+        if kw in ("MIN", "MAX", "DOT"):
+            raise ParseError(f"{kw}(...) cannot be used inside an arithmetic expression")
+        raise ParseError(f"unknown function {t.value!r}")
+    if kw in _CLAUSE_WORDS:
+        raise ParseError(f"expected an expression, got keyword {t.value.upper()}")
+    return ColRef(name=_parse_col_ref(p)), 0
+
+
+_CLAUSE_WORDS = frozenset({"FROM", "AS", "WHERE", "GROUP", "HAVING", "LIMIT", "OFFSET",
+                           "JOIN", "ON", "AND", "OR", "SELECT"})
+
+
+def _is_int_lit(e) -> bool:
+    return isinstance(e, Lit) and isinstance(e.value, int) and not isinstance(e.value, bool)
+
+
+def _classify(e) -> Proj:
+    """Map an expression tree back to the pre-v0.6 node types where one exists."""
+    if isinstance(e, ColRef):
+        return e
+    if isinstance(e, AggCall):
+        if e.fn == "COUNT":
+            return CountStar()
+        if isinstance(e.arg, ColRef):
+            return (SumExpr if e.fn == "SUM" else AvgExpr)(column=e.arg.name)
+    if isinstance(e, BinOp) and e.op == "*":
+        if _is_int_lit(e.left):
+            if isinstance(e.right, ColRef):
+                return ScalarMulExpr(scalar=e.left.value, column=e.right.name)
+            if (isinstance(e.right, AggCall) and e.right.fn == "SUM"
+                    and isinstance(e.right.arg, ColRef)):
+                return ScaledSumExpr(scalar=e.left.value, column=e.right.arg.name)
+        if isinstance(e.left, ColRef) and isinstance(e.right, ColRef):
+            return CtMulExpr(left=e.left.name, right=e.right.name)
+    return ExprProj(expr=e)
+
+
+def _parse_proj(p: _P) -> Proj:
+    t = p.peek(kind="id")
+    nxt = p.toks[p.i + 1] if p.i + 1 < len(p.toks) else None
+    if t is not None and nxt is not None and nxt.kind == "sym" and nxt.value == "(":
+        kw = t.value.upper()
+        node = None
+        if kw in ("MIN", "MAX"):
+            p.eat(); p.eat(kind="sym", value="(")
             col = _parse_col_ref(p)
             p.eat(kind="sym", value=")")
-            return ScaledSumExpr(scalar=n, column=col)
-        col = _parse_col_ref(p)                      # k * col       — per-row
-        return ScalarMulExpr(scalar=n, column=col)
-    if p.peek(kind="id"):
-        first = p.eat(kind="id").value
-        # table-qualified ref: t.col [* t2.col2]
-        if p.peek(kind="sym", value="."):
-            p.eat()
-            first_col = p.eat(kind="id").value
-            first = f"{first}.{first_col}"
-        if p.peek(kind="sym", value="*"):
-            p.eat()
-            second = p.eat(kind="id").value
-            if p.peek(kind="sym", value="."):
-                p.eat()
-                second_col = p.eat(kind="id").value
-                second = f"{second}.{second_col}"
-            return CtMulExpr(left=first, right=second)
-        return ColRef(name=first)
-    raise ParseError(f"could not parse projection at token {p.peek()}")
+            node = (MinExpr if kw == "MIN" else MaxExpr)(column=col)
+        elif kw == "DOT":
+            p.eat(); p.eat(kind="sym", value="(")
+            a = _parse_col_ref(p)
+            p.eat(kind="sym", value=",")
+            b = _parse_col_ref(p)
+            p.eat(kind="sym", value=")")
+            node = DotExpr(left=a, right=b)
+        if node is not None:
+            p.split_neg()
+            if _is_op(p, "+", "-", "*", "/"):
+                raise ParseError(f"{kw}(...) cannot be used inside an arithmetic expression")
+            return node
+    e, _h = _parse_expr(p)
+    return _classify(e)

@@ -51,6 +51,17 @@ _SEEDS = [
     "SELECT e.name, d.dname FROM emp e LEFT OUTER JOIN dept AS d ON e.did = d.did WHERE d.dname IN ('a','b')",
     "SELECT a.x FROM t a JOIN t b ON a.p = b.id JOIN u ON u.k = b.k GROUP BY a.x",
     "SELECT DOT(a.x, b.y) FROM a JOIN b ON a.k = b.k",
+    # v0.6 arithmetic expressions
+    "SELECT a*b*c + d/2 FROM t",
+    "SELECT SUM(a*b)/COUNT(*) FROM t",
+    "SELECT (a+b)*(c-d)/FRAC(1,3) AS z FROM t",
+    "SELECT -a, a - -1, a*-2, a-1 FROM t GROUP BY k",
+    "SELECT AVG(a/b+1), SUM(a)*SUM(b) FROM t WHERE x = 1",
+    "SELECT ((((a)))) FROM t",
+    "SELECT SUM(SUM(a)) FROM t",
+    "SELECT a/ FROM t",
+    "SELECT a+*b FROM t",
+    "SELECT MIN(a)+1 FROM t",
     # near-valid joins
     "SELECT * FROM t JOIN",
     "SELECT * FROM t LEFT JOIN u ON",
@@ -175,6 +186,22 @@ def test_parser_deeply_nested_where():
         pass
     except RecursionError as exc:
         pytest.fail(f"parser stack-overflowed on deep WHERE: {exc}")
+
+
+def test_parser_deeply_nested_expressions():
+    """Pathological expression nesting must raise ParseError, never RecursionError."""
+    for sql in ["SELECT " + "(" * 50000 + "a FROM t",
+                "SELECT " + "- " * 50000 + "a FROM t",
+                "SELECT " + "a+" * 50000 + "a FROM t",
+                "SELECT " + "a*(" * 20000 + "a FROM t",
+                "SELECT " + "SUM(" * 20000 + "a FROM t",
+                "SELECT " + "(a" + "+a)" * 20000 + " FROM t"]:
+        try:
+            parse(sql)
+        except ParseError:
+            pass
+        except RecursionError as exc:
+            pytest.fail(f"parser stack-overflowed on a deep expression: {exc}")
 
 
 def test_parser_empty_and_whitespace():

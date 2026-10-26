@@ -649,6 +649,7 @@ class Connection:
                  integrity_anchor=None,
                  integrity_anchor_max_rows: int | None = None,
                  integrity_recheck_seconds: float | None = None,
+                 max_mult_depth: int = 8,
                  timeout: float | None = 30.0):
         if integrity_anchor is not None and not authenticated:
             raise ProgrammingError("integrity_anchor needs authenticated=True")
@@ -684,7 +685,8 @@ class Connection:
                                       fhe_dot_mode=fhe_dot_mode,
                                       integrity_anchor=integrity_anchor,
                                       integrity_anchor_max_rows=integrity_anchor_max_rows,
-                                      integrity_recheck_seconds=integrity_recheck_seconds)
+                                      integrity_recheck_seconds=integrity_recheck_seconds,
+                                      max_mult_depth=max_mult_depth)
             self._amgr = self.client._amgr
             if self._amgr is not None:
                 self._amgr.managed = True
@@ -1215,6 +1217,7 @@ def connect(host: str = "127.0.0.1", port: int = 8533, *,
             integrity_anchor=None,
             integrity_anchor_max_rows: int | None = None,
             integrity_recheck_seconds: float | None = None,
+            max_mult_depth: int = 8,
             timeout: float | None = 30.0) -> Connection:
     """Open a PEP 249 connection to a no-key TorusDB server.
 
@@ -1263,6 +1266,9 @@ def connect(host: str = "127.0.0.1", port: int = 8533, *,
             malicious server could relabel an encrypted column "plain"). Tables
             created through / restored from this client's vault are always
             trusted. A stateless ``mask_cluster`` owner needs this flag.
+        max_mult_depth: the most sequential ciphertext x ciphertext product levels one
+            v0.6 expression may need (default 8). Each level is one batched owner round
+            trip (Π_mult); a deeper expression is refused before any request is sent.
         timeout: socket timeout in seconds (default 30; None = block forever)
     """
     return Connection(host, port, authenticated=authenticated,
@@ -1275,4 +1281,5 @@ def connect(host: str = "127.0.0.1", port: int = 8533, *,
                       fhe_key=fhe_key, fhe_allow_unverified_dot=fhe_allow_unverified_dot,
                       fhe_dot_mode=fhe_dot_mode, integrity_anchor=integrity_anchor,
                       integrity_anchor_max_rows=integrity_anchor_max_rows,
-                      integrity_recheck_seconds=integrity_recheck_seconds, timeout=timeout)
+                      integrity_recheck_seconds=integrity_recheck_seconds,
+                      max_mult_depth=max_mult_depth, timeout=timeout)

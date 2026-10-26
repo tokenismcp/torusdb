@@ -49,13 +49,16 @@ Python packages, shell and server (`python3 --version`; macOS and older Linux of
 > (internal audit: [`docs/crypto-review-packet.md`](docs/crypto-review-packet.md) §11).
 > Read [`docs/threat-model.md`](docs/threat-model.md) before relying on it.
 
-## What it does (dialect v0.5)
+## What it does (dialect v0.6)
 
 ```sql
 CREATE TABLE emp (id INT PLAIN, dept INT PLAIN, salary RATIONAL ENC, rate INT PAIRED, hours INT PAIRED);
 
 SELECT SUM(salary), AVG(salary) FROM emp WHERE dept = 5;           -- encrypted aggregation
 SELECT DOT(rate, hours) FROM emp;                                  -- encrypted × encrypted (depth 1)
+SELECT rate * hours * (rate - 10) + salary / 12 FROM emp;          -- v0.6: + - * /, products of any depth
+SELECT SUM(rate * hours) / COUNT(*) FROM emp;                      -- v0.6: aggregate of a product, then divide
+SELECT rate / hours FROM emp;                                      -- v0.6: division by an encrypted value (exact rational)
 SELECT d.dname, COUNT(*), SUM(e.salary)                            -- joins + grouping + encrypted SUM
   FROM emp e LEFT JOIN dept d ON e.dept = d.dept
  GROUP BY d.dname HAVING COUNT(*) > 1 ORDER BY d.dname LIMIT 10;
@@ -63,11 +66,27 @@ SELECT e.name, m.name FROM emp e JOIN emp m ON e.mgr = m.id;       -- self-join
 UPDATE emp SET salary = FRAC(9500,1) WHERE id = 2;  DELETE FROM emp WHERE dept = 9;
 ```
 
-`INSERT/UPDATE/DELETE`, `SUM AVG MIN MAX COUNT`, `k*col`, `a*b`, `DOT`,
+`INSERT/UPDATE/DELETE`, `SUM AVG MIN MAX COUNT`, `k*col`, `a*b`, `DOT`, **arithmetic expressions
+`+ - * /`** (products of arbitrary depth between `PAIRED` columns, `SUM(a*b*c)`, division by public
+and encrypted values — v0.6, see below),
 `WHERE` (AND/OR/IN/NOT IN/BETWEEN/IS NULL/LIKE) on `PLAIN` columns, `GROUP BY/HAVING`, `ORDER BY/LIMIT/DISTINCT`,
 aliases, `INNER`/`LEFT` joins (any number, self-joins), transactions. Full
 reference and the list of what is *not* supported:
-[`spec/TorusSQL-Spec-v0.5.md`](spec/TorusSQL-Spec-v0.5.md).
+[`spec/TorusSQL-Spec-v0.6.md`](spec/TorusSQL-Spec-v0.6.md).
+
+**Expressions (v0.6) — who computes what.** The server holds blinded cells and does exactly
+two kinds of arithmetic: sums of blinded cells (Π_lin, used for linear `SUM(...)`) and the step
+`e·g mod n` of each Beaver multiplication, on openings that are uniform and independent of the
+data. The **owner** (the driver) unmasks the cells it reads, applies all additions and public
+scalar operations, draws the triples, reconstructs every product and **inverts encrypted
+denominators**. So products and divisions are *not offloaded*: the owner already holds both
+operands, does O(rows) work per product, and the server's step is kept for protocol fidelity and
+the authenticated-mode check ([review packet](docs/crypto-review-packet.md) §3.3, finding F-3).
+Cost: **one batched owner round trip per multiplicative level** (default maximum depth 8,
+`connect(..., max_mult_depth=N)`); intermediates never leave the owner except inside the next
+level's fresh-masked opening. `x / 0` and out-of-range results are errors, never wrong values.
+`FHE` columns keep depth-1 `SUM`/`AVG`/`DOT` and reject deeper products and division.
+The TypeScript and Rust drivers do not evaluate expressions yet.
 
 ## Repository layout
 

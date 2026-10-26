@@ -1,5 +1,9 @@
 # TorusSQL Dialect Specification — v0.5
 
+> **Superseded by [v0.6](TorusSQL-Spec-v0.6.md)** (arithmetic expressions: products of
+> arbitrary depth, division). Everything below keeps its meaning in v0.6; this file is
+> kept for history. Where it says "depth 1" or "no division", v0.6 lifts that limit.
+
 **Status:** current. Supersedes `TorusSQL-Spec-v0.1.md` (kept for history; every
 v0.1–v0.4 statement keeps its meaning — see §9). Conformance is executable:
 `spec/conformance/` (open validator and engine must agree on every case).

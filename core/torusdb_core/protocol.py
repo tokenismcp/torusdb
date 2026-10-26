@@ -158,6 +158,18 @@ class Owner:
         delta = sum(a * r for a, r in zip(coeffs, masks)) % N
         return (blinded_y - delta) % N
 
+    # Π_boot with Boot := inversion (v0.6 division). Inversion is not compatible with
+    # an additive mask, so a masked wire cannot be inverted by the server: the OWNER
+    # removes the mask (or, for an intermediate, already holds the value), inverts in
+    # Z/nZ, and the inverse re-enters the protocol only inside a fresh Beaver opening
+    # (e = z⁻¹ − u, u fresh uniform) — i.e. re-masked. Zero has no inverse: loud error.
+    @staticmethod
+    def invert(s: int) -> int:
+        s %= N
+        if s == 0:
+            raise ZeroDivisionError("division by zero")
+        return pow(s, -1, N)
+
     # Π_mult (Construction 18): open operands against a triple, reconstruct.
     def mult_open(self, s: int, s2: int, triple: Triple) -> tuple[int, int]:
         """Owner → Server: e = s−u, g = s'−v  (both uniform, hide s, s')."""

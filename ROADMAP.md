@@ -3,11 +3,12 @@
 Legend: ✅ shipped · 🚧 partial · ⬜ planned · 🔬 research (no honest construction yet).
 This file states what is *not* done as plainly as what is.
 
-## Shipped (through v0.5)
+## Shipped (through v0.5, plus the unreleased v0.6 dialect)
 
 | Area | Status |
 |---|---|
 | Dialect: DDL/DML, SUM/AVG/MIN/MAX/COUNT, `k*col`, `a*b`, `DOT`, WHERE (AND/OR/IN), GROUP BY/HAVING, ORDER BY/LIMIT/DISTINCT, aliases | ✅ spec v0.5 + executable conformance |
+| **Dialect v0.6 (unreleased)**: arithmetic expressions `+ - * /`, products of arbitrary depth (one batched owner round per level, default max depth 8), division by public and by encrypted values, `SUM(expr)`/`AVG(expr)` | ✅ Python driver/engine + conformance; the owner computes the products (no server offload, F-3), the server only does Π_lin sums and the `e·g` step; not yet in the TypeScript/Rust drivers |
 | Joins: INNER/LEFT, aliases, self-joins, multi-join, grouping over joins | ✅ (hash join at the owner on PLAIN keys) |
 | Exactness contract with loud overflow errors | ✅ |
 | Open parser + validator, engine-agreement tests | ✅ |
@@ -46,7 +47,9 @@ This file states what is *not* done as plainly as what is.
 * ⬜ Multi-owner deployments (needs MPC triple preprocessing).
 * ⬜ Schema migration tooling (ALTER TABLE).
 * 🔬 Encrypted predicates / ordering (needs an FHE comparison circuit).
-* 🔬 Multiplication depth > 1.
+* 🔬 Offloading products to the server (server-resident blinded wires, sub-linear owner work).
+* ⬜ Expressions in the TypeScript and Rust drivers.
+* 🔬 Expressions over `FHE` columns (the pairing scheme has one multiplicative level).
 * 🔬 Access-pattern hiding (ORAM-style) — the largest remaining leakage.
 
 ## Explicit non-goals

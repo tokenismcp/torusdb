@@ -8,6 +8,15 @@ server never holds a key and never decrypts. Programmatic API (no SQL parser;
 that lives in the Python `torussql-parser`); exact mod-n arithmetic via
 `num-bigint`; wire format and framing match the other drivers.
 
+> **Not yet in this driver (dialect v0.6).** The Python driver/engine evaluates arithmetic
+> expressions (`+ - * /`, products of arbitrary depth, division by public and encrypted values,
+> `SUM(a*b*c)`; [`spec/TorusSQL-Spec-v0.6.md`](../../spec/TorusSQL-Spec-v0.6.md)). This driver
+> offers the v0.5 operations only - `sum`, `avg`, scaling, `dot` and `join_dot` (depth-1
+> Pi_mult) - and has no expression evaluator, no division and no multi-level products. The
+> expressions need **no new RPC** (the wire is unchanged), so a port is purely owner-side work
+> (`core/torusdb_core/expr_eval.py` is the reference). Statements in this README about "one
+> multiplicative level" describe the FHE (pairing) columns and the v0.5 Pi_mult API.
+
 ## Install and first run
 
 You need a running server (Python >= 3.11): from the repository root

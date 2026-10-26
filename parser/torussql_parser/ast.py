@@ -114,8 +114,48 @@ class MaxExpr:
     column: str
 
 
+# ── v0.6 expression grammar ──────────────────────────────────────────────────
+# A general arithmetic expression over columns, literals and aggregates.
+# `ColRef` (above) is also the column leaf of an expression tree.
+@dataclass
+class Lit:
+    """A numeric constant (an int, or a Fraction for `FRAC(n, d)` / folded
+    constants)."""
+    value: Any                            # int | fractions.Fraction
+
+
+@dataclass
+class Neg:
+    """Unary minus."""
+    operand: Any
+
+
+@dataclass
+class BinOp:
+    """`left op right` with op in + - * /."""
+    op: str
+    left: Any
+    right: Any
+
+
+@dataclass
+class AggCall:
+    """An aggregate inside an expression: SUM(expr), AVG(expr) or COUNT(*)
+    (``arg`` is None for COUNT(*))."""
+    fn: str                               # "SUM" | "AVG" | "COUNT"
+    arg: Any = None
+
+
+@dataclass
+class ExprProj:
+    """A projection that is a general arithmetic expression (v0.6). The legacy
+    shapes (`col`, `SUM(col)`, `k*col`, `k*SUM(col)`, `a*b`, ...) keep their
+    own node types; ExprProj is produced only for what they cannot express."""
+    expr: Any
+
+
 Proj = Union[ColRef, SumExpr, DotExpr, ScalarMulExpr, ScaledSumExpr, CtMulExpr,
-             CountStar, AvgExpr, MinExpr, MaxExpr]
+             CountStar, AvgExpr, MinExpr, MaxExpr, ExprProj]
 
 # Comparison operators allowed in WHERE (plaintext columns only).
 WHERE_OPS = ("=", "!=", "<>", "<", ">", "<=", ">=")

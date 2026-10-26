@@ -29,15 +29,16 @@ from typing import Any, Callable
 from . import protocol as nokey
 from .protocol import Owner, Server, decode, encode, gen_triple
 
-from .errors import ExecError, IntegrityError, PlanError
+from .errors import DepthLimitExceeded, ExecError, IntegrityError, PlanError
 from .maskstore import DictMaskStore, MaskStore
 from torussql_parser.predicate import compare as _compare
 from .store import MemoryStorage, StoreView, TableStore, TxOverlay
 from .parser import parse
 from .planner import (
-    PAvg, PColRef, PCondition, PCountStar, PCtMul, PDot, PInList, PMax, PMin,
+    PAvg, PColRef, PCondition, PCountStar, PCtMul, PDot, PExpr, PInList, PMax, PMin,
     PScalarMul, PScaledSum, PSum, PWhere, Plan, plan_query,
 )
+from .expr_eval import ExprRunner
 
 N = nokey.N
 
@@ -432,6 +433,14 @@ class NoKeyClient:
     # O(n) decryptions); "auto" = delegated without authentication, local with it.
     fhe_dot_mode: str = "auto"
     _batch_ok: bool = True                     # does the server know update_cells?
+    # v0.6 expressions: the most sequential ciphertext x ciphertext product levels (= owner rounds,
+    # one batched Π_mult exchange each) a single expression may need. Checked at plan time, before
+    # any request is sent; raise it deliberately (each level is one round trip).
+    max_mult_depth: int = 8
+    # cost of the last SELECT's expression projections, summed over them (and over GROUP BY
+    # groups; "depth" is the maximum): {"depth", "mult_rounds", "products", "inversions",
+    # "linear_sums"}; None when the statement had none (for tests and tuning)
+    last_expr_cost: dict | None = field(default=None, init=False, repr=False)
     # Anchored table-state mode (fhe_anchor.py): an ``Anchor`` (or a path -> FileAnchor) holding the
     # owner-trusted root/count/epoch of every table with FHE columns. Needs authenticated=True.
     # None = today's behaviour: NO row-set integrity and NO freshness for FHE tables.
@@ -836,6 +845,14 @@ class NoKeyClient:
     # the owner on plaintext cells; encrypted columns only ever leave the
     # server as blinded scalars (Π_lin / Π_mult), never decrypted there.
     def _select(self, plan: Plan) -> "ResultSet":
+        self.last_expr_cost = None
+        for p in plan.projections or []:
+            if isinstance(p, PExpr) and p.depth > self.max_mult_depth:
+                raise DepthLimitExceeded(
+                    f"expression {p.text!r} needs {p.depth} sequential ciphertext x ciphertext "
+                    f"product levels (one owner round each) but max_mult_depth is "
+                    f"{self.max_mult_depth}; raise max_mult_depth deliberately or restructure "
+                    f"the expression")
         qualified = plan.instances is not None
         inst = plan.instances or {plan.table: plan.table}
         names = list(inst)
@@ -994,7 +1011,7 @@ class NoKeyClient:
         return [decode(s) for s in self._read_verified_scalars(table, col, idxs)]
 
     _AGG = (PSum, PAvg, PCountStar, PScaledSum, PDot, PScalarMul, PCtMul,
-            PMin, PMax)
+            PMin, PMax, PExpr)
 
     def _project(self, plan, inst, names, loc, tuples) -> "ResultSet":
         pos = {a: k for k, a in enumerate(names)}
@@ -1061,6 +1078,8 @@ class NoKeyClient:
             return f"dot({p.left},{p.right})"
         if isinstance(p, PCtMul):
             return f"{p.left}*{p.right}"
+        if isinstance(p, PExpr):
+            return p.text
         return "expr"
 
     # — evaluate one (aggregate / per-row encrypted) projection over tuples —
@@ -1077,6 +1096,8 @@ class NoKeyClient:
 
         if isinstance(p, PCountStar):
             return len(tuples)
+        if isinstance(p, PExpr):
+            return ExprRunner(self, p, inst, names, loc, tuples).run()
         if isinstance(p, PColRef):
             table, bare, all_ids = ids(p.name)
             return self._reveal_col(table, bare, all_ids)
@@ -1220,13 +1241,18 @@ class NoKeyClient:
         return key.decrypt_dot(total)
 
     # — Π_lin: SUM = Σ s̃ᵢ on the server, minus Σ rᵢ at the owner —
-    def _pi_lin_sum(self, table: str, col: str, idxs: list[int]):
+    def _pi_lin_sum_raw(self, table: str, col: str, idxs: list[int]) -> int:
+        """The MAC-verified, UNDECODED sum Σ sᵢ in Z/nZ (v0.6 expressions combine
+        several such sums before the single final decode)."""
         blinded = self.server.blinded_sum(table, col, idxs)
         mask = self.maskstore.sum(table, col, idxs)
         y = self._owner.unblind_affine(blinded, [1], [mask])
         if self.authenticated:
             self._verify_mac(table, col, idxs, y, scale=1, per_row=False)
-        return decode(y)
+        return y
+
+    def _pi_lin_sum(self, table: str, col: str, idxs: list[int]):
+        return decode(self._pi_lin_sum_raw(table, col, idxs))
 
     def _pi_lin_scaled_sum(self, table: str, col: str, idxs: list[int], k: int):
         blinded = self.server.blinded_scaled_sum(table, col, idxs, k)

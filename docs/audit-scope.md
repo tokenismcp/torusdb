@@ -28,7 +28,7 @@ review has been done yet**; everything below the "internal work" heading is our 
 
 | Tier | Component | Path | ~LOC (Python) |
 |---|---|---|---|
-| 1 | Encoding, `Π_lin`, `Π_mult`, MAC | `core/torusdb_core/protocol.py`, `nokey_engine.py` (client side: `_blind_row`, `_update`, aggregates, MAC checks) | ~2.8k |
+| 1 | Encoding, `Π_lin`, `Π_mult`, MAC | `core/torusdb_core/protocol.py`, `nokey_engine.py` (client side: `_blind_row`, `_update`, aggregates, MAC checks), `expr_eval.py` (v0.6 multi-level products and division; review packet 3.3) | ~2.8k |
 | 1 | Server request handling, auth, limits | `server/nokey_server.py`, `server/durability.py`, `parser/torussql_parser` | ~3.4k |
 | 1 | Threshold key custody (DKG, partial decryption, reshare) | `drivers/python/torussql/custody/{group,laurent,shares,dkg,reshare,threshold,proofs,identity,keys}.py` | ~3.1k |
 | 2 | Threshold masks, custodian network service | `custody/{masks,net,quorum}.py` | (incl. above) |

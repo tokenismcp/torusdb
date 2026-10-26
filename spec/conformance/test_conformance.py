@@ -375,3 +375,160 @@ def test_join_engine_rejects(engine, sql):
         engine.run(stmt)
     with pytest.raises(engine.POLICY):
         engine.run(sql)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v0.6  Arithmetic expressions — arbitrary-depth products and division
+# (spec/TorusSQL-Spec-v0.6.md §3, §4, §5)
+# ─────────────────────────────────────────────────────────────────────────────
+def _seed_v06(engine):
+    engine.run(_SCHEMA_SQL)
+    for (i, d, s, r, h, fr, fh) in [(1, 5, 100, 2, 3, "FRAC(1,2)", "FRAC(2,3)"),
+                                    (2, 9, 200, 4, 5, "FRAC(3,4)", "FRAC(1,5)"),
+                                    (3, 9, 300, -6, 7, "FRAC(-5,6)", "FRAC(3,2)")]:
+        engine.run(f"INSERT INTO payroll (id, dept, salary, rate, hours, frate, fhours) "
+                   f"VALUES ({i}, {d}, FRAC({s},1), {r}, {h}, {fr}, {fh})")
+
+
+def test_v06_product_of_depth_three_is_exact(engine):
+    _seed_v06(engine)
+    # ((rate*hours)*rate)*hours per row: (2*3)^2, (4*5)^2, (-6*7)^2
+    assert engine.rows("SELECT rate * hours * rate * hours FROM payroll") \
+        == [[[36, 400, 1764]]]
+    assert engine.rows("SELECT SUM(rate * hours * rate * hours) FROM payroll") == [[36 + 400 + 1764]]
+
+
+def test_v06_mixed_expression(engine):
+    _seed_v06(engine)
+    # (rate+hours)*(rate-hours) + salary/2
+    assert engine.rows("SELECT (rate + hours) * (rate - hours) + salary / 2 FROM payroll") \
+        == [[[(2 + 3) * (2 - 3) + 50, (4 + 5) * (4 - 5) + 100, (-6 + 7) * (-6 - 7) + 150]]]
+
+
+def test_v06_rational_product_chain_is_exact(engine):
+    _seed_v06(engine)
+    assert engine.rows("SELECT frate * fhours * frate FROM payroll") \
+        == [[[Fraction(1, 2) * Fraction(2, 3) * Fraction(1, 2),
+              Fraction(3, 4) * Fraction(1, 5) * Fraction(3, 4),
+              Fraction(-5, 6) * Fraction(3, 2) * Fraction(-5, 6)]]]
+
+
+def test_v06_division_by_public_constant_is_exact(engine):
+    _seed_v06(engine)
+    assert engine.rows("SELECT salary / 8, rate / -3 FROM payroll") \
+        == [[[Fraction(100, 8), Fraction(200, 8), Fraction(300, 8)],
+             [Fraction(2, -3), Fraction(4, -3), Fraction(-6, -3)]]]
+
+
+def test_v06_division_by_encrypted_value_is_an_exact_rational(engine):
+    _seed_v06(engine)
+    assert engine.rows("SELECT rate / hours FROM payroll") \
+        == [[[Fraction(2, 3), Fraction(4, 5), Fraction(-6, 7)]]]
+    assert engine.rows("SELECT SUM(rate * hours) / COUNT(*) FROM payroll") \
+        == [[Fraction(6 + 20 - 42, 3)]]
+    assert engine.rows("SELECT SUM(rate) / SUM(hours) FROM payroll") == [[Fraction(0, 15)]]
+
+
+def test_v06_division_by_zero_is_a_loud_error(engine):
+    _seed_v06(engine)
+    engine.run("UPDATE payroll SET hours = 0 WHERE id = 2")
+    with pytest.raises(engine.ZERO_DIVISION):
+        engine.run("SELECT rate / hours FROM payroll")
+    assert engine.rows("SELECT rate / hours FROM payroll WHERE id <> 2") \
+        == [[[Fraction(2, 3), Fraction(-6, 7)]]]
+    with pytest.raises(engine.ZERO_DIVISION):
+        engine.run("SELECT SUM(rate) / COUNT(*) FROM payroll WHERE id > 99")
+    with pytest.raises(engine.ZERO_DIVISION):          # a denominator that is 0 only at run time
+        engine.run("SELECT rate / (hours - hours) FROM payroll")
+
+
+def test_v06_out_of_budget_results_raise(engine):
+    engine.run("CREATE TABLE big (a INT PAIRED, b INT PAIRED)")
+    engine.run(f"INSERT INTO big (a, b) VALUES ({2 ** 60}, {2 ** 60})")
+    assert engine.rows("SELECT a * b + 0 FROM big") == [[[2 ** 120]]]
+    with pytest.raises(engine.BUDGET):
+        engine.run("SELECT a * b * a FROM big")
+    # an intermediate outside the budget is harmless when the final result is back inside it
+    assert engine.rows("SELECT a * b * a / (a * b) FROM big") == [[[2 ** 60]]]
+
+
+_LEGAL_V06 = [
+    "SELECT rate * hours * rate FROM payroll",
+    "SELECT rate * hours + salary FROM payroll",
+    "SELECT salary * 12 + 1 FROM payroll",
+    "SELECT SUM(rate * hours * rate) FROM payroll",
+    "SELECT SUM(rate * hours) / COUNT(*) FROM payroll",
+    "SELECT SUM(rate) / SUM(hours) FROM payroll",
+    "SELECT SUM(salary * 12 + 1) FROM payroll",
+    "SELECT AVG(rate * hours) FROM payroll",
+    "SELECT salary / 2 FROM payroll",
+    "SELECT rate / hours FROM payroll",
+    "SELECT frate / fhours * rate FROM payroll",
+    "SELECT (rate + hours) * (rate - hours) AS diff_sq FROM payroll",
+    "SELECT -rate / 3 FROM payroll",
+    "SELECT rate * dept FROM payroll",                       # a PLAIN factor: public scalar
+    "SELECT dept, SUM(rate * hours) / COUNT(*) FROM payroll GROUP BY dept",
+    "SELECT SUM(rate * hours) AS dotp, COUNT(*) AS n FROM payroll WHERE dept = 9",
+]
+
+_ILLEGAL_V06 = [
+    "SELECT salary * rate * hours FROM payroll",             # ENC inside a ct x ct product
+    "SELECT rate / salary FROM payroll",                     # ENC denominator
+    "SELECT salary / salary FROM payroll",
+    "SELECT rate / 0 FROM payroll",                          # constant zero denominator
+    "SELECT rate / (2 - 2) FROM payroll",                    # constants fold: still a zero denominator
+    "SELECT id * dept FROM payroll",                         # PLAIN columns only
+    "SELECT id * 2 + dept FROM payroll",
+    "SELECT SUM(id * 2) FROM payroll",
+    "SELECT rate + SUM(rate) FROM payroll",                  # per-row and aggregate mixed
+    "SELECT SUM(rate * hours) / COUNT(*) + rate FROM payroll",
+    "SELECT 1 + 2 FROM payroll",                             # no column
+    "SELECT SUM(rate * hours) FROM payroll ORDER BY id",
+    "SELECT rate * hours * rate FROM payroll LIMIT 1",
+]
+
+_PARSE_ILLEGAL_V06 = [
+    "SELECT MIN(id) + 1 FROM payroll",
+    "SELECT DOT(rate, hours) * 2 FROM payroll",
+    "SELECT SUM(SUM(rate)) FROM payroll",
+    "SELECT rate + FROM payroll",
+    "SELECT (rate FROM payroll",
+    "SELECT sqrt(rate) FROM payroll",
+]
+
+
+@pytest.mark.parametrize("sql", _LEGAL_V06)
+def test_v06_open_validator_accepts_what_engine_accepts(engine, sql):
+    _seed_v06(engine)
+    _open_schema().validate(parse(sql))
+    engine.run(sql)
+
+
+@pytest.mark.parametrize("sql", _ILLEGAL_V06)
+def test_v06_open_validator_rejects_what_engine_rejects(engine, sql):
+    _seed_v06(engine)
+    with pytest.raises(ValidationError):
+        _open_schema().validate(parse(sql))
+    with pytest.raises(engine.POLICY):
+        engine.run(sql)
+
+
+@pytest.mark.parametrize("sql", _PARSE_ILLEGAL_V06)
+def test_v06_parse_errors_agree(engine, sql):
+    from torussql_parser import ParseError
+    with pytest.raises(ParseError):
+        parse(sql)
+    with pytest.raises(engine.PARSE):
+        engine.run(sql)
+
+
+def test_v06_fhe_columns_stay_depth_one_with_a_clear_error():
+    s = Schema()
+    s.apply(parse("CREATE TABLE f (id INT PLAIN, x INT FHE, y INT FHE)"))
+    for sql in ["SELECT SUM(x) FROM f", "SELECT AVG(x) FROM f", "SELECT 3 * SUM(x) FROM f",
+                "SELECT DOT(x, y) FROM f"]:
+        s.validate(parse(sql))
+    for sql in ["SELECT x * y * x FROM f", "SELECT x / 2 FROM f", "SELECT SUM(x) / COUNT(*) FROM f",
+                "SELECT x + 1 FROM f", "SELECT SUM(x * y) FROM f"]:
+        with pytest.raises(ValidationError, match="FHE"):
+            s.validate(parse(sql))
