@@ -6,6 +6,14 @@ Versioning: [Versioning Policy](docs/versioning.md).
 
 ---
 
+## [0.6.2] — 2026-10-28
+
+First public release. Supersedes the unreleased 0.5.0 development line; all packages are
+versioned together from this point (`docs/versioning.md`). Everything below this line was
+previously staged under "Unreleased" across several internal milestones (dialect v0.5 and
+v0.6, the shared-wire Π_C expression evaluator, and FHE-column expressions through v0.6.2)
+and ships together as the first release.
+
 ## [Unreleased]
 
 ### Added - FHE expressions (dialect v0.6.2): bare products accepted, row-level (un-aggregated) products

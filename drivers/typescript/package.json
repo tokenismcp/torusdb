@@ -1,6 +1,6 @@
 {
   "name": "@torusdb/driver",
-  "version": "0.5.0",
+  "version": "0.6.2",
   "description": "No-key TorusDB client for Node/TypeScript \u2014 the server holds no keys and never decrypts",
   "license": "Apache-2.0",
   "author": "J1729 Labs <jlabsrd@gmail.com>",

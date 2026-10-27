@@ -53,7 +53,7 @@ apilevel     = "2.0"     # supports DB-API 2.0
 threadsafety = 2         # threads may share the module and connections (statements are serialized)
 paramstyle   = "format"  # %s positional substitution
 
-__version__ = "0.5.0"
+__version__ = "0.6.2"
 
 __all__ = [
     "connect", "Connection", "Cursor",

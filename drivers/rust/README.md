@@ -1,6 +1,6 @@
 <p align="center"><img src="https://raw.githubusercontent.com/tokenismcp/torusdb/main/assets/logo-128.png" alt="TorusDB" width="96"></p>
 
-# torusdb (Rust) - v0.5.0
+# torusdb (Rust) - v0.6.2
 
 No-key TorusDB client (wire protocol v2). Connects to a **keyless** server,
 holds the mask vault locally, blinds on insert and unblinds results - the

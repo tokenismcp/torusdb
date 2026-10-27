@@ -1,6 +1,6 @@
 <p align="center"><img src="https://raw.githubusercontent.com/tokenismcp/torusdb/main/assets/logo-128.png" alt="TorusDB" width="96"></p>
 
-# @torusdb/driver (TypeScript / Node) - v0.5.0
+# @torusdb/driver (TypeScript / Node) - v0.6.2
 
 No-key TorusDB client. Connects to a **keyless** server (wire protocol v2),
 holds the mask vault locally, blinds on insert and unblinds results - the
@@ -21,8 +21,8 @@ Node >= 18, and a running server (Python >= 3.11; from the repository root
 ```bash
 npm install @torusdb/driver          # once published
 # from a checkout, today:
-cd drivers/typescript && npm ci && npm run build && npm pack     # -> torusdb-driver-0.5.0.tgz
-cd /your/project && npm install /path/to/torusdb-driver-0.5.0.tgz
+cd drivers/typescript && npm ci && npm run build && npm pack     # -> torusdb-driver-0.6.2.tgz
+cd /your/project && npm install /path/to/torusdb-driver-0.6.2.tgz
 # run the bundled example against a server on 127.0.0.1:8533 (needs a fresh server each time):
 cd drivers/typescript && npx ts-node example.ts
 ```

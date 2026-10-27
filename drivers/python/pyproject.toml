@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "torussql"
-version = "0.5.0"
+version = "0.6.2"
 description = "PEP 249 Python driver for TorusDB — encrypted SQL over the no-key delegation protocol"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -23,7 +23,7 @@ classifiers = [
 ]
 
 # Runtime: the client side of the no-key protocol lives in torusdb-core (Apache-2.0).
-dependencies = ["torusdb-core==0.5.0"]
+dependencies = ["torusdb-core==0.6.2"]
 
 [project.optional-dependencies]
 custody = ["py_ecc>=6.0.0,<9.0.0"]

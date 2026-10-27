@@ -72,7 +72,7 @@ from torusdb_core.store import DiskStorage, StoreCorrupt, TxOverlay  # noqa: E40
 import durability as dur                                     # noqa: E402
 import replication as repl                                   # noqa: E402
 
-SERVER_VERSION = "0.5.0"
+SERVER_VERSION = "0.6.2"
 PROTOCOL_VERSION = 2
 
 log = logging.getLogger("torusdb.server")
