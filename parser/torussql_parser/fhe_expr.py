@@ -35,7 +35,9 @@ from fractions import Fraction
 from .ast import AggCall, BinOp, ColRef, Lit, Neg
 from .errors import ValidationError
 
-REJECT_BARE_COLUMN_PRODUCT = True   # see analyze(): SUM(x*y) of two bare FHE columns is spelled DOT(x, y)
+REJECT_BARE_COLUMN_PRODUCT = False  # see analyze(): SUM(x*y) of two bare FHE columns used to be rejected
+                                     # in favour of DOT(x, y); v0.6.2 accepts it through the same fhe_mul
+                                     # path as every other product shape (DOT keeps working unchanged).
 MAX_COEF = 1 << 40            # |k| of an operand coefficient / |c| of its constant (= the dlog bound)
 MAX_COLS = 16                 # distinct columns in one operand
 MAX_PRODUCTS = 16             # product terms in one expression
@@ -96,12 +98,15 @@ class Res:
 
 
 class FheExpr:
-    """A validated FHE expression: an aggregate public-affine combination with >= 1 product term."""
-    __slots__ = ("terms", "const", "products")
+    """A validated FHE expression: a public-affine combination with >= 1 product term, either
+    aggregated (``level="agg"``: ``SUM(L*R)`` / ``AL*AR``) or, when the caller opts in
+    (``analyze(..., allow_row=True)``), per row (``level="row"``: one value per row, ``L*R``
+    un-aggregated, as a projection — e.g. ``SELECT a*b FROM t``, ``SELECT (a+2*b)*(c-d) FROM t``)."""
+    __slots__ = ("terms", "const", "products", "level")
 
     def __init__(self, res: Res):
-        self.terms, self.const = res.terms, res.const
-        self.products = sum(1 for _c, t in res.terms if t[0] in ("sumprod", "aggprod"))
+        self.terms, self.const, self.level = res.terms, res.const, res.level
+        self.products = sum(1 for _c, t in res.terms if t[0] in ("sumprod", "aggprod", "prod"))
 
 
 def _fail(msg: str):
@@ -245,9 +250,13 @@ def _avg(x):
     return Res(s.level, [(_pshift(c, -1), t) for c, t in s.terms], _pshift(s.const, -1))
 
 
-def analyze(expr, resolve, fold) -> tuple[FheExpr, object]:
+def analyze(expr, resolve, fold, allow_row: bool = False) -> tuple[FheExpr, object]:
     """Validate ``expr`` (the unfolded tree) and return ``(FheExpr, folded_tree)``.
-    ``resolve(name) -> (instance, column)``; ``fold`` folds constant subtrees (``expr._fold``)."""
+    ``resolve(name) -> (instance, column)``; ``fold`` folds constant subtrees (``expr._fold``).
+    ``allow_row=True`` (v0.6.2, used only for a row-level *projection*, e.g. ``SELECT a*b FROM t``)
+    additionally accepts a per-row product of two integer-linear forms, un-aggregated: one ciphertext
+    per row, opened by the owner into one value per row — never summed into one GT element. Every
+    existing caller leaves this ``False`` and keeps rejecting a bare per-row product exactly as before."""
     tree = fold(expr)
     seen: list = []
     if (REJECT_BARE_COLUMN_PRODUCT and isinstance(tree, AggCall) and tree.fn == "SUM"
@@ -316,9 +325,15 @@ def analyze(expr, resolve, fold) -> tuple[FheExpr, object]:
             raise _Reject(old_message(seen[0]))
         v = _lin_to_res(v)
     if v.level == "row":
-        if any(t[0] == "prod" for _c, t in v.terms):
-            _fail("a per-row product of FHE columns is not supported; aggregate it: SUM(a*b)")
-        raise _Reject(old_message(seen[0]))
+        prods = [t for _c, t in v.terms if t[0] == "prod"]
+        if not prods:
+            raise _Reject(old_message(seen[0]))
+        if not allow_row:
+            _fail("a per-row product of FHE columns is not supported here; aggregate it: SUM(a*b) "
+                  "(a bare projection such as SELECT a*b FROM t is accepted — see fhe-columns.md)")
+        if len(prods) > MAX_PRODUCTS:
+            _fail(f"at most {MAX_PRODUCTS} products per expression")
+        return FheExpr(v), tree
     prods = [t for _c, t in v.terms if t[0] in ("sumprod", "aggprod")]
     if not prods:
         raise _Reject(old_message(seen[0]))

@@ -228,22 +228,37 @@ def mul_cells(lterms, lconst: int, rterms, rconst: int, mode: str, backend=None)
       the ``4n`` Miller loops are multiplied before ONE final exponentiation per component.
     * ``mode="agg"``: the lists are summed first (they may have different lengths), the result is
       ``(Σ_i L_i)·(Σ_j R_j)``: 4 pairings in total.
+    * ``mode="row"`` (v0.6.2): row aligned, like ``"sum"``, but NOT summed across rows — each row is
+      finalised on its own, so the return value is a ``list[bytes]`` of one DOT blob per row
+      (``L_i·R_i``), the row-level analogue of ``SELECT a*b FROM t`` on PAIRED columns. The owner opens
+      each blob separately with ``decrypt_dot``.
 
     Uses only public ciphertext data and public integers: nobody holding the cells can compute it, it
     needs no key, and the result can be opened only with the owner's secret."""
     be = _be(backend)
-    if mode not in ("sum", "agg"):
-        raise FheError("mode is 'sum' or 'agg'")
+    if mode not in ("sum", "agg", "row"):
+        raise FheError("mode is 'sum', 'agg' or 'row'")
     _check_lin(lterms, lconst)
     _check_lin(rterms, rconst)
     rows = None
-    if mode == "sum":
+    if mode in ("sum", "row"):
         lens = {len(c) for _k, c in list(lterms) + list(rterms)}
         if len(lens) > 1:
             raise FheError("row-aligned operands need cell lists of one length")
         rows = lens.pop() if lens else 0
     left = _lin_halves(lterms, lconst, rows, be, "g2")
     right = _lin_halves(rterms, rconst, rows, be, "g1")
+    one = be.gt_one()
+    if mode == "row":
+        out = []
+        for (d1, d2), (c1, c2) in zip(left, right):
+            acc = [None, None, None, None]
+            for k, (q, p_) in enumerate(((d1, c1), (d1, c2), (d2, c1), (d2, c2))):
+                if be.g1_is_zero(p_) or be.g1_is_zero(q):
+                    continue
+                acc[k] = be.miller(q, p_)
+            out.append(be.tag + b"".join(be.gt_to(be.final(x) if x is not None else one) for x in acc))
+        return out
     acc = [None, None, None, None]
     for (d1, d2), (c1, c2) in zip(left, right):
         for k, (q, p_) in enumerate(((d1, c1), (d1, c2), (d2, c1), (d2, c2))):
@@ -251,7 +266,6 @@ def mul_cells(lterms, lconst: int, rterms, rconst: int, mode: str, backend=None)
                 continue
             m = be.miller(q, p_)
             acc[k] = m if acc[k] is None else be.gt_mul(acc[k], m)
-    one = be.gt_one()
     return be.tag + b"".join(be.gt_to(be.final(x) if x is not None else one) for x in acc)
 
 

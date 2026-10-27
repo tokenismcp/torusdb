@@ -77,9 +77,25 @@ db.last_expr_cost();                                                       // So
 * **Policy rules** (checked before any request, identical to the Python validator and engine): `PLAIN` columns and
   literals are public operands; `ENC`/`PAIRED` columns may appear in any linear position (`+ -`, public scalar multiples,
   division by a public value); a product of two encrypted operands and a division by an encrypted denominator need every
-  encrypted column involved to be `PAIRED`; `STR` and `FHE` columns are rejected (an `FHE` column keeps `sum`, `avg`,
-  `scaled_sum`, `dot` - the error names FHE); a per-row expression needs an `ENC`/`PAIRED` column; per-row columns and aggregates
-  cannot be mixed; constants fold exactly and a constant zero denominator or a constant beyond 2^126 is a `PlanError`.
+  encrypted column involved to be `PAIRED`; `STR` columns are rejected; a per-row expression needs an `ENC`/`PAIRED` column;
+  per-row columns and aggregates cannot be mixed; constants fold exactly and a constant zero denominator or a constant
+  beyond 2^126 is a `PlanError`. An expression referencing an `FHE` column is evaluated through a SEPARATE path (see
+  "Expressions over FHE columns" below) instead of the shared-wire/owner transport above - it never uses a shared wire,
+  since the server holds no key and no share of an FHE column.
+* **Expressions over FHE columns** (dialect v0.6.1/v0.6.2, `src/fhe_expr.rs`, `docs/fhe-columns.md`): `expr()` / `expr_as()`
+  additionally accept a public affine combination of terms where at least one term is an aggregated product of two
+  integer-linear forms of `FHE` columns - `SUM(a*b)`, `SUM((a+2*b)*(c-d))`, `SUM(a)*SUM(b)`, `AVG(a*c)`,
+  `2*SUM(a*b)-SUM(c*d)/4+7` - under a `WHERE` predicate, single table only (`Kind::Interface` across a `join()`).
+  Coefficients/constants are integers with `|k| <= 2^40`, at most 16 columns per operand, at most 16 products per
+  expression. The server (no key, no mask) only ever performs public curve/pairing arithmetic on cells it already
+  stores (a new `fhe_mul` RPC, delegated mode, the default unless authenticated) or serves `fhe_sum`/cells for the
+  owner to multiply itself (local mode, the default once authenticated, exactly like `fhe_dot_mode`); either way the
+  wire carries only table/column names, row ids and the query's small public integers, and the owner opens every GT
+  result with the existing `decrypt_dot`. `Client::last_fhe_expr_cost()` reports `server_products` / `pairings` /
+  `gt_results` / `decrypted_cells` / `products`, kept separate from `last_expr_cost()`. A product of products, division
+  by a non-literal, `FHE` mixed with `PLAIN`/`ENC`/`PAIRED`, a non-aggregated (per-row) FHE value, a non-integer
+  operand coefficient, `COUNT(*)` inside the expression, and an expression with no product term at all are all
+  rejected with a precise `PlanError` before anything is sent.
 * **Transport: `expression_mode`.** `ExprMode::Shared` (the default, exactly as in the Python driver) or `ExprMode::Owner`
   (`ConnectOptions::expression_mode`, `Client::set_expression_mode`). In shared mode every wire of the circuit is a two-party additive sharing and a server with the
   `wire_exec` / `wire_free` RPCs (wire protocol 2.1, advertised in `hello.limits.wires`) is required; against an older server the
@@ -411,8 +427,11 @@ local transaction at once.
 
 * No SQL / PEP 249 cursor; no GROUP BY, ORDER BY, MIN/MAX (`scaled_sum` exists for FHE columns only). v0.6 expressions are
   evaluated one per call (`expr` / `join_expr`) rather than as a SELECT list; `MIN`/`MAX`/`DOT` are not expression operands in
-  either driver, and `FHE` columns are rejected inside an expression (the Python engine's `SUM(f)` / `DOT(f, g)` forms are the
-  `sum()` / `dot()` methods here). Join
+  either driver. An `FHE` column may now appear inside an aggregate expression with at least one product term (see
+  "Expressions over FHE columns" above); a per-row (non-aggregated) use of one, or one mixed with a non-FHE column, is
+  still rejected with the same message as the Python engine's `SUM(f)` / `DOT(f, g)` forms (also still available here as
+  the `sum()` / `dot()` methods, and an un-aggregated per-row FHE projection such as `SELECT a*b FROM t` that the core
+  engine now also accepts is NOT exposed by this driver, matching the TypeScript port). Join
   WHERE over joined tables is a client-side post-filter on PLAIN columns
   (`cmp_in("d", "dname", "=", &v)`).
 * Vault is a plain JSON snapshot written on demand (atomic, 0600, directory

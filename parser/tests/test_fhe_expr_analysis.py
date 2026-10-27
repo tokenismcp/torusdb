@@ -138,15 +138,36 @@ def test_operand_width_is_bounded(schema):
     assert analyze_expr(e, lambda r: ("w", t.column(r)))[1].fhe
 
 
-def test_per_row_products_stay_unavailable(schema):
-    # the projection `a * b` of two FHE columns is rejected by the validator (unchanged since v0.5)
-    with pytest.raises(ValidationError):
-        schema.validate(parse("SELECT a * b FROM t"))
-    # ... and an aggregate-free product written as an expression names the way out
-    with pytest.raises(ValidationError, match="aggregate it"):
-        info(schema, "(a+1)*(b+1)")
-    with pytest.raises(ValidationError, match="aggregate it"):
-        info(schema, "(a+1)*b+2")
+def test_per_row_products_are_now_available(schema):
+    """v0.6.2: a per-row (non-aggregated) product of integer-linear forms of FHE columns is
+    accepted — one ciphertext per row, paired by the server, the owner decrypts each individually
+    (mirrors PAIRED's row-level `a * b`). Everything that stays rejected at the aggregate level
+    (depth-2 products, non-integer coefficients, mixed policies, ...) stays rejected here too."""
+    schema.validate(parse("SELECT a * b FROM t"))
+    # bare `col * col` parses as the dedicated CtMulExpr node, not ExprProj; build the equivalent
+    # BinOp directly (exactly what the validator/planner rewrite it to) to call analyze_expr on it.
+    from torussql_parser.ast import BinOp, ColRef as _CR
+    t = schema.tables["t"]
+    bare = BinOp(op="*", left=_CR(name="a"), right=_CR(name="b"))
+    folded, i = analyze_expr(bare, lambda ref: ("t", t.column(ref)))
+    assert i.fhe and i.kind == "row" and i.enc and i.depth == 0
+    folded, i = info(schema, "(a+1)*(b+1)")
+    assert i.fhe and i.kind == "row"
+    folded, i = info(schema, "(a+1)*b+2")
+    assert i.fhe and i.kind == "row"
+    # a bare per-row FHE value with NO product is still rejected (the dedicated SUM/AVG/k*SUM/DOT forms)
+    with pytest.raises(ValidationError, match="FHE column"):
+        info(schema, "a+1")
+    # depth-2 (a product of a product) stays rejected at row level too
+    deeper = BinOp(op="*", left=bare, right=_CR(name="c"))
+    with pytest.raises(ValidationError, match="product of products"):
+        analyze_expr(deeper, lambda ref: ("t", t.column(ref)))
+    # LIMIT/OFFSET and ORDER BY do not apply to a per-row encrypted expression (same convention as
+    # PAIRED's `a*b` / `k*col`)
+    with pytest.raises(ValidationError, match="LIMIT/OFFSET"):
+        schema.validate(parse("SELECT a*b FROM t LIMIT 1"))
+    with pytest.raises(ValidationError, match="ORDER BY"):
+        schema.validate(parse("SELECT a*b FROM t ORDER BY id"))
 
 
 def test_pre_v061_rejections_keep_their_text(schema):

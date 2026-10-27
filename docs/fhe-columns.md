@@ -94,6 +94,8 @@ SELECT (SUM(rate) + 2*SUM(bonus)) * (SUM(hours) - 1) FROM emp;
 SELECT 2*SUM(rate*hours) - SUM(bonus*hours)/4 + 7 FROM emp;     -- public scale / add / divide AFTER decryption
 SELECT AVG(rate * hours), COUNT(*) FROM emp;                    -- AVG = SUM / n at the owner
 SELECT dept, SUM(2*rate*hours) FROM emp GROUP BY dept;
+SELECT rate * hours FROM emp;                                   -- v0.6.2: ONE ciphertext PER ROW,
+SELECT (rate + bonus) * (hours - 8) FROM emp WHERE dept = 5;     --   not aggregated — see below
 ```
 
 **Accepted** (checked by one function, `torussql_parser.fhe_expr`, shared by the open validator, the planner
@@ -102,18 +104,29 @@ and the evaluator): a public affine combination (`+ - `, `* literal`, `/ nonzero
 `k1*c1 + k2*c2 + ... + k0` of FHE columns (or, for `SUM(c)*SUM(d)`, of their SUMs), aggregated either row by row
 (`SUM(L*R)`) or as aggregates (`AL * AR`). Coefficients and constants are integers with `|k| <= 2^40`, at most 16
 columns per operand, at most 16 products per expression. A plain `SUM(L)` / `SUM(c)` may appear as an extra term.
-One spelling is deliberately kept rejected: `SUM(x * y)` over exactly two bare FHE columns *is* `DOT(x, y)` (use `DOT`); it was
-rejected before v0.6.1 and the v0.5/v0.6 conformance suite and the cross-language expression vectors pin that, so it keeps its
-text. Every other product (`SUM(2*x*y)`, `SUM((x+0)*y)`, `SUM(x*y)*1`) is accepted. The switch is one constant
-(`torussql_parser.fhe_expr.REJECT_BARE_COLUMN_PRODUCT`).
+`SUM(x * y)` over two bare FHE columns gives the same answer as `DOT(x, y)` (v0.6.2: formerly a dedicated special
+case rejecting this one spelling in favour of `DOT`; it now goes through the same `fhe_mul` path as every other
+product — `torussql_parser.fhe_expr.REJECT_BARE_COLUMN_PRODUCT`, `False` by default, still exists to pin the
+pre-v0.6.2 text in a test, flip it back to `True` to restore the old rejection).
+
+**Row-level products (v0.6.2, un-aggregated):** `SELECT L * R FROM t` (and `SELECT a * b FROM t`, the bare
+two-column projection, which used to require PAIRED columns) is accepted for the SAME operand shapes as the
+aggregate case — a depth-1 product of two integer-linear forms of FHE columns — but WITHOUT `SUM`/`AVG`: the
+server pairs each row on its own (one GT ciphertext PER ROW, not summed across rows) and the owner decrypts each
+one individually, exactly mirroring PAIRED's row-level `a * b`. `WHERE` still narrows the row set first. Like
+every other per-row encrypted projection, the result is returned as one list and `LIMIT`/`OFFSET`/`ORDER BY` do
+not apply to it (`ValidationError`, same message as `k * col` / PAIRED's `a * b`). A per-row result cannot be fed
+into a further product or mixed with an aggregate in the same expression (depth-1, and per-row/aggregate levels
+cannot mix) — same rule as the aggregate case, now also enforced here.
 
 **Rejected with a precise message** (never evaluated): a product of a product (`SUM(a*b)*SUM(c)`, `SUM(a*b*c)`,
-`SUM(a)*SUM(b)*SUM(c)`: depth 2), any division whose denominator is not a literal, an `AVG`/sum of terms used as a
-factor, non-integer or oversized operand coefficients (`SUM(a/2*b)` — write `SUM(a*b)/2`), FHE columns together with
-`PLAIN`/`ENC`/`PAIRED` columns, a per-row (non-aggregated) FHE value or product (`a+1`, `(a+1)*(b+1)`; the projection
-`a * b` keeps its v0.5 rejection), joins, `COUNT(*)` inside the expression, expressions with no product. FHE columns hold no
-`NULL` (an INSERT/UPDATE of NULL is refused), so there is no NULL handling to define; an empty selection gives `SUM = 0` and
-`AVG = NULL`, and an expression whose AVG sees no rows is `NULL`.
+`SUM(a)*SUM(b)*SUM(c)`, `(a*b)*c`: depth 2, aggregated or per-row), any division whose denominator is not a
+literal, an `AVG`/sum of terms used as a factor, non-integer or oversized operand coefficients (`SUM(a/2*b)` —
+write `SUM(a*b)/2`), FHE columns together with `PLAIN`/`ENC`/`PAIRED` columns, a bare per-row FHE value with NO
+product (`a+1`; still the dedicated `SUM`/`AVG`/`k*SUM`/`DOT` forms), joins, `COUNT(*)` inside the expression,
+expressions with no product. FHE columns hold no `NULL` (an INSERT/UPDATE of NULL is refused), so there is no
+NULL handling to define; an empty selection gives `SUM = 0` and `AVG = NULL`, and an expression whose AVG sees no
+rows is `NULL`; a row-level product over an empty selection is the empty list.
 
 ### Who computes what
 
@@ -121,7 +134,7 @@ factor, non-integer or oversized operand coefficients (`SUM(a/2*b)` — write `S
 |---|---|---|
 | Parse, validate, plan, choose rows (`WHERE` on PLAIN columns) | owner + server (as for every query) | PLAIN data, the query text |
 | Operand ciphertexts `Enc(L)`, `Enc(R)`: `Σ k·D1`, `Σ k·D2 + c·G2` (G2 half of the left operand) and `Σ k·C1`, `Σ k·C2 + c·G1` (G1 half of the right one); for aggregates the cells of the selected rows are summed first | **server** (default mode) | stored cells + the query's integer literals. Constants are added as "trivial" ciphertexts (randomness 0) |
-| Pairing of the two halves: 4 Miller loops per row for `SUM(L*R)` (multiplied, then ONE final exponentiation per component), 4 pairings in total for `AL*AR` | **server** | the operand points above |
+| Pairing of the two halves: 4 Miller loops per row for `SUM(L*R)` (multiplied, then ONE final exponentiation per component), 4 pairings in total for `AL*AR`, 4 per row finalised SEPARATELY (one GT blob per row, never folded together) for a row-level `L*R` | **server** | the operand points above |
 | Opening a GT result: `c11·c01^-s2·c10^-s·c00^(s·s2)`, one bounded GT discrete log per product term | **owner** (or a custodian quorum for a threshold key) | the GT blob(s) |
 | `SUM(c)` terms | server adds, owner opens (as `SUM`) | — |
 | Public scale / sum / `/ literal` / AVG's `1/n`, in exact `Fraction` arithmetic | **owner**, after decryption | decrypted integers |
@@ -130,13 +143,17 @@ The server holds **no key**, receives **no ciphertext, mask, tag key or plaintex
 request is table/column names, row ids, the two mode strings, a back-end hint and small integers that are literals of
 the query — pinned by the wire audit in `tests/test_fhe_expr.py`), decrypts nothing and re-encrypts nothing. The owner
 never decrypts, re-encrypts or re-uploads an intermediate: there are none, the only intermediate is a GT element
-that the owner opens once. Cost per statement (`conn.client.last_expr_cost`): `server_products` GT blobs,
-`pairings` (4 per row for `SUM(L*R)`), `gt_results` discrete logs (each ≈ √(2·range) GT multiplications, worst case; the
-baby-step table is built once per key), `decrypted_cells` (0 when the server multiplies), `mult_rounds` and `depth`
-always 0 (no owner round trip exists). Pure Python: ≈0.2 s per pairing, i.e. ≈0.8 s per row; native: ≈1 ms per row.
-Request sizes follow `hello.limits.fhe` (`max_dot_rows`, `max_mul_work`, `max_mul_agg_rows`, `recommended_dot_rows`):
-a `SUM(L*R)` is chunked by rows (blobs multiply by bilinearity); an `AL*AR` over more rows than one request allows
-costs `m²` requests for `m` chunks (`Σ_u L_u · Σ_v R_v = Π e(L_u, R_v)`).
+that the owner opens once (a row-level product: one per row — the list of GT elements, not one). Cost per
+statement (`conn.client.last_expr_cost`): `server_products` GT blobs / `fhe_mul` calls, `pairings` (4 per row for
+`SUM(L*R)` and for a row-level `L*R`), `gt_results` discrete logs (each ≈ √(2·range) GT multiplications, worst
+case; the baby-step table is built once per key — one per row for a row-level product), `decrypted_cells` (0 when
+the server multiplies), `mult_rounds` and `depth` always 0 (no owner round trip exists). Pure Python: ≈0.2 s per
+pairing, i.e. ≈0.8 s per row; native: ≈1 ms per row. Request sizes follow `hello.limits.fhe` (`max_dot_rows`,
+`max_mul_work`, `max_mul_agg_rows`, `recommended_dot_rows`): a `SUM(L*R)` or a row-level `L*R` is chunked by rows
+and shares the SAME `max_dot_rows` / `max_mul_work` caps (identical per-row curve cost; a row-level product just
+skips the final fold-together step) — so rows × (terms in both operands) per request is capped exactly as for
+`SUM(L*R)`, giving a configurable bound on total pairings for a query; an `AL*AR` over more rows than one request
+allows costs `m²` requests for `m` chunks (`Σ_u L_u · Σ_v R_v = Π e(L_u, R_v)`).
 
 ### Integrity: authenticated connections verify by recomputing
 

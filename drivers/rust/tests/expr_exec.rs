@@ -420,15 +420,29 @@ fn analyze_expr_sends_nothing_fhe_str_and_enc_rules() {
     let i = db.analyze_expr("an", "p*q*p").unwrap();
     assert_eq!((i.kind, i.enc, i.depth, i.ct_muls, i.inversions, i.text.as_str()), ("row", true, 2, 2, 0, "p*q*p"));
     assert_eq!(db.analyze_expr("an", "SUM(p*q)/SUM(p)").unwrap().depth, 2);
-    for x in ["f*f*f", "f/2", "f+1", "SUM(f)/COUNT(*)", "SUM(f*f)", "p*f*p", "f*2+p"] {
+    for x in ["f*f*f", "f/2", "f+1", "SUM(f)/COUNT(*)", "p*f*p", "f*2+p"] {
         let e = db.analyze_expr("an", x).unwrap_err();
+        assert_eq!(e.kind, Kind::PlanError, "{}: {}", x, e);
+        // "f*f*f" is a depth>1 FHE product (rejected by `fhe_expr.rs` with its own DEPTH message, not
+        // the generic "cannot be used inside an arithmetic expression" one); every other case here
+        // mixes an FHE column with a non-FHE one, a bare aggregate over it, or an unaggregated use -
+        // all still rejected with the old generic message.
         assert!(
-            e.kind == Kind::PlanError && e.message.starts_with("FHE column 'f' cannot be used inside an arithmetic expression"),
+            e.message.starts_with("FHE expression: a product of products")
+                || e.message.starts_with("FHE column 'f' cannot be used inside an arithmetic expression"),
             "{}: {}",
             x,
             e
         );
     }
+    // v0.6.2: `SUM(f*f)` of two bare FHE column references is now accepted (an aggregate product,
+    // `REJECT_BARE_COLUMN_PRODUCT = false` - see `fhe_expr.rs`'s module doc comment for the
+    // deliberate deviation from the stale TypeScript port, which still rejects this one spelling).
+    let fhe_info = db.analyze_expr("an", "SUM(f*f)").unwrap();
+    assert_eq!(
+        (fhe_info.kind, fhe_info.enc, fhe_info.depth, fhe_info.ct_muls, fhe_info.inversions, fhe_info.text.as_str()),
+        ("agg", true, 0, 1, 0, "(fhe expression)")
+    );
     assert!(db.analyze_expr("an", "nm*2+p").unwrap_err().message.contains("STR column 'nm'"));
     assert!(db.analyze_expr("an", "e*p").unwrap_err().message.contains("requires PAIRED columns (column 'e' is ENC)"));
     assert!(db.analyze_expr("an", "p/e").unwrap_err().message.contains("PAIRED"));

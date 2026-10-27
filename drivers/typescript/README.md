@@ -83,9 +83,12 @@ db.lastExprCost;                                                    // { depth, 
 * **Policy rules** (checked before any request, identical to the Python validator and engine): `PLAIN` columns and
   literals are public operands; `ENC`/`PAIRED` columns may appear in any linear position (`+ - `, public scalar multiples,
   division by a public value); a product of two encrypted operands and a division by an encrypted denominator need every
-  encrypted column involved to be `PAIRED`; `STR` columns and `FHE` columns are rejected (an `FHE` column keeps `sum`, `avg`,
-  `scaledSum`, `dot` - the error names FHE); a per-row expression needs an `ENC`/`PAIRED` column; per-row columns and aggregates
-  cannot be mixed; constants fold exactly and a constant zero denominator or a constant beyond 2^126 is a `PlanError`.
+  encrypted column involved to be `PAIRED`; `STR` columns are rejected; a per-row expression over `ENC`/`PAIRED` columns needs
+  at least one such column; per-row columns and aggregates cannot be mixed; constants fold exactly and a constant zero
+  denominator or a constant beyond 2^126 is a `PlanError`. `FHE` columns keep `sum`, `avg`, `scaledSum`, `dot` (the error
+  for any OTHER per-row use still names FHE) plus the v0.6.1 expression shapes below (`SUM(L*R)`, `SUM(A)*SUM(B)`, public
+  affine combinations of those): an expression that references an `FHE` column is routed to that separate analyzer/evaluator
+  automatically, and FHE and non-FHE columns cannot appear together in one expression.
 * **Transport: `expressionMode`.** `"shared"` (the default, exactly as in the Python driver) or `"owner"` (connect option and
   `db.expressionMode = ...`). In shared mode every wire of the circuit is a two-party additive sharing and a server with the
   `wire_exec` / `wire_free` RPCs (wire protocol 2.1, advertised in `hello.limits.wires`) is required; against an older server the
@@ -313,8 +316,32 @@ await db.dot("emp", "rate", "hours", null, "pyecc");                // sum(rate_
 * **Hostile DOT answers.** Before the key's secret is used as an exponent, the components `c00` and `c01*c10`
   of a DOT blob are checked to lie in the target group (order n); otherwise a hostile server could probe
   `s` modulo small prime factors of `p^12 - 1` through success/failure of decryption.
+* **Expressions over FHE columns (v0.6.1/v0.6.2): `db.expr(table, "SUM((a+2*b)*(c-d))")`.** Beyond plain `sum`/`avg`/`scaledSum`/`dot`,
+  `expr()`/`joinExpr()` (single table only - FHE expressions cannot join) accept a public affine combination of terms where
+  at least one term is `SUM(L*R)` (a per-row product of two integer-linear forms of `FHE` columns, aggregated) or
+  `SUM(A)*SUM(B)` (a product of two aggregates), e.g. `SUM((rate+bonus)*hours)`, `SUM(rate)*SUM(hours)`,
+  `2*SUM(a*c)-SUM(b*d)/4+7`, `AVG(a*c)`. Coefficients/constants are integers `|k| <= 2^40`, <= 16 columns per operand,
+  <= 16 products per expression; `SUM(x*y)` of two BARE distinct FHE columns is accepted too (v0.6.2) and is numerically
+  identical to `dot(x, y)` - both go through the same `fhe_mul` path. Rejected with a precise `PlanError`: a product of a
+  product, division by a non-literal, FHE mixed with `PLAIN`/`ENC`/`PAIRED` in one expression, `AVG(a)*AVG(b)`, joins,
+  `COUNT(*)` inside the expression, a per-row FHE value with no product anywhere (e.g. `a+1`), no product at all.
+  The analyzer (`analyzeFheExpr` in `fheExpr.ts`) is a direct port of `parser/torussql_parser/fhe_expr.py`; the server never
+  receives a key, mask or plaintext-derived value - only table/column names, row ids and the query's small integer literals
+  (`fhe_mul`, `proto/fhe-wire.md`). `fheDotMode` picks delegated (the server pairs the ciphertexts; `db.lastFheExprCost` then
+  shows `serverProducts`/`pairings`/`gtResults` > 0, `decryptedCells` 0) vs local (authenticated connections by default: the
+  owner reads and tag-verifies the operand cells/SUMs and multiplies plaintexts itself; `decryptedCells` > 0, no server
+  products) exactly as it does for `dot()`; delegated mode on an authenticated connection has no integrity for the product.
+  `db.lastFheExprCost` (separate from `lastExprCost`, which stays for non-FHE expressions) also carries `products`.
+* **Row-level (non-aggregated) FHE products (v0.6.2): `db.expr(table, "a*b")`, `db.expr(table, "(a+2*b)*(c-d)")`.**
+  The SAME product shapes as above, un-aggregated: one ciphertext per row, finalised by the server's pairing on its
+  own (`fhe_mul` mode `"row"`, a list of blobs instead of one combined blob) and decrypted by the owner individually -
+  the FHE analogue of PAIRED's per-row `a*b`. `expr()` returns an array (one decrypted value per row, in row-id order);
+  there is no `LIMIT`/`ORDER BY` to reject because `expr()`/`joinExpr()` take no such option in the first place (the
+  caller already gets every selected row back as one array). Same caps, same `fheDotMode` rule (local by default when
+  `authenticated`, delegated an explicit opt-in with no integrity) and the same cost fields as the aggregate case.
 * **Not supported (rejected like the Python engine):** predicates / ORDER / GROUP / MIN / MAX / indexes /
-  JOIN on FHE columns, per-row `k*col`, non-integer or NULL values, booleans, strings, binary values.
+  JOIN on FHE columns, a per-row FHE value with no product anywhere, non-integer or NULL values,
+  booleans, strings, binary values.
   Tables learned from the server stay read-only unless trusted (`trustTable`), as for every other policy.
 * **Performance** (Node 24, Apple silicon): 100 encryptions about 0.1-0.25 s after a 50 ms table build,
   about 4-8 ms per cell decryption, DOT-result decryption about 20-60 ms; the GT baby-step table for range
@@ -427,7 +454,8 @@ interleave inside a transaction. Calls made *inside* `transaction(fn)` re-enter.
 * ORDER BY / GROUP BY / MIN / MAX are not provided (JOIN, SUM, AVG, COUNT,
   DOT and v0.6 expressions are; `scaledSum` exists for FHE columns only). Expressions are evaluated one per call
   (`expr` / `joinExpr`) rather than as a SELECT list, and `MIN`/`MAX`/`DOT` are not expression operands in either driver;
-  `FHE` columns are rejected inside an expression (the Python engine's `SUM(f)` / `DOT(f, g)` forms are the `sum()` / `dot()` methods here). Join WHERE over joined tables is a client-side
+  a bare `FHE` column outside the v0.6.1 product shapes above is rejected inside an expression (the Python engine's plain
+  `SUM(f)` / `DOT(f, g)` forms are the `sum()` / `dot()` methods here; `FHE` expressions cannot join). Join WHERE over joined tables is a client-side
   post-filter on PLAIN columns (`eq("dname", "Eng", "d")`).
 * No client certificates (mutual TLS) option yet.
 * Integers from the server are limited to 90 digits; sums over > 100 000 rows

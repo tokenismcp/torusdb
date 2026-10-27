@@ -367,10 +367,16 @@ class Schema:
         elif isinstance(proj, CtMulExpr):
             _i, a = scope.resolve(proj.left, "col * col")
             _j, b = scope.resolve(proj.right, "col * col")
-            if "plain" in (a.policy, b.policy):
-                # v0.6: a PLAIN factor makes it a public-scalar product (an expression)
+            if "plain" in (a.policy, b.policy) or (a.policy == "fhe" and b.policy == "fhe"):
+                # v0.6: a PLAIN factor makes it a public-scalar product (an expression).
+                # v0.6.2: two FHE columns is a per-row FHE product (one ciphertext per row,
+                # the server pairs them, keyless) — also routed through the general expression path.
                 self._expr_info(scope, ExprProj(expr=BinOp(
                     op="*", left=ColRef(name=proj.left), right=ColRef(name=proj.right))))
+            elif a.policy == "fhe" or b.policy == "fhe":
+                raise ValidationError(
+                    f"col * col ({a.name} * {b.name}) cannot mix an FHE column with "
+                    f"ENC/PAIRED — use two FHE columns or two PAIRED columns")
             elif a.policy != "paired" or b.policy != "paired":
                 raise ValidationError(
                     f"ciphertext × ciphertext ({a.name} * {b.name}) requires "

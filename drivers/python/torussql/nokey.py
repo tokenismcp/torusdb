@@ -299,9 +299,16 @@ class RemoteNoKeyServer:
         return _b64d(self._c.call("fhe_dot", args))
 
     def fhe_mul(self, table, mode, ids, ids_r, lterms, lconst, rterms, rconst, backend=None):
-        """Product of two integer-linear operands over FHE columns (v0.6.1): public data only."""
+        """Product of two integer-linear operands over FHE columns: public data only.
+        ``mode="row"`` (v0.6.2) returns one DOT blob per row (a ``list[bytes]``), un-aggregated;
+        ``"sum"``/``"agg"`` return a single aggregated DOT blob."""
         args = [table, mode, ids, ids_r, lterms, lconst, rterms, rconst] + ([backend] if backend else [])
-        return _b64d(self._c.call("fhe_mul", args))
+        reply = self._c.call("fhe_mul", args)
+        if mode == "row":
+            if not isinstance(reply, list):
+                raise OperationalError("fhe_mul: mode 'row' must reply with a list of blobs")
+            return [_b64d(x) for x in reply]
+        return _b64d(reply)
 
     def fhe_rows(self, table, start, count):
         """Scan of an anchored table (see ``torusdb_core.fhe_anchor``): -> (slots, rows) exactly

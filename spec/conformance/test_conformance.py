@@ -526,9 +526,28 @@ def test_v06_fhe_columns_stay_depth_one_with_a_clear_error():
     s = Schema()
     s.apply(parse("CREATE TABLE f (id INT PLAIN, x INT FHE, y INT FHE)"))
     for sql in ["SELECT SUM(x) FROM f", "SELECT AVG(x) FROM f", "SELECT 3 * SUM(x) FROM f",
-                "SELECT DOT(x, y) FROM f"]:
+                "SELECT DOT(x, y) FROM f",
+                # v0.6.2: SUM(x*y) of two bare FHE columns is accepted through the same fhe_mul path
+                # as every other product shape (DOT(x, y) keeps working unchanged, same answer).
+                "SELECT SUM(x * y) FROM f"]:
         s.validate(parse(sql))
     for sql in ["SELECT x * y * x FROM f", "SELECT x / 2 FROM f", "SELECT SUM(x) / COUNT(*) FROM f",
-                "SELECT x + 1 FROM f", "SELECT SUM(x * y) FROM f"]:
+                "SELECT x + 1 FROM f"]:
         with pytest.raises(ValidationError, match="FHE"):
             s.validate(parse(sql))
+
+
+def test_v06_1_bare_fhe_product_matches_dot():
+    """SUM(x*y) of two bare FHE columns gives the exact product-of-sums result, same as DOT(x, y) —
+    depth-1 is still enforced: a product OF a product (SUM(x*y)*z-style) stays rejected above."""
+    from torusdb_core import fhe
+    from torusdb_core.nokey_engine import NoKeyClient, NoKeyServer
+    key = fhe.FheKey(value_range=10_000)
+    c = NoKeyClient(NoKeyServer(), fhe=key)
+    c.execute("CREATE TABLE f (id INT PLAIN, x INT FHE, y INT FHE)")
+    rows = [(1, 3, 4), (2, -5, 7), (3, 11, -2)]
+    for i, x, y in rows:
+        c.execute(f"INSERT INTO f (id, x, y) VALUES ({i}, {x}, {y})")
+    want = sum(x * y for _i, x, y in rows)
+    assert c.execute("SELECT SUM(x * y) FROM f").rows == [[want]]
+    assert c.execute("SELECT DOT(x, y) FROM f").rows == [[want]]

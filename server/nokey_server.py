@@ -1475,8 +1475,8 @@ class Engine:
         stored cells, the literals of the query) — see ``NoKeyServer.fhe_mul_prepare``. The server
         receives no ciphertext and no secret: only names, row ids and small integers."""
         from torusdb_core import fhe, fhe_backend
-        if mode not in ("sum", "agg"):
-            raise BadRequest("fhe_mul: mode is 'sum' or 'agg'")
+        if mode not in ("sum", "agg", "row"):
+            raise BadRequest("fhe_mul: mode is 'sum', 'agg' or 'row'")
         lim = fhe.MUL_MAX_K
 
         def terms(t, what):
@@ -1499,9 +1499,9 @@ class Engine:
             if isinstance(c_, bool) or not isinstance(c_, int) or abs(c_) > lim:
                 raise BadRequest("fhe_mul: a constant is an integer with |c| <= 2^40")
         a = self._check_ids(table, ids)
-        b = a if mode == "sum" else self._check_ids(table, ids_r)
-        if mode == "sum" and ids_r is not None:
-            raise BadRequest("fhe_mul: mode 'sum' takes one id list")
+        b = a if mode in ("sum", "row") else self._check_ids(table, ids_r)
+        if mode in ("sum", "row") and ids_r is not None:
+            raise BadRequest(f"fhe_mul: mode {mode!r} takes one id list")
         if backend is not None and backend not in ("pyecc", "mcl"):
             raise BadRequest("backend must be 'pyecc' or 'mcl'")
         try:
@@ -1513,7 +1513,11 @@ class Engine:
         native = be.name == "mcl"
         if len(set(a)) != len(a) or len(set(b)) != len(b):
             raise BadRequest("fhe_mul takes distinct row ids")
-        if mode == "sum":
+        if mode in ("sum", "row"):
+            # "row" does exactly the same per-row pairing work as "sum" (it is simply not
+            # summed across rows afterwards), so it shares the same row / row-term caps — rows
+            # times the number of terms in both operands is the number of per-row curve
+            # operations, capped by fhe_max_mul_work(_native) to avoid an unbounded-cost query.
             cap = self.cfg.fhe_max_dot_rows_native if native else self.cfg.fhe_max_dot_rows
             work = self.cfg.fhe_max_mul_work_native if native else self.cfg.fhe_max_mul_work
             if len(a) > cap or len(a) * max(1, len(lterms) + len(rterms)) > work:
@@ -1525,12 +1529,14 @@ class Engine:
                 raise BadRequest(f"fhe_mul takes at most {cap} rows per operand with the {be.name} "
                                  f"back end")
         try:
-            run = self.srv.fhe_mul_prepare(table, mode, a, None if mode == "sum" else b,
+            run = self.srv.fhe_mul_prepare(table, mode, a, None if mode in ("sum", "row") else b,
                                            lterms, lconst, rterms, rconst, be.name)
         except Exception as exc:                                  # noqa: BLE001
             if type(exc).__name__ == "ExecError":
                 raise BadRequest(str(exc)) from None
             raise
+        if mode == "row":
+            return lambda: [_b64e(blob) for blob in run()]
         return lambda: _b64e(run())
 
     # — shared wires: stored cells of the named rows as ring elements (internal; reached only

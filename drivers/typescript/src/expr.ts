@@ -312,7 +312,7 @@ export interface ExprInfo {
 interface Sum { kind: "const" | "row" | "agg"; cols: ExprColumn[]; depth: number; muls: number; invs: number }
 const CONST: Sum = { kind: "const", cols: [], depth: 0, muls: 0, invs: 0 };
 
-function checkConst(v: Frac): void {
+export function checkConst(v: Frac): void {
   const n = v.num < 0n ? -v.num : v.num;
   if (n > MAX_SCALAR || v.den > MAX_SCALAR) {
     throw planErr(`constant ${fStr(v)} is out of range (|numerator|, denominator <= 2^126): a larger ` +

@@ -111,14 +111,34 @@ def test_sql_in_process():
     assert not any(b"\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x28" in x for x in cells)
 
 
+def test_row_level_fhe_products_sql_in_process():
+    """v0.6.2: SELECT L*R FROM t on FHE columns -- one ciphertext per row, the server pairs it
+    (keyless), the owner decrypts each individually. Mirrors PAIRED's row-level `a*b`."""
+    srv = NoKeyServer()
+    c = NoKeyClient(srv, fhe=KEY)
+    rows = seed(c)
+    want = [r[2] * r[3] for r in rows]
+    assert c.execute("SELECT rate * hours FROM emp").rows == [[want]]
+    want2 = [(r[2] + 1) * (r[3] - 5) for r in rows]
+    assert c.execute("SELECT (rate+1)*(hours-5) FROM emp").rows == [[want2]]
+    # WHERE narrows the rows first
+    sel = [r for r in rows if r[1] == 5]
+    assert c.execute("SELECT rate * hours FROM emp WHERE dept = 5").rows == [
+        [[r[2] * r[3] for r in sel]]]
+    # the full wire audit (what reaches the server) for this shape lives in test_fhe_expr.py
+
+
 def test_sql_rules_are_enforced_by_validator_and_planner():
     from torussql_parser import Schema, ValidationError, parse
     sch = Schema()
     sch.apply(parse("CREATE TABLE t (id INT PLAIN, a INT FHE, b INT FHE, p INT PAIRED, r RATIONAL ENC)"))
     for ok in ("SELECT SUM(a) FROM t", "SELECT DOT(a, b) FROM t", "SELECT AVG(a), COUNT(*) FROM t",
-               "SELECT a FROM t WHERE id = 1"):
+               "SELECT a FROM t WHERE id = 1",
+               # v0.6.2: a bare per-row product of two FHE columns is now a feature (one ciphertext
+               # per row, the server pairs it, keyless) — mirrors PAIRED's row-level `a * b`.
+               "SELECT a * b FROM t"):
         sch.validate(parse(ok))
-    for bad in ("SELECT DOT(a, p) FROM t", "SELECT 2 * a FROM t", "SELECT a * b FROM t",
+    for bad in ("SELECT DOT(a, p) FROM t", "SELECT 2 * a FROM t", "SELECT a * p FROM t",
                 "SELECT SUM(a) FROM t WHERE a = 1", "SELECT id FROM t ORDER BY a",
                 "SELECT MIN(a) FROM t", "SELECT SUM(a) FROM t t1 JOIN t t2 ON t1.id = t2.id"):
         with pytest.raises(ValidationError):

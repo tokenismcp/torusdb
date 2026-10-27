@@ -8,6 +8,73 @@ Versioning: [Versioning Policy](docs/versioning.md).
 
 ## [Unreleased]
 
+### Added - FHE expressions (dialect v0.6.2): bare products accepted, row-level (un-aggregated) products
+
+- `SUM(x*y)` of two bare `FHE` columns now gives the same answer as `DOT(x, y)` — it is no longer a
+  dedicated rejected spelling (`torussql_parser.fhe_expr.REJECT_BARE_COLUMN_PRODUCT` defaults to
+  `False`; it still exists so a test can pin the pre-v0.6.2 text). `DOT` itself is unchanged.
+- **Row-level (un-aggregated) FHE products**: `SELECT L*R FROM t` for the same accepted operand shapes
+  as the aggregate case (a depth-1 product of two integer-linear forms of `FHE` columns) — including
+  the bare `SELECT a*b FROM t`, which used to require two `PAIRED` columns. The server pairs each row on
+  its own (one GT ciphertext PER ROW, never folded together) and the owner decrypts each individually,
+  exactly mirroring `PAIRED`'s row-level `a*b`. `WHERE` narrows the row set first; `LIMIT`/`OFFSET`/
+  `ORDER BY` do not apply to the result (same convention as `k*col`/`a*b` on `PAIRED` columns, and the
+  same error). Shares the aggregate case's grammar, operand bounds, cost accounting
+  (`conn.client.last_expr_cost`) and server-side caps (`fhe_max_mul_work(_native)`, `fhe_max_dot_rows(_native)`
+  — the per-row curve cost is identical to `SUM(L*R)`, only the final fold-together step differs) via a
+  new `mode="row"` of the `fhe_mul` RPC (same wire audit, extended in `tests/test_fhe_expr.py`).
+  Authenticated connections verify locally by default and require an explicit opt-in
+  (`fhe_dot_mode="delegated"`) for a server-computed per-row product, exactly as for `DOT` and the
+  aggregate shapes.
+- `docs/fhe-review-log.md` Round 4: a dedicated attempt at Q4 (a sound, owner-cheap integrity check for
+  a delegated pairing product) — no construction was found; the structural reason is written up, and the
+  documented state (local recomputation by default, delegated only by explicit, unauthenticated-equivalent
+  opt-in) is unchanged and now explicitly covers the row-level shape too.
+
+### Added - TypeScript driver: expressions over `FHE` columns (dialect v0.6.1)
+
+- `Client.expr()` / `joinExpr()` now accept the v0.6.1 shapes of `docs/fhe-columns.md` ("Expressions over FHE columns")
+  when the expression references an `FHE` column: a public affine combination of terms where at least one is `SUM(L*R)`
+  (a per-row product of two integer-linear forms, aggregated) or `SUM(A)*SUM(B)` (a product of two aggregates), e.g.
+  `SUM((rate+bonus)*hours)`, `SUM(rate)*SUM(hours)`, `2*SUM(a*c)-SUM(b*d)/4+7`, `AVG(a*c)`. New `src/fheExpr.ts`
+  (`analyzeFheExpr`, `referencesFheColumn`) is a direct port of `parser/torussql_parser/fhe_expr.py`'s accept/reject
+  matrix (same limits: `|k| <= 2^40`, <= 16 columns/operand, <= 16 products/expression; `SUM(x*y)` of two bare FHE
+  columns stays rejected, spelled `dot(x, y)`). The evaluator (new private methods on `Client` in `torusdb.ts`) calls the
+  server's `fhe_mul` RPC (delegated mode: the server pairs the ciphertexts, the owner opens one GT discrete log per
+  product term) or reads/verifies the operand cells and multiplies locally (`fheDotMode: "local"`, the default on
+  authenticated connections), exactly as `dot()` already does; the server never receives a key, mask or plaintext-derived
+  value. New `Client.lastFheExprCost` (`serverProducts`, `pairings`, `gtResults`, `decryptedCells`, `products`), separate
+  from `lastExprCost`. `hello.limits.fhe` gains optional `maxMulWork` / `maxMulAggRows` (per back end). New
+  `test/fheExpr.test.ts`: the static accept/reject matrix, delegated vs. local evaluation, a wire audit of `fhe_mul`
+  requests, and a cross-language check against the Python engine via an extended `drivers/expr_peer.py`
+  (`fhe_key`, `fhe_dot_mode`, and the FHE cost fields).
+- **v0.6.2 catch-up**: the TypeScript driver now matches the core dialect for both v0.6.2 changes above —
+  `SUM(x*y)` of two bare `FHE` columns is accepted (`REJECT_BARE_COLUMN_PRODUCT = false` in `src/fheExpr.ts`,
+  numerically identical to `dot(x, y)`), and row-level (un-aggregated) FHE products (`db.expr(table, "a*b")`,
+  `fhe_mul` mode `"row"`) are supported end to end, including the authenticated-local-by-default /
+  delegated-opt-in-has-no-integrity rule for the row shape.
+
+### Added - Rust driver: expressions over `FHE` columns (dialect v0.6.1/v0.6.2 parity with the TypeScript port)
+
+- `Client::expr()` / `expr_as()` now accept the same FHE-column shapes as the TypeScript port above, through a new
+  parallel path (`src/fhe_expr.rs`: the analyzer, a line-for-line port of `parser/torussql_parser/fhe_expr.py`'s
+  `Lin`/`Res`/polynomial-in-`n` structures onto a `BTreeMap<i32, Frac>`/`Vec<(String, Frac)>` idiom; `src/fhe_expr_eval.rs`:
+  the owner-side evaluator and the `fhe_mul` RPC) dispatched in `Client::expr_plan` ahead of the shared-wire/owner
+  transport whenever the expression references an `FHE` column; single table only (`Kind::Interface` across a
+  `join()`). Delegated mode (the default unless authenticated) chunks `fhe_mul` per `hello.limits.fhe`'s new
+  `max_mul_work` / `max_mul_agg_rows` and decrypts the GT reply with the existing `FheKey::decrypt_dot` (same blob
+  shape as `fhe_dot`); local mode (the default once authenticated) reuses the existing `fhe_reveal`/`fhe_sum` and
+  multiplies plaintexts, range-checked like the server's bounded discrete log. New `Client::last_fhe_expr_cost()`
+  (`FheExprCost { server_products, pairings, gt_results, decrypted_cells, products }`), kept separate from
+  `last_expr_cost()` since FHE expressions never use shared wires. New `tests/fhe_expr.rs`: the static accept/reject
+  matrix, end-to-end evaluation (delegated and local, WHERE filtering, affine combinations, `AVG`), a wire audit of
+  `fhe_mul` requests, and a cross-language check against the Python engine via `drivers/expr_peer.py`. One deliberate
+  divergence from the TypeScript port, which still pins `SUM(x*y)` of two bare FHE columns as rejected: this Rust port
+  follows the CURRENT `parser/torussql_parser/fhe_expr.py` (`REJECT_BARE_COLUMN_PRODUCT = False`, v0.6.2), so that
+  spelling is accepted here (see `src/fhe_expr.rs`'s module doc comment). The core engine's row-level (un-aggregated)
+  FHE projection (`SELECT a*b FROM t`, `fhe_mul` mode `"row"`, added above) is, like in the TypeScript port, not
+  exposed by this driver's `expr`/`expr_as`/`join_expr` entry points.
+
 ### Changed - TypeScript and Rust drivers: shared-wire expressions (wire protocol 2.1), the new default
 
 - `Client.connect(..., { expressionMode: "shared" | "owner" })` (TypeScript; property `db.expressionMode`) and

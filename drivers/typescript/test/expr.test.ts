@@ -8,6 +8,7 @@ import * as fs from "fs";
 import {
   parseExpression, analyzeExpression, renderExpr, scopeResolver, frac, Expr, ExprColumn, MAX_EXPR_HEIGHT,
 } from "../src/expr";
+import { analyzeFheExpr, referencesFheColumn } from "../src/fheExpr";
 import { TorusError } from "../src/errors";
 import { EXPR_VECTORS } from "./helpers";
 
@@ -27,7 +28,17 @@ test("static vectors: every expression is accepted or rejected exactly like the 
     const resolve = scopeOf(c.scope);
     const run = () => {
       const tree = parseExpression(c.expr);
-      return analyzeExpression(tree, (r) => resolve(r).col);
+      const col = (r: string) => resolve(r).col;
+      // mirrors `torussql_parser.expr.analyze_expr`'s single entry point: dispatch to the FHE analyzer
+      // (allow_row=True, its only caller) before the plain one when an FHE column is referenced.
+      if (referencesFheColumn(tree, col)) {
+        const fhe = analyzeFheExpr(tree, col, true);
+        return {
+          expr: fhe.tree,
+          info: { kind: fhe.level, enc: true, depth: 0, ctMuls: fhe.products, inversions: 0, text: renderExpr(fhe.tree) },
+        };
+      }
+      return analyzeExpression(tree, col);
     };
     if (c.error === "ParseError") {
       assert.throws(run, kind("ParseError"), where);

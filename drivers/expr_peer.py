@@ -4,6 +4,8 @@
 
 usage: expr_peer.py HOST PORT JSON
   JSON = {"auth": bool, "mode"?: "owner" | "shared",
+          "fhe_key"?: {"secret": "<64 hex chars>", "range": int},
+          "fhe_dot_mode"?: "auto" | "local" | "delegated",
           "tables": [{"name", "columns": [[n, type, policy]...], "rows": [["1", "3/4", null]...]}],
           "queries": [{"table", "expr", "where"?: {"col","op","val"}, "max_depth"?: int}]}
 
@@ -16,6 +18,12 @@ mode "owner" (the default here, as before) is the owner-computed transport; mode
 Python default (shared wires, Pi_C): the cost then also carries openings / wires / requests / reveals and every
 result (also an error) carries "trace", the sha256 of the shape of every wire request the Python owner sent
 (drivers/wire_shape.py), so the other drivers can be compared structure for structure.
+
+`fhe_key` makes this peer the OWNER of FHE columns too (v0.6.1 expressions over `FHE` columns,
+`docs/fhe-columns.md`): pass the same secret/range the other driver's test uses so both decrypt the
+same cells. `fhe_dot_mode` picks delegated-vs-local exactly like the connection option of the same name
+(TS/Rust `fheDotMode`); default "auto". When the FHE evaluator ran, the cost dict additionally carries
+`server_products`, `pairings`, `gt_results`, `decrypted_cells` (`docs/fhe-columns.md` "Who computes what").
 """
 import json
 import sys
@@ -27,6 +35,7 @@ from torussql_parser.ast import ExprProj
 
 _pp._classify = lambda e: ExprProj(expr=e)       # the expression path for every shape (as the other drivers)
 
+from torusdb_core import fhe                                                               # noqa: E402
 from torusdb_core.errors import DepthLimitExceeded, DivisionByZero, IntegrityError, PlanError  # noqa: E402
 from torusdb_core.protocol import OutOfBudget                                              # noqa: E402
 import wire_shape                                                                          # noqa: E402
@@ -59,7 +68,15 @@ def cls(exc):
 
 def main():
     host, port, spec = sys.argv[1], int(sys.argv[2]), json.loads(sys.argv[3])
-    conn = torussql.connect(host, port, authenticated=bool(spec.get("auth")), timeout=240.0)
+    fhe_key = None
+    fk = spec.get("fhe_key")
+    if fk:
+        fhe_key = fhe.FheKey(int(fk["secret"], 16), value_range=fk["range"])
+    kwargs = {}
+    if spec.get("fhe_dot_mode"):
+        kwargs["fhe_dot_mode"] = spec["fhe_dot_mode"]
+    conn = torussql.connect(host, port, authenticated=bool(spec.get("auth")), timeout=240.0,
+                             fhe_key=fhe_key, **kwargs)
     cli = conn.client
     mode = spec.get("mode", "owner")
     cli.expr_mode = mode
@@ -108,6 +125,9 @@ def main():
                                "inversions": c["inversions"], "linear_sums": c["linear_sums"]}
                 if mode == "shared":
                     for k in ("openings", "wires", "requests", "reveals"):
+                        res["cost"][k] = c[k]
+                for k in ("server_products", "pairings", "gt_results", "decrypted_cells"):
+                    if k in c:
                         res["cost"][k] = c[k]
             if mode == "shared":
                 res["trace"] = wire_shape.digest(trace)

@@ -287,10 +287,17 @@ R("analyzeExpr reports kind/depth/cost without a request; FHE columns are reject
   const n0 = rec.log.length;
   assert.deepEqual(db.analyzeExpr(t, "p*q*p"), { kind: "row", enc: true, depth: 2, ctMuls: 2, inversions: 0, text: "p*q*p" });
   assert.equal(db.analyzeExpr(t, "SUM(p*q)/SUM(p)").depth, 2);
-  for (const x of ["x*y*x", "f/2", "f+1", "SUM(f)/COUNT(*)", "SUM(f*f)", "p*f*p", "f*2+p"]) {
-    const y = x.replace(/x/g, "f").replace(/y/g, "f");
-    assert.throws(() => db.analyzeExpr(t, y), (e: unknown) => e instanceof TorusError && e.kind === "PlanError" && /FHE column 'f' cannot be used inside an arithmetic expression/.test(e.message), y);
+  for (const x of ["f/2", "f+1", "SUM(f)/COUNT(*)", "p*f*p", "f*2+p"]) {
+    assert.throws(() => db.analyzeExpr(t, x), (e: unknown) => e instanceof TorusError && e.kind === "PlanError" && /FHE column 'f' cannot be used inside an arithmetic expression/.test(e.message), x);
   }
+  // a product of products (depth > 1) is rejected with its own, more precise message, not the generic
+  // "FHE column cannot be used" one - same whether or not the product is wrapped in SUM/aggregated
+  assert.throws(() => db.analyzeExpr(t, "f*f*f"),
+    (e: unknown) => e instanceof TorusError && e.kind === "PlanError" && /product of products/.test(e.message), "f*f*f");
+  // v0.6.2: SUM(x*y) of two BARE (here: the same) FHE columns is now accepted, numerically identical
+  // to DOT(x, y) - no longer a dedicated rejected spelling (REJECT_BARE_COLUMN_PRODUCT = false)
+  assert.deepEqual(db.analyzeExpr(t, "SUM(f*f)"),
+    { kind: "agg", enc: true, depth: 0, ctMuls: 1, inversions: 0, text: "(fhe expression)" });
   assert.throws(() => db.analyzeExpr(t, "nm*2+p"), /STR column 'nm'/);
   assert.throws(() => db.analyzeExpr(t, "e*p"), /requires PAIRED columns \(column 'e' is ENC\)/);
   assert.throws(() => db.analyzeExpr(t, "p/e"), /PAIRED/);

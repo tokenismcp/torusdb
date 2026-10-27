@@ -933,8 +933,13 @@
   {
    "scope": "t",
    "expr": "SUM(f*f)",
-   "error": "PlanError",
-   "message": "FHE column 'f' cannot be used inside an arithmetic expression (FHE columns support SUM, AVG, k*SUM and DOT only)"
+   "ok": true,
+   "text": "sum(f*f)",
+   "kind": "agg",
+   "enc": true,
+   "depth": 0,
+   "ct_muls": 1,
+   "inversions": 0
   },
   {
    "scope": "t",

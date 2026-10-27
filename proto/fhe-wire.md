@@ -55,23 +55,30 @@ cell    = C1 ‖ C2 ‖ D1 ‖ D2                                       384 byte
 | `plain_cells` | `[table, col, ids]` (also `__fmac__<col>`) | list of binary values |
 | `fhe_sum` | `[table, col, ids, k?]` (col may be `__fmac__<col>`; ≤ 5000 ids) | base64 SUM blob |
 | `fhe_dot` | `[ltable, lcol, lids, rtable, rcol, rids, backend?]` (≤ 300 ids pyecc / 6000 mcl) | base64 DOT blob |
-| `fhe_mul` | `[table, mode, ids, ids_r, lterms, lconst, rterms, rconst, backend?]` (read role; see below) | base64 DOT blob |
+| `fhe_mul` | `[table, mode, ids, ids_r, lterms, lconst, rterms, rconst, backend?]` (read role; see below) | base64 DOT blob (`mode="row"`: a JSON array of base64 DOT blobs, one per row) |
 | `fhe_rows` | `[table, start, count]` (read role; `0 ≤ count ≤ 2000`, advertised as `hello.limits.fhe.max_scan_rows`) | `{"n": slots, "rows": [...]}` — see below |
 
-`fhe_mul` (v0.6.1, expressions over FHE columns). `lterms` / `rterms` are `[[column, k], ...]` (distinct FHE columns of
-`table`, at most 16, `k` a non-zero integer with |k| ≤ 2^40; tag/internal columns refused), `lconst` / `rconst` integers with
-|c| ≤ 2^40. The operands are `L = Σ k·col + lconst`, `R = Σ k'·col + rconst`. `mode = "sum"`: `ids` are the rows (`ids_r` must be
-`null`), the blob opens to `Σ_i L_i·R_i`; row cap = `max_dot_rows`, and `rows × (len(lterms)+len(rterms)) ≤ max_mul_work`
-(`hello.limits.fhe.max_mul_work`, per back end). `mode = "agg"`: the cells of `ids` / `ids_r` are summed per column into `L` / `R`
-and the blob opens to `(Σ L)(Σ R)`; each list ≤ `max_mul_agg_rows`. Ids must be distinct. The server builds the G2 half of `L`
-(`Σk·D1`, `Σk·D2 + lconst·G2`) and the G1 half of `R` (`Σk·C1`, `Σk·C2 + rconst·G1`) and pairs them (4 Miller loops per row); the
-reply is the same blob as `fhe_dot` (decrypt with the same checks). Blobs of the same back end tag multiply to combine chunks; an
-`agg` request over several chunks `u`, `v` is `Π e(L_u, R_v)` with the operand constants carried by chunk 0 only. The request contains
-NO ciphertext and no secret-derived value — a server may rely on that and a client MUST NOT add any.
+`fhe_mul` (v0.6.1, expressions over FHE columns; v0.6.2 adds `mode="row"`). `lterms` / `rterms` are `[[column, k], ...]`
+(distinct FHE columns of `table`, at most 16, `k` a non-zero integer with |k| ≤ 2^40; tag/internal columns refused), `lconst` /
+`rconst` integers with |c| ≤ 2^40. The operands are `L = Σ k·col + lconst`, `R = Σ k'·col + rconst`. `mode = "sum"`: `ids` are the
+rows (`ids_r` must be `null`), the blob opens to `Σ_i L_i·R_i`; row cap = `max_dot_rows`, and `rows × (len(lterms)+len(rterms)) ≤
+max_mul_work` (`hello.limits.fhe.max_mul_work`, per back end). `mode = "agg"`: the cells of `ids` / `ids_r` are summed per column
+into `L` / `R` and the blob opens to `(Σ L)(Σ R)`; each list ≤ `max_mul_agg_rows`. `mode = "row"` (v0.6.2): same shape, caps and
+cost as `mode="sum"` (`ids` are the rows, `ids_r` must be `null`, same `max_dot_rows` / `max_mul_work`), but the reply is a JSON
+array of `len(ids)` base64 DOT blobs, one per row (`L_i·R_i`, NOT folded into one sum) — the row-level analogue of a per-row
+`a*b` on PAIRED columns; the owner decrypts each blob separately. Ids must be distinct (every mode). The server builds the G2
+half of `L` (`Σk·D1`, `Σk·D2 + lconst·G2`) and the G1 half of `R` (`Σk·C1`, `Σk·C2 + rconst·G1`) and pairs them (4 Miller loops
+per row, finalised into one GT value per row for `mode="row"`, or multiplied together before ONE final exponentiation for
+`mode="sum"`); each blob is otherwise the same shape as `fhe_dot`'s (decrypt with the same checks). Blobs of the same back end
+tag multiply to combine `sum`/`agg` chunks (never `row` blobs, which are already final per row); an `agg` request over several
+chunks `u`, `v` is `Π e(L_u, R_v)` with the operand constants carried by chunk 0 only. The request contains NO ciphertext and no
+secret-derived value — a server may rely on that and a client MUST NOT add any.
 
 Details clients must know:
-* `fhe_sum`'s `k` is an integer with |k| ≤ 2^40 (server-enforced); `fhe_sum` / `fhe_dot` return a plain
-  base64 **string**; a missing `__fmac__<col>` cell reads back as a NULL wire value, not an error.
+* `fhe_sum`'s `k` is an integer with |k| ≤ 2^40 (server-enforced); `fhe_sum` / `fhe_dot` / `fhe_mul` with
+  `mode` `"sum"`/`"agg"` return a plain base64 **string**; `fhe_mul` with `mode="row"` returns a JSON
+  **array** of base64 strings, one per requested id, in the same order; a missing `__fmac__<col>` cell
+  reads back as a NULL wire value, not an error.
 * The caps above cannot be discovered via `hello`; use conservative chunks (≤ 2000 ids for SUM; ≤ 50 for
   DOT unless the native back end is requested) and a generous timeout (pure Python ≈ 0.2 s per DOT row).
 * **Subgroup checks (mandatory before decrypting a DOT blob):** the secret is used as an exponent, so

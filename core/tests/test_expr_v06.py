@@ -503,14 +503,14 @@ def test_fhe_columns_give_a_clear_error_not_a_wrong_answer():
                     ("p", "int", "paired")]}
     cat = _CatalogView(schema)
     for sql in ["SELECT x*y*x FROM f", "SELECT x/2 FROM f", "SELECT x+1 FROM f", "SELECT SUM(x)/COUNT(*) FROM f",
-                "SELECT SUM(x*y) FROM f", "SELECT p*x*p FROM f"]:
+                "SELECT p*x*p FROM f", "SELECT (x*y)*p FROM f"]:
         with pytest.raises(PlanError, match="FHE"):
             plan_query(parse(sql), cat)
     for sql in ["SELECT SUM(x) FROM f", "SELECT AVG(x) FROM f", "SELECT 3 * SUM(x) FROM f",
-                "SELECT DOT(x, y) FROM f"]:
+                "SELECT DOT(x, y) FROM f",
+                "SELECT SUM(x*y) FROM f",                      # v0.6.2: accepted, same answer as DOT
+                "SELECT x * y FROM f"]:                         # v0.6.2: per-row FHE product, accepted
         plan_query(parse(sql), cat)                           # the depth-1 FHE forms still plan
-    with pytest.raises(PlanError):                            # legacy FHE a*b rejection unchanged
-        plan_query(parse("SELECT x * y FROM f"), cat)
 
 
 # ── randomized differential test against exact Fraction arithmetic ───────────

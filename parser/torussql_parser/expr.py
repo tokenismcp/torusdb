@@ -221,8 +221,11 @@ def analyze_expr(expr, resolve, *, top: bool = True, fhe_ok: bool = True) -> tup
     if fcols:
         if not fhe_ok:
             raise ValidationError(fhe_expr.old_message(fcols[0]))
-        fx, folded = fhe_expr.analyze(expr, resolve, _fold)
-        return folded, ExprInfo(kind="agg", enc=True, depth=0, ct_muls=fx.products, inversions=0,
+        # allow_row=True: a bare per-row product projection (SELECT a*b FROM t, SELECT (a+b)*c FROM t)
+        # is accepted here too (v0.6.2); the aggregated shapes (SUM(a*b), SUM(a)*SUM(b), ...) are
+        # unaffected — fhe_expr.analyze rejects a pure per-row LINEAR form (no product) exactly as before.
+        fx, folded = fhe_expr.analyze(expr, resolve, _fold, allow_row=True)
+        return folded, ExprInfo(kind=fx.level, enc=True, depth=0, ct_muls=fx.products, inversions=0,
                                 fhe=True)
     node, (kind, cols, depth, muls, invs) = _an(expr, resolve)
     if kind == "const":

@@ -433,8 +433,11 @@ def _plan_select(q: Select, cat: Catalog) -> Plan:
         for proj in q.projections:
             if isinstance(proj, CtMulExpr):
                 # v0.6: `col * col` with a PLAIN factor is a public-scalar product, planned as
-                # an expression; with two encrypted factors it keeps its v0.5 rule below
-                if "plain" in (scope.resolve(proj.left)[1].policy, scope.resolve(proj.right)[1].policy):
+                # an expression; v0.6.2: two FHE columns is a per-row FHE product, also planned as
+                # an expression (one ciphertext per row, paired by the server); two PAIRED factors
+                # keep the v0.5 dedicated CtMul rule below.
+                _pl, _pr = scope.resolve(proj.left)[1].policy, scope.resolve(proj.right)[1].policy
+                if "plain" in (_pl, _pr) or (_pl == "fhe" and _pr == "fhe"):
                     proj = ExprProj(expr=BinOp(op="*", left=_ColRef(name=proj.left),
                                                right=_ColRef(name=proj.right)))
             if isinstance(proj, ColRef):
@@ -479,6 +482,9 @@ def _plan_select(q: Select, cat: Catalog) -> Plan:
             elif isinstance(proj, CtMulExpr):
                 qname_a, a = _rcol(proj.left)
                 qname_b, b = _rcol(proj.right)
+                if a.policy == "fhe" or b.policy == "fhe":
+                    raise PlanError(f"col * col ({a.name} * {b.name}) cannot mix an FHE column "
+                                    f"with ENC/PAIRED — use two FHE columns or two PAIRED columns")
                 if a.policy != "paired" or b.policy != "paired":
                     raise PlanError(f"ciphertext × ciphertext ({a.name} * {b.name}) "
                                     f"requires both columns to be `paired`")

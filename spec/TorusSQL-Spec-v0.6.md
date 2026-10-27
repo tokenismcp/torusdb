@@ -20,7 +20,7 @@ A table has typed columns, each with a **policy**:
 | `PLAIN` | the value itself | yes | as a public operand | n/a (public) |
 | `ENC` | a one-time-padded scalar | no | yes | no |
 | `PAIRED` | a one-time-padded scalar | no | yes | yes |
-| `FHE` | a 384-byte ciphertext the server can add/multiply (INT only, experimental) | no | `SUM`/`AVG` only | `DOT` (two `FHE` columns); depth-1 products of integer-linear forms, aggregated, in expressions (§5.9) |
+| `FHE` | a 384-byte ciphertext the server can add/multiply (INT only, experimental) | no | `SUM`/`AVG` only | `DOT` (two `FHE` columns); depth-1 products of integer-linear forms, aggregated OR per row, in expressions (§5.9) |
 
 Types: `INT`, `RATIONAL` (exact fractions), `STR` (always `PLAIN`).
 `AVG` accepts any numeric column (`PLAIN`, `ENC`, `PAIRED`).
@@ -261,7 +261,7 @@ two `PAIRED` columns and `DOT` still needs `INT`). Anything else that parses is 
 expression. `SUM(a*b)` is the expression form of `DOT(a,b)` and, unlike `DOT`, is
 also defined for `RATIONAL` columns.
 
-### 5.9 `FHE` columns (revised in v0.6.1)
+### 5.9 `FHE` columns (revised in v0.6.1, v0.6.2)
 
 `FHE` columns keep `SUM`, `AVG`, `k*SUM` and depth-1 `DOT`. A statement over `FHE` columns is also an
 expression when it is a **public affine combination** (`+`, `-`, unary `-`, `* literal`, `/ nonzero literal`; `AVG`'s `1/n`)
@@ -269,15 +269,22 @@ of terms with at least one **product** `L * R` whose operands are **integer-line
 columns (`|k|, |k0| <= 2^40`, at most 16 columns), aggregated as `SUM(L*R)` (row by row), as `AL * AR` with `AL`, `AR`
 integer-linear forms of `SUM(col)`s (`k1*SUM(c1) + ... + k0`), or `AVG(L*R)`; plain `SUM(L)` terms may accompany a
 product. Examples: `SUM((a+2*b)*(c-d))`, `SUM(a)*SUM(b)`, `2*SUM(a*b) - SUM(c*d)/4 + 7`, `AVG(a*b)`.
-The single spelling `SUM(x*y)` of two bare `FHE` columns (= `DOT(x,y)`) stays rejected, with the pre-v0.6.1 message.
+`SUM(x*y)` of two bare `FHE` columns gives the same result as `DOT(x,y)` (v0.6.2; it used to be a dedicated
+rejected spelling requiring `DOT` instead — `torussql_parser.fhe_expr.REJECT_BARE_COLUMN_PRODUCT`).
+**v0.6.2**: the same product shapes are also accepted **un-aggregated**, as a per-row projection
+(`SELECT L*R FROM t`, including the bare `SELECT a*b FROM t`, which used to require two `PAIRED`
+columns): one ciphertext per row, paired by the server and opened by the owner individually, exactly
+like `PAIRED`'s row-level `a*b`. `LIMIT`/`OFFSET`/`ORDER BY` do not apply to it (§4.6), and it cannot be
+nested inside a further product or mixed with an aggregate term in the same expression.
 Everything else is **rejected** with an error naming `FHE`; no wrong value is ever produced: a product of a product
-(`SUM(a*b)*SUM(c)`, `SUM(a*b*c)`: the ciphertext scheme has one multiplicative level and an intermediate is never decrypted
-or re-encrypted), division by anything but a literal, `x+1`, `SUM(x)/COUNT(*)`, non-integer or oversized operand coefficients,
-`FHE` mixed with other column policies, per-row (non-aggregated) values, joins. The result of an `FHE` expression has
-multiplicative depth 0 in the sense of §5.4 (no owner round trips exist); the ciphertext product is computed by the server
-from public ciphertext data and opened by the owner, who then applies the public affine part exactly (`Fraction`). A result
-term outside the key's range is an error. Integrity: delegated products are unauthenticated; an authenticated connection
-verifies by recomputing at the owner (docs/fhe-columns.md).
+(`SUM(a*b)*SUM(c)`, `SUM(a*b*c)`, `(a*b)*c`: the ciphertext scheme has one multiplicative level and an intermediate is
+never decrypted or re-encrypted, aggregated or per-row), division by anything but a literal, `x+1`, `SUM(x)/COUNT(*)`,
+non-integer or oversized operand coefficients, `FHE` mixed with other column policies, joins. The result of an `FHE`
+expression has multiplicative depth 0 in the sense of §5.4 (no owner round trips exist); the ciphertext product is
+computed by the server from public ciphertext data and opened by the owner, who then applies the public affine part
+exactly (`Fraction`) — per row, for a row-level expression. A result term outside the key's range is an error.
+Integrity: delegated products (aggregated or per row) are unauthenticated; an authenticated connection verifies by
+recomputing at the owner (docs/fhe-columns.md, docs/fhe-review-log.md Round 4 on why no cheaper sound check was found).
 
 ### 5.10 Who computes what (informative: reference engine, `expr_mode="shared"`)
 
@@ -396,7 +403,7 @@ errors (`Unauthenticated`, `Forbidden`, `Busy`, `BadRequest`, `InternalError`).
 
 Predicates, ordering, grouping or joining on encrypted columns; expressions in
 predicates or in `INSERT`/`UPDATE` values; arithmetic on `FHE` columns beyond
-§5.9 (depth > 1, division, per-row values); operators other than `+ - * /` (no `%`, `^`, functions); integer (truncating)
+§5.9 (depth > 1, division, a bare per-row FHE value with no product); operators other than `+ - * /` (no `%`, `^`, functions); integer (truncating)
 division; `MIN`/`MAX`/`DOT` as expression operands; `RIGHT`/`FULL`/`CROSS`
 joins, non-equi joins, subqueries, `UNION`; multi-column `ORDER BY`; `HAVING`
 other than `COUNT(*)`.
@@ -414,6 +421,7 @@ other than `COUNT(*)`.
 | 0.5 | table aliases, self-joins, multiple joins, `LEFT [OUTER] JOIN`, `GROUP BY`/`HAVING` over joins, `WHERE` on any joined table, `DOT`/`a*b` across tables, `ORDER BY` an unselected column, qualified names on single-table queries, strict exactness errors (`OutOfBudget`) |
 | **0.6** | **arithmetic expressions** `+ - * /`, unary minus, parentheses, literals (`int`, `FRAC`); **products of arbitrary depth** (one round per level, configurable maximum, default 8; transport revised to secret-shared wires in wire protocol 2.1 without any dialect change, §5.10); **division** by public and by encrypted values with `DivisionByZero`; `SUM(expr)`, `AVG(expr)`, aggregate expressions (`SUM(a*b)/COUNT(*)`, `SUM(a)*SUM(b)`); `col * col` with one `PLAIN` factor |
 | 0.6.1 | expressions over `FHE` columns: depth-1 products of integer-linear forms, aggregated, with a public affine part (§5.9) |
+| 0.6.2 | `SUM(x*y)` of two bare `FHE` columns accepted (no longer a dedicated rejected spelling); depth-1 products of integer-linear forms of `FHE` columns accepted UN-aggregated, per row (`SELECT L*R FROM t`, including bare `a*b`), one ciphertext per row (§5.9) |
 
 All v0.1–v0.5 statements keep their meaning and result. v0.6 only makes some
 previously illegal statements legal (anything that used `/`, a product of more than

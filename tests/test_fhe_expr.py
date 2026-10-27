@@ -439,8 +439,15 @@ def test_server_rejects_malformed_and_oversized_fhe_mul(backend):
             assert isinstance(call(*good), str)
             base_len = len(base64.b64decode(call(*good)))
             assert base_len == 1 + 4 * 384
+            # mode="row": a LIST of blobs, one per row, same validation / caps as "sum"
+            row_good = ["t", "row", [0, 1], None, [["a", 1]], 0, [["b", 2]], 3]
+            reply = call(*row_good)
+            assert isinstance(reply, list) and len(reply) == 2
+            assert all(len(base64.b64decode(x)) == 1 + 4 * 384 for x in reply)
             bad = [
                 (["t", "bogus", [0], None, [["a", 1]], 0, [["b", 1]], 0], "mode"),
+                (["t", "row", [0], [0], [["a", 1]], 0, [["b", 1]], 0], "one id list"),
+                (["t", "row", [0, 1, 2, 3], None, [["a", 1]], 0, [["b", 1]], 0], "at most"),
                 (["t", "sum", [0], [0], [["a", 1]], 0, [["b", 1]], 0], "one id list"),
                 (["t", "sum", [0, 0], None, [["a", 1]], 0, [["b", 1]], 0], "distinct"),
                 (["t", "sum", [0, 99], None, [["a", 1]], 0, [["b", 1]], 0], "out of range"),
@@ -489,9 +496,129 @@ REJECT = [
     ("SELECT SUM(a)+SUM(b) FROM t", "FHE"),
     ("SELECT SUM(a/2*b) FROM t", "FHE"),
     ("SELECT SUM((a+1099511627777)*b) FROM t", "FHE"),
-    ("SELECT (a+1)*(b+1) FROM t", "FHE"),
-    ("SELECT a * b FROM t", "(?i)paired"),
+    ("SELECT (a*b)*c FROM t", "FHE"),               # depth-2 still rejected at row level
+    ("SELECT a * p FROM t", "(?i)paired|fhe"),       # FHE cannot mix with PAIRED in a product
 ]
+
+
+# v0.6.2: per-row (non-aggregated) products of FHE columns are now ACCEPTED, same shapes as the
+# aggregate case — see test_row_level_fhe_products below for differential correctness checks.
+ACCEPT_ROW = [
+    "SELECT a * b FROM t",
+    "SELECT (a+1)*(b+1) FROM t",
+]
+
+
+def test_row_level_fhe_products_are_accepted_through_the_wire():
+    s = Running()
+    try:
+        with s.connect(fhe_key=key_for("pyecc")) as c:
+            c.execute("CREATE TABLE t (id INT PLAIN, a INT FHE, b INT FHE, c INT FHE, d INT FHE, "
+                      "p INT PAIRED, e INT ENC)")
+            c.execute("INSERT INTO t (id, a, b, c, d, p, e) VALUES (1, 2, 3, 4, 5, 6, 7)")
+            for sql in ACCEPT_ROW:
+                c.cursor().execute(sql)          # must not raise
+    finally:
+        s.stop()
+
+
+# ── row-level (non-aggregated) FHE products (v0.6.2): SELECT L*R FROM t, one ciphertext per row ──────
+@pytest.mark.parametrize("auth,mode,who", MODES)
+def test_row_level_fhe_products_differential(backend, auth, mode, who):
+    """Mirrors PAIRED's row-level `a*b`: one value per row, decrypted individually. Differential
+    against exact integer arithmetic, across every (authenticated, fhe_dot_mode) combination."""
+    rows = rows_for(backend)
+    a, b, cc, d = (col(rows, x) for x in "abcd")
+    s = Running()
+    try:
+        with s.connect(fhe_key=key_for(backend), authenticated=auth, fhe_dot_mode=mode) as c:
+            load(c, rows)
+            got = c.execute("SELECT a * b FROM t").rows
+            assert got == [[list(x * y for x, y in zip(a, b))]]
+            got = c.execute("SELECT (a+2*b)*(c-d) FROM t").rows
+            assert got == [[[(x + 2 * y) * (z - w) for x, y, z, w in zip(a, b, cc, d)]]]
+            got = c.execute("SELECT 2*(a*b)-1 FROM t").rows
+            assert got == [[[2 * x * y - 1 for x, y in zip(a, b)]]]
+            # WHERE narrows the row set BEFORE the per-row product is computed
+            got = c.execute("SELECT a*b FROM t WHERE id = 1").rows
+            assert got == [[[a[0] * b[0]]]]
+    finally:
+        s.stop()
+
+
+def test_row_level_fhe_products_limit_and_order_by_are_rejected():
+    """Same convention as PAIRED's per-row `a*b`/`k*col`: LIMIT/OFFSET/ORDER BY do not apply to a
+    result that is returned as one list."""
+    s = Running()
+    try:
+        with s.connect(fhe_key=key_for("pyecc")) as c:
+            c.execute(SCHEMA)
+            with pytest.raises(torussql.ProgrammingError, match="LIMIT/OFFSET"):
+                c.execute("SELECT a*b FROM t LIMIT 1")
+            with pytest.raises(torussql.ProgrammingError, match="ORDER BY"):
+                c.execute("SELECT a*b FROM t ORDER BY id")
+    finally:
+        s.stop()
+
+
+def test_row_level_fhe_products_authenticated_default_is_local():
+    """Authenticated connections verify the OPERANDS locally and multiply at the owner by default
+    (no integrity check exists for a delegated pairing result, same gap as DOT); an explicit
+    `fhe_dot_mode='delegated'` opt-in is required to let the server multiply on an authenticated
+    connection, exactly matching DOT's behaviour."""
+    rows = ROWS_SMALL
+    a, b = col(rows, "a"), col(rows, "b")
+    s = Running()
+    spy = Spy(s)
+    try:
+        with s.connect(fhe_key=key_for("pyecc"), authenticated=True) as c:
+            load_inproc(c)
+            spy.clear()
+            got = c.execute("SELECT a*b FROM t").rows
+            assert got == [[[x * y for x, y in zip(a, b)]]]
+            assert "fhe_mul" not in spy.methods()                 # local: the server never multiplied
+    finally:
+        s.stop()
+
+
+def test_row_level_fhe_products_delegated_authenticated_has_no_integrity():
+    """The documented negative control for the per-row shape: an explicit, authenticated opt-in to
+    a server-computed per-row product has NO integrity (same gap as DOT / the aggregate product)."""
+    srv = NoKeyServer()
+    key = key_for("pyecc")
+    c = NoKeyClient(srv, fhe=key, authenticated=True, fhe_dot_mode="delegated")
+    load_inproc(c)
+    want = [r[2] * r[3] for r in ROWS_SMALL]
+    assert c.execute("SELECT a*b FROM t").rows == [[want]]
+    real = srv.fhe_mul
+    srv.fhe_mul = lambda t, mode, ids, ids_r, lt, lc, rt, rc, be=None: real(
+        t, mode, ids[:1] + ids[:1], ids_r, lt, lc, rt, rc, be)      # swap a row's blob for another's
+    got = c.execute("SELECT a*b FROM t").rows[0][0]
+    assert got != want                                              # wrong, and silently accepted
+
+
+def test_row_level_fhe_products_have_a_pairings_cap():
+    """A row-level product costs 4 pairings per row (like SUM(L*R)); the same server cap
+    (fhe_max_mul_work / fhe_max_dot_rows) that bounds the aggregate case bounds this shape too, so a
+    query cannot force an unbounded amount of per-row curve work."""
+    rows = rows_for("pyecc", seed=9)
+    # cap both backends' limits identically: whichever one the server auto-selects (pyecc, or mcl
+    # when the native extension happens to be importable in this environment), the request must
+    # still be chunked to 1 row per call.
+    s = Running(fhe_max_dot_rows=1, fhe_max_dot_rows_native=1, fhe_max_mul_work=2, fhe_max_mul_work_native=2)
+    spy = Spy(s)
+    try:
+        with s.connect(fhe_key=key_for("pyecc")) as c:
+            load(c, rows)
+            a, b = col(rows, "a"), col(rows, "b")
+            spy.clear()
+            # the request is chunked to the cap (one row per call) rather than failing outright
+            got = c.execute("SELECT a*b FROM t").rows
+            assert got == [[[x * y for x, y in zip(a, b)]]]
+            sizes = [len(args[2]) for m, args in spy.log if m == "fhe_mul"]
+            assert sizes and max(sizes) == 1 and len(sizes) == len(rows)
+    finally:
+        s.stop()
 
 
 def test_rejection_matrix_through_planner_and_wire():
@@ -523,7 +650,7 @@ def audit(log, out, *, names, allowed_methods, secrets_, plaintexts, n_rows):
     * bytes / floats: none;
     * replies: standard-size base64 blobs only."""
     bad = []
-    allowed_str = set(names) | {"sum", "agg", "pyecc", "mcl"}
+    allowed_str = set(names) | {"sum", "agg", "row", "pyecc", "mcl"}
 
     def walk(x, where):
         if isinstance(x, bool) or x is None:
@@ -554,9 +681,11 @@ def audit(log, out, *, names, allowed_methods, secrets_, plaintexts, n_rows):
             walk(args, m)
     for m, res in out:
         if m == "fhe_mul":
-            raw = base64.b64decode(res)
-            if len(raw) != 1 + 4 * 384:
-                bad.append("reply size")
+            blobs = res if isinstance(res, list) else [res]       # mode "row": a list of blobs
+            for one in blobs:
+                raw = base64.b64decode(one)
+                if len(raw) != 1 + 4 * 384:
+                    bad.append("reply size")
     return bad
 
 
@@ -580,7 +709,8 @@ def test_wire_audit_the_server_sees_only_public_data(backend):
             a, b, cc, d = (col(rows, x) for x in "abcd")
             qs = ["SELECT SUM(a*b) FROM t", "SELECT SUM((a+2*b)*(c-d)) FROM t",
                   "SELECT SUM(a)*SUM(b) FROM t", "SELECT (SUM(a)+SUM(b))*(SUM(c)-1) FROM t",
-                  "SELECT 2*SUM(a*b)-SUM(c*d)/4+7 FROM t", "SELECT AVG(a*b) FROM t"]
+                  "SELECT 2*SUM(a*b)-SUM(c*d)/4+7 FROM t", "SELECT AVG(a*b) FROM t",
+                  "SELECT a*b FROM t", "SELECT (a+2*b)*(c-d) FROM t"]              # v0.6.2: row mode
             for q in qs:
                 c.execute(q)
             plain = set()
@@ -592,7 +722,7 @@ def test_wire_audit_the_server_sees_only_public_data(backend):
                       sum(a) * sum(b), (sum(a) + sum(b)) * (sum(cc) - 1)}
             plain = {p for p in plain if abs(p) >= 100}
             names = {"t", "id", "g", "a", "b", "c", "d"}
-            assert spy.methods().count("fhe_mul") == 7
+            assert spy.methods().count("fhe_mul") == 9
             ro = {"fhe_mul", "plain_cells", "matching_rowids", "schema", "tables"}
             assert audit(spy.log, spy.out, names=names, allowed_methods=ro, secrets_=secret_forms(key),
                          plaintexts=plain, n_rows=n) == []
@@ -611,6 +741,16 @@ def test_the_audit_has_teeth():
     blob = [("fhe_mul", base64.b64encode(bytes(1 + 4 * 384)).decode())]
     kw = dict(names=names, allowed_methods=ro, secrets_=secret_forms(key), plaintexts={4321, -987654}, n_rows=2)
     assert audit(clean, blob, **kw) == []
+    # mode="row" (v0.6.2): a list of blobs; the audit must still catch every leak, and still reject a
+    # wrong-size blob inside the list and a non-list reply.
+    row_clean = [("fhe_mul", ["t", "row", [0, 1], None, [["a", 2]], 3, [["b", 1]], 0, "pyecc"])]
+    row_blob = [("fhe_mul", [base64.b64encode(bytes(1 + 4 * 384)).decode()] * 2)]
+    assert audit(row_clean, row_blob, **kw) == []
+    assert audit(row_clean, [("fhe_mul", [base64.b64encode(bytes(1 + 4 * 384)).decode(),
+                                          base64.b64encode(bytes(64)).decode()])], **kw), \
+        "one bad-size blob inside an otherwise-clean row-mode list"
+    assert audit([("fhe_mul", ["t", "row", [0], None, [["a", 1]], key._s, [["b", 1]], 0])],
+                 row_blob, **kw), "the secret key leaked through mode='row'"
     leaks = {
         "the secret key as a constant": ["t", "sum", [0], None, [["a", 1]], key._s, [["b", 1]], 0],
         "the second secret": ["t", "sum", [0], None, [["a", 1]], 0, [["b", 1]], fhe.derive_s2(key._s)],

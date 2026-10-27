@@ -1,5 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Evaluation of v0.6.1 expressions over FHE columns (the owner side).
+"""Evaluation of v0.6.1 / v0.6.2 expressions over FHE columns (the owner side).
+
+v0.6.2 additionally accepts the SAME product shapes **un-aggregated**, as a per-row projection
+(``SELECT L*R FROM t``, including the bare ``SELECT a*b FROM t``): the server finalises each row's
+pairing on its own (one GT ciphertext PER ROW, never folded together) and the owner decrypts each
+individually — ``FheExpr.level == "row"``, handled by ``_run_row`` / ``_term_row`` / ``_delegated_row``
+below, which share every cap, cost field and ``fhe_dot_mode`` rule with the aggregate path.
 
 WHO COMPUTES WHAT
 =================
@@ -95,6 +101,79 @@ class FheExprRunner:
             raise ExecError("an operand constant of an FHE product exceeds 2^40 for this many rows")
         return [(col, int(k)) for col, k in lin.coefs.items()], int(c)
 
+    # ── row-level terms (v0.6.2: un-aggregated products, one value per row) ────
+    def _term_row(self, term, mode: str) -> list[int]:
+        """-> one value per row for a ROW-level term (``("prod", L, R)`` or ``("lin", L)``)."""
+        key = self.c._fhe_key()
+        kind = term[0]
+        if kind == "lin":
+            lin = term[1]
+            c = peval(lin.c, self.n)
+            if c is None or c.denominator != 1 or abs(int(c)) > MAX_COEF:
+                raise ExecError("a per-row term constant of an FHE expression exceeds 2^40")
+            c = int(c)
+            coefs = list(lin.coefs.items())
+            return [key._in_range(c + sum(k * self._col(col)[i] for col, k in coefs))
+                    for i in range(self.n)]
+        if kind != "prod":
+            raise ExecError(f"unsupported row-level FHE term: {kind}")
+        lt, lc = self._operand(term[1])
+        rt, rc = self._operand(term[2])
+        if mode == "local":
+            a = [lc + sum(k * self._col(col)[i] for col, k in lt) for i in range(self.n)]
+            b = [rc + sum(k * self._col(col)[i] for col, k in rt) for i in range(self.n)]
+            return [key._in_range(x * y) for x, y in zip(a, b)]
+        blobs = self._delegated_row(lt, lc, rt, rc)
+        self.cost["server_products"] += 1
+        self.cost["gt_results"] += len(blobs)
+        return [key.decrypt_dot(blob) for blob in blobs]
+
+    def _delegated_row(self, lt, lc: int, rt, rc: int) -> list[bytes]:
+        """Server-delegated per-row product: shares the chunking / cap logic of ``_delegated``'s
+        ``"sum"`` path (same per-row pairing cost), but every chunk's blobs come back un-summed."""
+        c, key, table = self.c, self.c._fhe_key(), self.table
+        lim = c._fhe_limits()
+        be = key.backend
+        sb = lim.get("default_backend")
+        if sb in ("pyecc", "mcl"):
+            sb_ = sb
+        elif sb == "auto":
+            sb_ = "mcl" if "mcl" in (lim.get("backends") or []) else "pyecc"
+        else:
+            sb_ = be
+        lterms, rterms = [list(t) for t in lt], [list(t) for t in rt]
+        cap = int((lim.get("recommended_dot_rows") or {}).get(sb_)
+                  or (c._FHE_DOT_CHUNK_NATIVE if sb_ == "mcl" else c._FHE_DOT_CHUNK))
+        cap = max(1, min(cap, int((lim.get("max_dot_rows") or {}).get(sb_) or cap)))
+        work = int((lim.get("max_mul_work") or {}).get(sb_) or 0)
+        if work:
+            cap = max(1, min(cap, work // max(1, len(lt) + len(rt))))
+        out: list[bytes] = []
+        for i in range(0, self.n, cap):
+            part = c._guard(table, lambda i=i: c.server.fhe_mul(
+                table, "row", self.ids[i:i + cap], None, lterms, lc, rterms, rc, be))
+            out.extend(part)
+            self.cost["pairings"] += 4 * len(self.ids[i:i + cap])
+        return out
+
+    def _run_row(self, fx, mode: str):
+        """A row-level FheExpr (v0.6.2): one value per row (never a single scalar). Mirrors the
+        aggregate path's affine combination, applied independently to each row's term values."""
+        n = self.n
+        const = peval(fx.const, n)
+        if const is None:
+            raise ExecError("a row-level FHE expression cannot depend on AVG's 1/n")
+        totals = [const] * n
+        for coef, term in fx.terms:
+            f = peval(coef, n)
+            if f is None:
+                raise ExecError("a row-level FHE expression cannot depend on AVG's 1/n")
+            if n == 0:
+                continue
+            vals = self._term_row(term, mode)
+            totals = [t + f * v for t, v in zip(totals, vals)]
+        return [int(t) if t.denominator == 1 else Fraction(t) for t in totals]
+
     # ── terms ────────────────────────────────────────────────────────────────
     def _term(self, term, mode: str) -> int:
         kind = term[0]
@@ -157,25 +236,32 @@ class FheExprRunner:
     # ── run ──────────────────────────────────────────────────────────────────
     def run(self):
         c = self.c
-        fx, _tree = analyze(self.p.expr, self._resolve, _fold)
+        fx, _tree = analyze(self.p.expr, self._resolve, _fold, allow_row=True)
         mode = c._fhe_mode()
         c._fhe_key()
         n = self.n
-        total = peval(fx.const, n)
-        dead = total is None
-        if not dead:
-            for coef, term in fx.terms:
-                f = peval(coef, n)
-                if f is None:                                  # AVG over no rows: the result is NULL
-                    dead = True
-                    break
-                if n == 0:
-                    continue
-                total += f * self._term(term, mode)
+        result = None
+        dead = False
+        if fx.level == "row":
+            result = self._run_row(fx, mode)
+        else:
+            total = peval(fx.const, n)
+            dead = total is None
+            if not dead:
+                for coef, term in fx.terms:
+                    f = peval(coef, n)
+                    if f is None:                              # AVG over no rows: the result is NULL
+                        dead = True
+                        break
+                    if n == 0:
+                        continue
+                    total += f * self._term(term, mode)
+            if not dead:
+                result = int(total) if total.denominator == 1 else Fraction(total)
         prev = c.last_expr_cost or {}
         cost = dict(self.cost, depth=0, mult_rounds=0, products=fx.products, inversions=0, linear_sums=0)
         c.last_expr_cost = {k: prev.get(k, 0) + v for k, v in cost.items() if k != "depth"}
         c.last_expr_cost["depth"] = prev.get("depth", 0)
         if dead:
             return None
-        return int(total) if total.denominator == 1 else Fraction(total)
+        return result

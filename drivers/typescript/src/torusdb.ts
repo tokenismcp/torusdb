@@ -26,12 +26,16 @@ import {
   Anchor, AnchorManager, AnchorValue, FhePart, FileAnchor, Snapshot, schemaDigest, sha256 as anchorSha,
 } from "./anchor";
 import { parseExpression, analyzeExpression, scopeResolver } from "./expr";
+import type { Expr, ResolveColumn, Frac } from "./expr";
 import { ExprRunner, ExprHost, ExprCost, Ring, WireLimits } from "./exprEval";
 import { SharedExprRunner } from "./exprShared";
 import type { ExprInfo } from "./expr";
 import {
   FheKey, FheBackend, newNonce, FHE_CELL_BYTES, FHE_DOT_BYTES, FHE_SUM_BYTES, addSums as fheAddSums, mulDots as fheMulDots,
 } from "./fhe";
+import { analyzeFheExpr, referencesFheColumn, operandAt, pevalPoly } from "./fheExpr";
+import type { FheExprPlan, Term as FheTerm } from "./fheExpr";
+import { frac, fAdd, fMul } from "./expr";
 
 export {
   FheKey, FHE_CELL_BYTES, FHE_DEFAULT_RANGE, FHE_MAX_RANGE, sumCells as fheSumCells,
@@ -46,6 +50,21 @@ export { parseExpression, analyzeExpression, renderExpr, MAX_EXPR_HEIGHT } from 
 export type { Expr, ExprInfo, ExprColumn, Frac } from "./expr";
 export type { ExprCost, WireLimits } from "./exprEval";
 export type ExpressionMode = "shared" | "owner";
+
+/** Cost of evaluating one v0.6.1 expression over FHE columns (`Client.lastFheExprCost`); mirrors
+ *  the Python driver's `last_expr_cost` FHE fields. */
+export interface FheExprCost {
+  /** GT blobs the server computed (one `fhe_mul` reply per chunk / chunk pair). */
+  serverProducts: number;
+  /** pairings performed at the server (4 per row for `SUM(L*R)`, 4 per chunk pair for `AL*AR`). */
+  pairings: number;
+  /** bounded GT discrete logs the owner opened (one per delegated product term). */
+  gtResults: number;
+  /** FHE cells decrypted locally (local/authenticated mode operand columns only). */
+  decryptedCells: number;
+  /** product terms in the expression. */
+  products: number;
+}
 
 /** Newest wire protocol this driver speaks. */
 export const PROTOCOL_VERSION = 2;
@@ -208,6 +227,10 @@ export interface ServerLimits {
     maxScanRows?: number;
     maxDotRows: { pyecc?: number; mcl?: number };
     recommendedDotRows: { pyecc?: number; mcl?: number };
+    /** `fhe_mul`: rows x (lterms+rterms) cap per request, per back end. */
+    maxMulWork?: { pyecc?: number; mcl?: number };
+    /** `fhe_mul` mode "agg": ids per side, per back end. */
+    maxMulAggRows?: { pyecc?: number; mcl?: number };
   };
 }
 const posInt = (x: unknown): number | undefined =>
@@ -783,6 +806,12 @@ export class Client {
   /** Cost of the last successful expression (`expr` / `joinExpr`): depth, owner rounds, products,
    *  inversions, Pi_lin sums. `null` before one ran or after a failed one. */
   lastExprCost: ExprCost | null = null;
+  /** Cost of the last successful FHE expression (`expr` / `joinExpr` over FHE columns): GT blobs the
+   *  server computed (`serverProducts`), pairings (4 per row for a `SUM(L*R)` term), bounded GT
+   *  discrete logs opened (`gtResults`), cells decrypted locally (`decryptedCells`, local/authenticated
+   *  mode only) and the number of product terms (`products`). `null` before one ran, after a failed
+   *  one, or after a non-FHE expression. */
+  lastFheExprCost: FheExprCost | null = null;
   /** What the server said in `hello` (protocol 1 servers: {protocol:1,...}). */
   serverInfo: { protocol: number; server?: string; auth_required: boolean;
                 max_frame?: number; persistent?: boolean; limits?: ServerLimits } =
@@ -905,7 +934,8 @@ export class Client {
       const f = l.fhe;
       if (f !== null && typeof f === "object" && !Array.isArray(f)) {
         const pair = (x: any) => (x !== null && typeof x === "object" ? { pyecc: posInt(x.pyecc), mcl: posInt(x.mcl) } : {});
-        lim.fhe = { maxSumRows: posInt(f.max_sum_rows), maxScanRows: posInt(f.max_scan_rows), maxDotRows: pair(f.max_dot_rows), recommendedDotRows: pair(f.recommended_dot_rows) };
+        lim.fhe = { maxSumRows: posInt(f.max_sum_rows), maxScanRows: posInt(f.max_scan_rows), maxDotRows: pair(f.max_dot_rows), recommendedDotRows: pair(f.recommended_dot_rows),
+                    maxMulWork: pair(f.max_mul_work), maxMulAggRows: pair(f.max_mul_agg_rows) };
       }
       info.limits = lim;
     }
@@ -2141,10 +2171,22 @@ export class Client {
     return this.exprPlan(expression, [[opts.alias ?? table, table]]).info;
   }
 
-  private exprPlan(expression: string, instances: Array<[string, string]>) {
+  private exprPlan(expression: string, instances: Array<[string, string]>):
+      { kind: "fhe"; table: string; fhe: FheExprPlan; info: ExprInfo }
+    | { kind: "wire"; expr: Expr; info: ExprInfo; loc: (n: string) => { alias: string; col: string } } {
     const tree = parseExpression(expression);
     const scope = scopeResolver(instances.map(([a, t]) => [a, this.cols(t)] as [string, Column[]]));
-    const { expr, info } = analyzeExpression(tree, (n) => scope(n).col);
+    const resolve: ResolveColumn = (n) => scope(n).col;
+    if (referencesFheColumn(tree, resolve)) {
+      if (instances.length !== 1) throw usage("FHE expressions cannot be used in a join query");
+      // allowRow=true: a per-row product projection (`SELECT a*b FROM t`) is accepted here too
+      // (v0.6.2), exactly like the Python planner/engine's single caller (`analyze_expr`,
+      // `allow_row=True`); the aggregated shapes (SUM(a*b), SUM(a)*SUM(b), ...) are unaffected.
+      const fhe = analyzeFheExpr(tree, resolve, true);
+      const info: ExprInfo = { kind: fhe.level, enc: true, depth: 0, ctMuls: fhe.products, inversions: 0, text: "(fhe expression)" };
+      return { kind: "fhe", table: instances[0][1], fhe, info };
+    }
+    const { expr, info } = analyzeExpression(tree, resolve);
     const loc = (n: string) => { const r = scope(n); return { alias: r.inst, col: r.col.name }; };
     let depth = info.depth;
     if (this.#exprMode === "shared") {
@@ -2167,7 +2209,7 @@ export class Client {
           `or call trustTable('${t}') first`);
       }
     }
-    return { expr, info, loc };
+    return { kind: "wire", expr, info, loc };
   }
 
   private exprHost(): ExprHost {
@@ -2203,11 +2245,236 @@ export class Client {
   private async runExpr(plan: ReturnType<Client["exprPlan"]>, inst: Array<[string, string]>,
                         tuples: Array<Array<number | null>>): Promise<ExprValue> {
     this.lastExprCost = null;
+    this.lastFheExprCost = null;
+    if (plan.kind === "fhe") {
+      const ids: number[] = [];
+      for (const t of tuples) { if (t[0] !== null) ids.push(t[0]); }
+      return plan.fhe.level === "row" ? this.runFheExprRow(plan.table, plan.fhe, ids)
+                                      : this.runFheExpr(plan.table, plan.fhe, ids);
+    }
     const ring = this.exprRing();
     const Runner = this.#exprMode === "shared" ? SharedExprRunner : ExprRunner;
     const runner = new Runner(this.exprHost(), ring, plan.expr, plan.info, new Map(inst), plan.loc, tuples);
     const out = await runner.run() as ExprValue;
     this.lastExprCost = { ...runner.cost };
+    return out;
+  }
+
+  // — v0.6.1 expressions over FHE columns: public affine combinations of SUM(L*R) / SUM(L)*SUM(R) /
+  //   SUM(L) terms (docs/fhe-columns.md "Expressions over FHE columns"; proto/fhe-wire.md `fhe_mul`).
+  //   The server (no key) builds the operand ciphertexts from the query's literals and pairs them
+  //   (delegated mode) or just serves cells/sums for the owner to multiply itself (local mode,
+  //   `fheDotMode === "local"`, the default on authenticated connections). —
+  private async runFheExpr(table: string, fx: FheExprPlan, ids: number[]): Promise<Decoded | null> {
+    this.fheKey();                                   // throws early if no key is loaded
+    const n = ids.length;
+    const cost: FheExprCost = { serverProducts: 0, pairings: 0, gtResults: 0, decryptedCells: 0, products: fx.products };
+    const cache = { sums: new Map<string, Promise<bigint>>(), cols: new Map<string, Promise<bigint[]>>() };
+    let total = pevalPoly(fx.const, n);
+    let dead = total === null;
+    if (!dead) {
+      for (const [coef, term] of fx.terms) {
+        const f = pevalPoly(coef, n);
+        if (f === null) { dead = true; break; }       // AVG over no rows: the result is NULL
+        if (n === 0) continue;
+        const v = await this.fheTermValue(table, ids, term, cache, cost);
+        total = fAdd(total!, fMul(f, frac(v)));
+      }
+    }
+    this.lastFheExprCost = cost;
+    if (dead) return null;
+    return rational(total!.num, total!.den);
+  }
+
+  private fheSumCached(table: string, col: string, ids: number[],
+                       cache: { sums: Map<string, Promise<bigint>> }): Promise<bigint> {
+    let p = cache.sums.get(col);
+    if (!p) { p = this.fheSum(table, col, ids); cache.sums.set(col, p); }
+    return p;
+  }
+
+  private fheColCached(table: string, col: string, ids: number[],
+                       cache: { cols: Map<string, Promise<bigint[]>> }, cost: FheExprCost): Promise<bigint[]> {
+    let p = cache.cols.get(col);
+    if (!p) {
+      p = this.fheReveal(table, col, ids).then((vs) => { cost.decryptedCells += vs.length; return vs; });
+      cache.cols.set(col, p);
+    }
+    return p;
+  }
+
+  private fheRangeCheck(v: bigint, key: FheKey): bigint {
+    const R = BigInt(key.range);
+    if (v < -R || v > R) {
+      throw new TorusError("OutOfBudget", "result is outside the key's value range (or the ciphertext is invalid)");
+    }
+    return v;
+  }
+
+  /** One term of an FHE expression: a plain `SUM(col)` (reuses `fheSum`), or a product term, computed
+   *  either locally (the owner reads/decrypts the operand cells or SUMs and multiplies plaintexts) or
+   *  by the server's pairing (`fhe_mul`, decrypted once by the owner). */
+  private async fheTermValue(table: string, ids: number[], term: FheTerm,
+                             cache: { sums: Map<string, Promise<bigint>>; cols: Map<string, Promise<bigint[]>> },
+                             cost: FheExprCost): Promise<bigint> {
+    if (term[0] === "sum") return this.fheSumCached(table, term[1], ids, cache);
+    if (term[0] !== "sumprod" && term[0] !== "aggprod") {
+      throw new Error(`internal error: unexpected FHE term kind ${term[0]}`);
+    }
+    const key = this.fheKey();
+    const n = ids.length;
+    const lo = operandAt(term[1], n), ro = operandAt(term[2], n);
+    if (this.#fheDotMode === "local") {
+      if (term[0] === "sumprod") {
+        const lcols = await Promise.all(lo.terms.map(([c]) => this.fheColCached(table, c, ids, cache, cost)));
+        const rcols = await Promise.all(ro.terms.map(([c]) => this.fheColCached(table, c, ids, cache, cost)));
+        let v = 0n;
+        for (let i = 0; i < n; i++) {
+          let a = lo.constant, b = ro.constant;
+          lo.terms.forEach(([, k], j) => { a += k * lcols[j][i]; });
+          ro.terms.forEach(([, k], j) => { b += k * rcols[j][i]; });
+          v += a * b;
+        }
+        return this.fheRangeCheck(v, key);
+      }
+      let a = lo.constant, b = ro.constant;
+      for (const [col, k] of lo.terms) a += k * (await this.fheSumCached(table, col, ids, cache));
+      for (const [col, k] of ro.terms) b += k * (await this.fheSumCached(table, col, ids, cache));
+      return this.fheRangeCheck(a * b, key);
+    }
+    const blob = await this.fheMulDelegated(table, ids, term[0] === "sumprod" ? "sum" : "agg", lo, ro, cost);
+    cost.gtResults += 1;
+    return BigInt(key.decryptDot(blob));
+  }
+
+  /** `fhe_mul` RPC, chunked: `mode === "sum"` is `SUM(L*R)` (rows chunked, blobs combine by
+   *  bilinearity); `mode === "agg"` is `(ΣL)(ΣR)` (both sides chunked, `m²` requests for `m` chunks,
+   *  the operand constants riding on chunk 0 only — proto/fhe-wire.md `fhe_mul`). */
+  private async fheMulDelegated(table: string, ids: number[], mode: "sum" | "agg",
+      lo: { terms: Array<readonly [string, bigint]>; constant: bigint },
+      ro: { terms: Array<readonly [string, bigint]>; constant: bigint },
+      cost: FheExprCost): Promise<Buffer> {
+    const lterms = lo.terms.map(([c, k]) => [c, Number(k)]);
+    const rterms = ro.terms.map(([c, k]) => [c, Number(k)]);
+    const lim = this.serverInfo.limits?.fhe;
+    let total: Buffer | null = null;
+    if (mode === "sum") {
+      const be: FheBackend = "pyecc";
+      let cap = lim?.recommendedDotRows?.pyecc ?? FHE_DOT_CHUNK;
+      cap = Math.max(1, Math.min(cap, lim?.maxDotRows?.pyecc ?? cap));
+      const work = lim?.maxMulWork?.[be];
+      if (work) cap = Math.max(1, Math.min(cap, Math.floor(work / Math.max(1, lterms.length + rterms.length))));
+      for (let i = 0; i < ids.length; i += cap) {
+        const part = ids.slice(i, i + cap);
+        const args: unknown[] = [table, "sum", part, null, lterms, Number(lo.constant), rterms, Number(ro.constant)];
+        const b = blob(await this.call("fhe_mul", args, 8192), "fhe_mul", FHE_DOT_BYTES);
+        total = total === null ? b : fheMulDots(total, b);
+        cost.pairings += 4 * part.length;
+        cost.serverProducts += 1;
+      }
+      return total!;
+    }
+    const step = lim?.maxMulAggRows?.pyecc ?? Math.min(FHE_SUM_CHUNK, lim?.maxSumRows ?? FHE_SUM_CHUNK);
+    const chunks: number[][] = [];
+    for (let i = 0; i < ids.length; i += step) chunks.push(ids.slice(i, i + step));
+    for (let u = 0; u < chunks.length; u++) {
+      for (let v = 0; v < chunks.length; v++) {
+        const args: unknown[] = [table, "agg", chunks[u], chunks[v], lterms, u === 0 ? Number(lo.constant) : 0,
+                                   rterms, v === 0 ? Number(ro.constant) : 0];
+        const b = blob(await this.call("fhe_mul", args, 8192), "fhe_mul", FHE_DOT_BYTES);
+        total = total === null ? b : fheMulDots(total, b);
+        cost.pairings += 4;
+        cost.serverProducts += 1;
+      }
+    }
+    return total!;
+  }
+
+  // — v0.6.2: the SAME product shapes, un-aggregated, as a per-row projection (`SELECT L*R FROM t`,
+  //   including the bare `SELECT a*b FROM t`): the server finalises each row's pairing on its own (one
+  //   GT ciphertext PER ROW, never folded together, `fhe_mul` mode `"row"`) and the owner decrypts each
+  //   individually - the FHE analogue of PAIRED's per-row `a*b`. Shares every cap, cost field and
+  //   `fheDotMode` rule with the aggregate path above. —
+  private async runFheExprRow(table: string, fx: FheExprPlan, ids: number[]): Promise<Decoded[]> {
+    this.fheKey();                                   // throws early if no key is loaded
+    const n = ids.length;
+    const cost: FheExprCost = { serverProducts: 0, pairings: 0, gtResults: 0, decryptedCells: 0, products: fx.products };
+    const cache = { sums: new Map<string, Promise<bigint>>(), cols: new Map<string, Promise<bigint[]>>() };
+    const c0 = pevalPoly(fx.const, n);
+    if (c0 === null) throw new TorusError("ExecError", "a row-level FHE expression cannot depend on AVG's 1/n");
+    let totals: Frac[] = new Array(n).fill(c0);
+    for (const [coef, term] of fx.terms) {
+      const f = pevalPoly(coef, n);
+      if (f === null) throw new TorusError("ExecError", "a row-level FHE expression cannot depend on AVG's 1/n");
+      if (n === 0) continue;
+      const vals = await this.fheTermRowValues(table, ids, term, cache, cost);
+      totals = totals.map((t, i) => fAdd(t, fMul(f, frac(vals[i]))));
+    }
+    this.lastFheExprCost = cost;
+    return totals.map((t) => rational(t.num, t.den));
+  }
+
+  /** One row-level term of an FHE expression (`("lin", L)` or `("prod", L, R)`): one value per row,
+   *  computed either locally (the owner reads/decrypts the operand cells and multiplies plaintexts) or
+   *  by the server's per-row pairing (`fhe_mul` mode `"row"`, decrypted once per row by the owner). */
+  private async fheTermRowValues(table: string, ids: number[], term: FheTerm,
+                                 cache: { sums: Map<string, Promise<bigint>>; cols: Map<string, Promise<bigint[]>> },
+                                 cost: FheExprCost): Promise<bigint[]> {
+    const key = this.fheKey();
+    const n = ids.length;
+    if (term[0] === "lin") {
+      const o = operandAt(term[1], n);
+      const cols = await Promise.all(o.terms.map(([c]) => this.fheColCached(table, c, ids, cache, cost)));
+      const out: bigint[] = [];
+      for (let i = 0; i < n; i++) {
+        let v = o.constant;
+        o.terms.forEach(([, k], j) => { v += k * cols[j][i]; });
+        out.push(this.fheRangeCheck(v, key));
+      }
+      return out;
+    }
+    if (term[0] !== "prod") throw new Error(`internal error: unexpected FHE row term kind ${term[0]}`);
+    const lo = operandAt(term[1], n), ro = operandAt(term[2], n);
+    if (this.#fheDotMode === "local") {
+      const lcols = await Promise.all(lo.terms.map(([c]) => this.fheColCached(table, c, ids, cache, cost)));
+      const rcols = await Promise.all(ro.terms.map(([c]) => this.fheColCached(table, c, ids, cache, cost)));
+      const out: bigint[] = [];
+      for (let i = 0; i < n; i++) {
+        let a = lo.constant, b = ro.constant;
+        lo.terms.forEach(([, k], j) => { a += k * lcols[j][i]; });
+        ro.terms.forEach(([, k], j) => { b += k * rcols[j][i]; });
+        out.push(this.fheRangeCheck(a * b, key));
+      }
+      return out;
+    }
+    const blobs = await this.fheMulDelegatedRow(table, ids, lo, ro, cost);
+    cost.gtResults += blobs.length;
+    return blobs.map((b) => BigInt(key.decryptDot(b)));
+  }
+
+  /** `fhe_mul` mode `"row"`, chunked exactly like mode `"sum"` (same per-row pairing cost / caps -
+   *  `fhe_max_mul_work(_native)`), but every chunk's reply is a LIST of un-combined blobs, one per row
+   *  (proto/fhe-wire.md `fhe_mul`): the owner opens each one on its own instead of folding them together. */
+  private async fheMulDelegatedRow(table: string, ids: number[],
+      lo: { terms: Array<readonly [string, bigint]>; constant: bigint },
+      ro: { terms: Array<readonly [string, bigint]>; constant: bigint },
+      cost: FheExprCost): Promise<Buffer[]> {
+    const lterms = lo.terms.map(([c, k]) => [c, Number(k)]);
+    const rterms = ro.terms.map(([c, k]) => [c, Number(k)]);
+    const lim = this.serverInfo.limits?.fhe;
+    let cap = lim?.recommendedDotRows?.pyecc ?? FHE_DOT_CHUNK;
+    cap = Math.max(1, Math.min(cap, lim?.maxDotRows?.pyecc ?? cap));
+    const work = lim?.maxMulWork?.pyecc;
+    if (work) cap = Math.max(1, Math.min(cap, Math.floor(work / Math.max(1, lterms.length + rterms.length))));
+    const out: Buffer[] = [];
+    for (let i = 0; i < ids.length; i += cap) {
+      const part = ids.slice(i, i + cap);
+      const args: unknown[] = [table, "row", part, null, lterms, Number(lo.constant), rterms, Number(ro.constant)];
+      const reply = arr(await this.call("fhe_mul", args, part.length * 2200 + 8192), "fhe_mul", part.length);
+      for (const item of reply) out.push(blob(item, "fhe_mul", FHE_DOT_BYTES));
+      cost.pairings += 4 * part.length;
+      cost.serverProducts += 1;
+    }
     return out;
   }
 

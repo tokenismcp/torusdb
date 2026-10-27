@@ -217,11 +217,14 @@ class NoKeyServer:
         ``rconst`` public integers: the operands are ``L = Σ k·col + lconst`` and ``R = Σ k'·col + rconst``.
         ``mode="sum"``: ``ids`` (``ids_r`` is None) are the rows; the blob opens to ``Σ_i L_i·R_i``.
         ``mode="agg"``: ``ids`` / ``ids_r`` are the rows summed into ``L`` / ``R``; the blob opens to
-        ``(Σ L)(Σ R)``. Returns a closure that does the pairing math (so a caller may run it outside
-        a lock); its result is a DOT-format blob."""
+        ``(Σ L)(Σ R)``. ``mode="row"`` (v0.6.2): like ``"sum"`` (``ids`` only, one row list), but
+        returns a ``list[bytes]`` of one DOT blob per row (``L_i·R_i``), un-aggregated — for a
+        per-row projection such as ``SELECT a*b FROM t``. Returns a closure that does the pairing
+        math (so a caller may run it outside a lock); its result is a DOT-format blob (or, for
+        ``mode="row"``, a list of them)."""
         from . import fhe
-        if mode not in ("sum", "agg"):
-            raise ExecError("fhe_mul: mode is 'sum' or 'agg'")
+        if mode not in ("sum", "agg", "row"):
+            raise ExecError("fhe_mul: mode is 'sum', 'agg' or 'row'")
         if table not in self._rows:
             raise ExecError(f"no such table: {table}")
         pol = {c[0]: c[2] for c in self._schema[table]}
@@ -236,9 +239,9 @@ class NoKeyServer:
                 except KeyError:
                     raise ExecError(f"fhe_mul: no such row in {table!r}") from None
             return out
-        if mode == "sum":
+        if mode in ("sum", "row"):
             if ids_r is not None:
-                raise ExecError("fhe_mul: mode 'sum' takes one id list")
+                raise ExecError(f"fhe_mul: mode {mode!r} takes one id list")
             ids_r = ids
         lt, rt = operand(lterms, ids), operand(rterms, ids_r)
         return lambda: fhe.mul_cells(lt, lconst, rt, rconst, mode, backend)

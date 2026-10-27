@@ -55,7 +55,7 @@ operands that are integer-linear in cells; nothing deeper. Findings and review q
 | F16 | Info | Randomness independence (`r1 != r2`) after combining: halves are combined separately, so `Σk·r1` and `Σk·r2` stay independent; the same-cell product `a*a` pairs `D` and `C` of one cell (independent randomness). | Tested (`test_randomness_of_the_two_halves...`). |
 | F17 | Medium (owner side) | A hostile server could send a GT blob made of small-order elements. | Unchanged: `decrypt_dot` checks `c00, c01, c10` individually; chunk blobs are multiplied with `mul_dots` and the PRODUCT is checked before any exponentiation. |
 | F18 | Medium | Ranges: a result outside `[-range, range]` must raise, never wrap. Operand coefficients, constants (`<= 2^40`), width (16) and expression size bound every true product below `2^232`, far under `n/2`. A hostile writer could store a cell outside the key range; unauthenticated delegated mode cannot detect that (no integrity at all there); authenticated mode opens each cell with a range-checked dlog. | Both modes raise on an out-of-range term (tested, boundary included); `5*SUM(a*b)` may leave the range after decryption by design. |
-| F19 | Medium | Integrity of a product. Tags are linear in the value; `Σ TagL_i ★ R_i = α·ΣL_iR_i + Σγ_iR_i` needs `Σγ_iR_i`, which the owner can form only from the plaintexts `R_i` (or by revealing `γ_i` to the server, which destroys the tag). A probabilistic check of the pairing result without the operands does not exist in this scheme. | **Not solved; mitigated honestly**: authenticated `auto` = `local` (verified operands, owner multiplies); delegated + authenticated only by explicit opt-in. No silent weakening. |
+| F19 | Medium | Integrity of a product. Tags are linear in the value; `Σ TagL_i ★ R_i = α·ΣL_iR_i + Σγ_iR_i` needs `Σγ_iR_i`, which the owner can form only from the plaintexts `R_i` (or by revealing `γ_i` to the server, which destroys the tag). A probabilistic check of the pairing result without the operands does not exist in this scheme. | **Not solved; mitigated honestly**: authenticated `auto` = `local` (verified operands, owner multiplies); delegated + authenticated only by explicit opt-in. No silent weakening. Revisited in Round 4 (Q4): no sound construction found; see there for the two attempts and why the obstruction is structural. |
 | F20 | Low | DoS: a product multiplies the per-row curve work by the number of terms. | Server caps rows, row×terms (`fhe_max_mul_work`), terms (16), operand rows for aggregates (`fhe_max_mul_agg_rows_native`); published in `hello.limits.fhe`. `AL*AR` over `m` chunks costs `m²` requests. |
 | F21 | Info | The owner uploads nothing: no ciphertext, no tag, no scalar derived from data. The wire audit enumerates every string/integer the server receives and is validated against sabotaged traffic and a sabotaged client. | Tested (`test_wire_audit...`, `test_the_audit_has_teeth`, `test_a_sabotaged_owner...`). |
 | F22 | Info | `AVG` introduces `1/n`: `n` is public (the server knows the row count), applied at the owner after decryption. | By design. |
@@ -67,6 +67,87 @@ statement "the GT result reveals only the owner-opened value" tight when many pr
 same owner and the application leaks the plaintexts to a party who also controls the server? (Q4) Is there a sound way to verify a
 GT result with `O(1)` owner work (e.g. a second GT tag with an owner-computable correction)? We found none.
 
+## Round 4 — row-level products (v0.6.2) and a sustained attempt at Q4 (self-review, not independent)
+
+Added: `SELECT L*R FROM t` (depth-1 products of integer-linear forms of FHE columns, un-aggregated — one
+ciphertext per row, mirroring PAIRED's row-level `a*b`), and `REJECT_BARE_COLUMN_PRODUCT = False`
+(`SUM(x*y)` of two bare FHE columns is no longer special-cased; it goes through the same `fhe_mul` path
+as every other product). Both reuse the server-side machinery of Round 3 unchanged (per-row `mul_cells`
+finalises each row's pairing separately instead of folding them into one sum); no new value the server
+computes or the owner sends is added by either change, so F14–F22 apply to the row-level shape without
+modification: in particular F19 (integrity of a delegated product) and F20 (DoS / cost) are the SAME
+finding, now also covering `mode="row"` — F20's cap (`fhe_max_mul_work`) is shared verbatim with
+`mode="sum"` since the per-row curve cost is identical; only the final accumulation differs.
+
+| ID | Severity | Finding / question | Status |
+|---|---|---|---|
+| F23 | Info | Row-level products share the aggregate shape's caps, grammar and wire audit (same `fhe_mul` RPC, a third `mode` value); no new leak surface. | Tested (`test_row_level_fhe_products_*`, audit extended for `mode="row"` list replies). |
+| F24 | Info | A per-row product result feeding into a further product, or a per-row FHE value participating in an aggregate in the same expression, stays rejected (depth-1, and row/agg levels cannot mix) — same rule as before, now also enforced for the un-aggregated shape. | Tested. |
+
+### Q4, revisited: is there a sound O(1) integrity check for a delegated pairing product?
+
+Q4 asked whether a second, owner-computable GT tag could let the owner check a delegated product
+without reading the operands. We looked specifically at the two constructions the question suggests and
+found neither works, for a structural reason that generalises past both of them:
+
+**Attempt 1 — pair a linear tag with the OTHER (untagged) operand.** Encrypt a tag
+`Tag_L = Enc(α·L + γ_L)` (same PRF-keyed `α`, `γ_L` as the existing cell/SUM tags) and have the server
+compute a second pairing `e(Tag_L, R) = g^(α·L·R + γ_L·R)` alongside the real product `g^(L·R)`. The
+owner wants to check `tag_result == α·(L·R) + γ_L·R`. It knows `α` (secret) and can recompute `γ_L`
+locally (a PRF of its own key over public row ids — no decryption needed, exactly like the existing
+SUM-tag check). It does **not** know `R` (the whole point of delegating), so it cannot compute `γ_L·R`
+and the check is stuck exactly where F19 left it: the correction term needs the plaintext of the
+operand that was never read. This is true whichever operand is tagged, and true whether the tag pairs
+with the raw operand or with the public-linear-combination ciphertext built from it (the combination is
+still an unopened ciphertext of an unknown value from the owner's point of view).
+
+**Attempt 2 — pair a linear tag of L with a linear tag of R** (the "second independent MAC keyed
+differently" idea), `e(Tag_L, Tag_R) = g^((α·L+γ_L)(β·R+δ_R))`
+`= g^(αβ·L·R + αδ_R·L + βγ_L·R + γ_L·δ_R)`. The owner can compute `γ_L`, `δ_R` and so the pure
+"PRF x PRF" term `γ_L·δ_R` locally with no decryption — but the other two cross terms,
+`αδ_R·L` and `βγ_L·R`, are each linear in one of the two operands the owner never read. Doubling the tag
+doubles the number of stuck cross terms instead of removing them; it does not help.
+
+**Why this keeps happening.** Expand the general case: any tag that is affine in a value (`α·v + γ`) and
+any bilinear pairing of two such affine quantities always produces, besides the `(data)·(data)` term and
+the `(PRF)·(PRF)` term (both fine), exactly two cross terms of the shape `(secret or PRF)·(the OTHER
+party's plaintext)`. Cancelling a cross term without knowing that plaintext is only possible if its
+coefficient is identically zero — but a zero `γ` or `α` is an untagged (unauthenticated) ciphertext, so
+the construction that "fixes" the cross term by zeroing it out has, by that same move, removed the
+tag's row-binding and is no longer a MAC of anything. There is no choice of affine tag that both (a)
+authenticates the row/value the way the existing SUM/cell tags do and (b) pairs with anything to a
+GT value the owner can check without the plaintext of at least one side. This is not specific to our
+`α, γ` construction: it is a property of *affine* (degree-1) tags under a *bilinear* (one-pairing-deep)
+map, which is exactly the tool this design restricts itself to (no second pairing level, no
+decrypt-and-re-encrypt).
+
+**Where a real fix would have to come from, and why we did not build it.** A sound check of a product
+performed by a party that is not shown the factors is precisely what a pairing-based proof system
+(e.g. a Groth16-style one-pairing product argument) provides — but every such construction needs a
+*witness-dependent* proof object assembled by whoever **does** know the factors, using a structured CRS,
+at proof-construction time. Here nobody is in that position without breaking a design invariant: the
+keyless server never has the plaintexts (it could not build a witness-dependent proof even if asked),
+and the only party who could decrypt the operands and build one is the owner — but having the owner
+decrypt the operands to build/check a proof is exactly the "owner reads the operands and recomputes"
+path this design already offers as `fhe_dot_mode="local"`, not a new O(1) alternative to it. We did not
+find, and do not believe there is, a way to get a cheaper-than-"read-the-operands" sound check out of
+this toolbox (BN254 pairings, affine PRF tags, no decrypt/re-encrypt, no witness-dependent proof
+object) — **Q4 is answered negatively** for the tools this design uses. A different cryptographic
+primitive (e.g. a dedicated SNARK with a trusted/transparent setup, built and verified by a third
+protocol layer) might do better, but that is a different system, not a small addition to this one, and
+is out of scope here.
+
+**Consequence (unchanged from Round 3, now explicit for the row-level shape too):** delegated
+`DOT`, delegated `SUM(L*R)` / `AL*AR`, and delegated per-row `L*R` all have **no integrity check**, by
+design, with no silent weakening. An authenticated connection defaults to `local` (the owner verifies
+the operands via their existing tags/anchor and multiplies itself, `O(rows x columns)` decryptions); the
+unverified delegated path is available only via the explicit, documented opt-in
+(`fhe_dot_mode="delegated"` / legacy `fhe_allow_unverified_dot=True`), exactly as for `DOT`, and this is
+pinned by tests for all three shapes (`test_authenticated_catches_tampering_where_delegated_cannot`,
+`test_delegated_unauthenticated_has_no_integrity_like_dot`,
+`test_row_level_fhe_products_delegated_authenticated_has_no_integrity`,
+`test_row_level_fhe_products_authenticated_default_is_local`).
+
 ## Known residual limits (inherent to the design)
 
 * **Rollback / replay of a complete old version** of a cell or table (value + tag + nonce together) is not
@@ -77,7 +158,11 @@ GT result with `O(1)` owner work (e.g. a second GT tag with an owner-computable 
 * **The anchor itself**: with a `FileAnchor`, loss, rollback or collusion with the server defeats anchor mode. A
   `QuorumAnchor` tolerates up to `k-1` faulty custodians and `n-k` unavailable ones (conditions in `fhe-columns.md`);
   `adopt_table` is trust on first use.
-* **Delegated `DOT` and delegated FHE expressions** (`SUM(a*b)`, `SUM(a)*SUM(b)`, ...) have no integrity check; `local` mode (default when authenticated) verifies operands instead.
+* **Delegated `DOT` and delegated FHE expressions** (`SUM(a*b)`, `SUM(a)*SUM(b)`, the row-level `a*b` /
+  `(a+b)*(c-d)`, ...) have no integrity check; `local` mode (default when authenticated) verifies
+  operands instead. Round 4 looked specifically for a sound O(1) alternative (a second, pairing-based
+  tag) and did not find one — see "Q4, revisited" there for why the obstruction looks structural, not
+  just a gap we haven't closed yet.
 * **Not constant time** in pure Python, and GT exponentiation is never constant time (only split-randomised).
 * **Security level** ≈ 100 bit (BN254), SXDH assumed. **No independent human review yet.**
 

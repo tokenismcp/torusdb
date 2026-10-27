@@ -31,6 +31,8 @@ mod expr_eval;
 mod expr_shared;
 mod field;
 mod fhe;
+mod fhe_expr;
+mod fhe_expr_eval;
 mod hash;
 
 pub use anchor::{
@@ -47,6 +49,12 @@ pub use fhe::{
 pub use fhe::internals as fhe_internals;
 pub use expr::{analyze_expression, parse_expression, render_expr, Expr, ExprInfo, Frac, MAX_EXPR_HEIGHT};
 pub use expr_eval::{ExprCost, ExprMode, ExprValue};
+pub use fhe_expr::{
+    analyze_fhe_expr, operand_at, peval_poly, references_fhe_column, FheExprPlan, Level as FheExprLevel, Poly as FheExprPoly,
+    Term as FheExprTerm, Lin as FheExprLin, MAX_COLS as FHE_EXPR_MAX_COLS, MAX_PRODUCTS as FHE_EXPR_MAX_PRODUCTS,
+    REJECT_BARE_COLUMN_PRODUCT,
+};
+pub use fhe_expr_eval::FheExprCost;
 
 /// SHA-256 of `data` as lowercase hex (test aid: the cross-language wire-trace digests). Not part of the stable API.
 #[doc(hidden)]
@@ -437,6 +445,10 @@ pub struct FheLimits {
     pub max_scan_rows: Option<usize>,
     pub max_dot_rows: BackendRows,
     pub recommended_dot_rows: BackendRows,
+    /// `fhe_mul`: rows x (lterms+rterms) cap per request, per back end.
+    pub max_mul_work: BackendRows,
+    /// `fhe_mul` mode "agg": ids per side, per back end.
+    pub max_mul_agg_rows: BackendRows,
 }
 
 /// Request-size limits a server publishes in `hello`.
@@ -470,6 +482,8 @@ fn parse_limits(l: &Value) -> Option<ServerLimits> {
         max_scan_rows: pos(&f["max_scan_rows"]),
         max_dot_rows: rows(&f["max_dot_rows"]),
         recommended_dot_rows: rows(&f["recommended_dot_rows"]),
+        max_mul_work: rows(&f["max_mul_work"]),
+        max_mul_agg_rows: rows(&f["max_mul_agg_rows"]),
     });
     let wires = l.get("wires").and_then(|w| w.as_object()).filter(|o| !o.is_empty()).map(|o| WireLimits {
         max_wires: o.get("max_wires").and_then(pos),
@@ -594,6 +608,12 @@ struct ExprPlan {
     locs: HashMap<String, (String, String)>,
 }
 
+/// `expr_plan`'s result: a normal (shared-wire / owner-transport) expression, or an FHE one.
+enum Plan {
+    Fhe { table: String, fhe: fhe_expr::FheExprPlan },
+    Wire(ExprPlan),
+}
+
 pub struct Client {
     conn: Conn,
     masks: Masks, // (table, rowid, col) -> r   (SECRET)
@@ -613,6 +633,7 @@ pub struct Client {
     max_mult_depth: usize,           // dialect v0.6: deepest expression `expr` / `join_expr` will run
     expression_mode: ExprMode,
     last_expr_cost: Option<ExprCost>,
+    last_fhe_expr_cost: Option<FheExprCost>,
 }
 
 impl fmt::Debug for Client {
@@ -779,6 +800,7 @@ impl Client {
             max_mult_depth: o.max_mult_depth,
             expression_mode: o.expression_mode,
             last_expr_cost: None,
+            last_fhe_expr_cost: None,
         };
         if let Some(spec) = &o.integrity_anchor {
             if !o.authenticated {
@@ -2547,19 +2569,37 @@ impl Client {
     }
 
     /// Cost of the last successful `expr` / `join_expr` (depth, owner rounds, products, inversions,
-    /// Pi_lin sums); `None` before one ran or after a failed one.
+    /// Pi_lin sums); `None` before one ran or after a failed one (also `None` after an FHE-column
+    /// expression: see [`Client::last_fhe_expr_cost`]).
     pub fn last_expr_cost(&self) -> Option<&ExprCost> {
         self.last_expr_cost.as_ref()
     }
 
-    fn expr_plan(&self, expression: &str, instances: &[(String, String)]) -> Result<ExprPlan> {
+    /// Cost of the last successful `expr` / `join_expr` evaluated over FHE columns (`fhe_mul` RPCs,
+    /// pairings, GT results opened, cells decrypted, product terms); `None` before one ran, after a
+    /// failed one, or after a non-FHE expression (see [`Client::last_expr_cost`]).
+    pub fn last_fhe_expr_cost(&self) -> Option<&FheExprCost> {
+        self.last_fhe_expr_cost.as_ref()
+    }
+
+    /// `expr_plan`'s result: either a normal (shared-wire / owner-transport) expression, or an FHE
+    /// one (dialect v0.6.1/v0.6.2, `fhe_expr.rs`, always single-table - no shared wires are involved).
+    fn expr_plan(&self, expression: &str, instances: &[(String, String)]) -> Result<Plan> {
         let tree = parse_expression(expression)?;
         let mut specs = vec![];
         for (a, t) in instances {
             specs.push((a.clone(), self.cols(t)?.clone()));
         }
         let scope = expr::Scope::new(specs)?;
-        let (expr, info) = analyze_expression(&tree, &|n: &str| scope.resolve(n).map(|(_, c)| c))?;
+        let resolve = |n: &str| -> Result<Column> { scope.resolve(n).map(|(_, c)| c) };
+        if fhe_expr::references_fhe_column(&tree, &resolve)? {
+            if instances.len() != 1 {
+                return Err(Error::interface("FHE expressions cannot be used in a join query"));
+            }
+            let fhe = fhe_expr::analyze_fhe_expr(&tree, &resolve)?;
+            return Ok(Plan::Fhe { table: instances[0].1.clone(), fhe });
+        }
+        let (expr, info) = analyze_expression(&tree, &resolve)?;
         let mut locs = HashMap::new();
         for name in expr::columns_of(&expr) {
             let (inst, col) = scope.resolve(&name)?;
@@ -2606,26 +2646,42 @@ impl Client {
                 ));
             }
         }
-        Ok(ExprPlan { expr, info, locs })
+        Ok(Plan::Wire(ExprPlan { expr, info, locs }))
     }
 
-    fn run_expr(&mut self, plan: &ExprPlan, inst: &[(String, String)], tuples: &[Vec<Option<i64>>]) -> Result<ExprValue> {
+    fn run_plan(&mut self, plan: &Plan, inst: &[(String, String)], tuples: &[Vec<Option<i64>>]) -> Result<ExprValue> {
         self.last_expr_cost = None;
-        let mode = self.expression_mode;
-        let base = expr_eval::ExprRunner::new(self, &plan.expr, &plan.info, inst, &plan.locs, tuples);
-        let (value, cost) = match mode {
-            ExprMode::Owner => base.run()?,
-            ExprMode::Shared => expr_shared::SharedRunner::new(base).run()?,
-        };
-        self.last_expr_cost = Some(cost);
-        Ok(value)
+        self.last_fhe_expr_cost = None;
+        match plan {
+            Plan::Fhe { table, fhe } => {
+                let ids: Vec<i64> = tuples.iter().filter_map(|t| t[0]).collect();
+                self.run_fhe_expr(table, fhe, &ids)
+            }
+            Plan::Wire(plan) => {
+                let mode = self.expression_mode;
+                let base = expr_eval::ExprRunner::new(self, &plan.expr, &plan.info, inst, &plan.locs, tuples);
+                let (value, cost) = match mode {
+                    ExprMode::Owner => base.run()?,
+                    ExprMode::Shared => expr_shared::SharedRunner::new(base).run()?,
+                };
+                self.last_expr_cost = Some(cost);
+                Ok(value)
+            }
+        }
     }
 
     /// Parse and check an expression against the table policies WITHOUT sending anything: its kind
     /// ("row" or "agg"), multiplicative depth, product / inversion counts and canonical text. Errors are
-    /// `Kind::Parse` / `Kind::PlanError` exactly where the Python parser and engine raise them.
+    /// `Kind::Parse` / `Kind::PlanError` exactly where the Python parser and engine raise them. An FHE
+    /// expression reports a synthetic `ExprInfo` (`kind: "agg"`, `ct_muls` = its product-term count,
+    /// `text: "(fhe expression)"`): `fhe_expr.rs`'s plan has no single `max_mult_depth`-comparable depth.
     pub fn analyze_expr(&self, table: &str, expression: &str) -> Result<ExprInfo> {
-        Ok(self.expr_plan(expression, &[(table.to_string(), table.to_string())])?.info)
+        match self.expr_plan(expression, &[(table.to_string(), table.to_string())])? {
+            Plan::Fhe { fhe, .. } => {
+                Ok(ExprInfo { kind: "agg", enc: true, depth: 0, ct_muls: fhe.products, inversions: 0, text: "(fhe expression)".to_string() })
+            }
+            Plan::Wire(p) => Ok(p.info),
+        }
     }
 
     /// `SELECT <expression> FROM table [WHERE pred]` for a v0.6 arithmetic expression: `+ - * /`, unary
@@ -2636,8 +2692,13 @@ impl Client {
     /// expression returns `ExprValue::Rows` (`None` where an operand is NULL), an aggregate one
     /// `ExprValue::Scalar` (`None` for an AVG over no rows).
     ///
-    /// Use `dot()` / `join_dot()` for DOT; MIN / MAX are not provided; FHE columns keep `sum` / `avg` /
-    /// `scaled_sum` / `dot` and are rejected here with an error naming FHE.
+    /// Use `dot()` / `join_dot()` for DOT; MIN / MAX are not provided. An expression over FHE columns
+    /// (dialect v0.6.1/v0.6.2: a public affine combination with at least one product term, e.g.
+    /// `SUM(a*b)`, `SUM(a)*SUM(b)`, `AVG(a*c)`, `2*SUM(a*b)-SUM(c*d)/4+7`, see `fhe_expr.rs` /
+    /// `docs/fhe-columns.md`) is evaluated through a separate path (no shared wires: FHE columns have
+    /// no server-held share of anything) and its cost is reported by [`Client::last_fhe_expr_cost`]
+    /// instead of [`Client::last_expr_cost`]; such an expression used across a `join()` is rejected
+    /// (`Kind::Interface`, "FHE expressions cannot be used in a join query").
     pub fn expr(&mut self, table: &str, expression: &str, pred: Value) -> Result<ExprValue> {
         self.expr_as(table, table, expression, pred)
     }
@@ -2645,22 +2706,25 @@ impl Client {
     /// Like [`Client::expr`], naming the table instance `alias` (so columns can be written `alias.col`).
     pub fn expr_as(&mut self, table: &str, alias: &str, expression: &str, pred: Value) -> Result<ExprValue> {
         self.last_expr_cost = None;
+        self.last_fhe_expr_cost = None;
         let inst = vec![(alias.to_string(), table.to_string())];
         let plan = self.expr_plan(expression, &inst)?;
         let pred = wire_pred(&pred)?;
         let ids = self.matching(table, pred)?;
         let tuples: Vec<Vec<Option<i64>>> = ids.into_iter().map(|i| vec![Some(i)]).collect();
-        self.run_expr(&plan, &inst, &tuples)
+        self.run_plan(&plan, &inst, &tuples)
     }
 
     /// The same over the rows of a `join()`: columns are `alias.col` (or a bare, unambiguous `col`); rows
     /// whose operand instance is the NULL side of a LEFT JOIN yield `None` per row and are skipped by SUM /
-    /// AVG, but are counted by COUNT(*).
+    /// AVG, but are counted by COUNT(*). An expression referencing an FHE column is rejected here (FHE
+    /// expressions are single-table only): see [`Client::expr`].
     pub fn join_expr(&mut self, j: &JoinResult, expression: &str) -> Result<ExprValue> {
         self.last_expr_cost = None;
+        self.last_fhe_expr_cost = None;
         let inst: Vec<(String, String)> = j.aliases.iter().map(|a| (a.clone(), j.tables[a].clone())).collect();
         let plan = self.expr_plan(expression, &inst)?;
-        self.run_expr(&plan, &inst, &j.tuples)
+        self.run_plan(&plan, &inst, &j.tuples)
     }
 
     /// Live rows on the server this vault cannot decrypt (a crash between the

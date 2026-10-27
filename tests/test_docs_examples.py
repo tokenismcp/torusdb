@@ -231,11 +231,16 @@ def test_first_run_error_messages_say_what_to_do(tmp_path):
 
 
 def test_payroll_example_file_runs_with_the_documented_results(conn):
-    """examples/payroll.torusql: every statement runs and the results quoted in its comments hold."""
+    """examples/payroll.torusql: every statement runs and the results quoted in its comments hold.
+
+    The FHE section needs a key (`conn` has none, like a real session without --fhe-key); it is
+    skipped here and re-run in isolation by test_payroll_example_fhe_section below."""
     from torussql.cli import split_statements
     text = (ROOT / "examples" / "payroll.torusql").read_text()
     stmts, rest = split_statements(text)
     assert not rest.strip() and len(stmts) > 15
+    fhe_stmts = [sql for sql in stmts if "fhe_payroll" in sql.lower()]
+    stmts = [sql for sql in stmts if sql not in fhe_stmts]
     got = {}
     for sql in stmts:
         got[" ".join(sql.split())] = conn.execute(sql).rows if sql.lstrip().upper().startswith("SELECT") \
@@ -260,3 +265,39 @@ def test_payroll_example_file_runs_with_the_documented_results(conn):
     # depth = rounds: the depth-3 query used three batched owner round trips
     conn.execute("SELECT rate * hours * (1 - tax) * overtime FROM payroll")
     assert conn.client.last_expr_cost["mult_rounds"] == 3
+
+
+def test_payroll_example_fhe_section_runs_with_the_documented_results(tmp_path):
+    """The FHE part of examples/payroll.torusql (dialect v0.6.2), run on a connection that has the
+    key the file's own comment says to pass with --fhe-key."""
+    import threading
+
+    from nokey_server import NoKeyTCPServer
+    from torusdb_core import fhe
+    from torussql.cli import split_statements
+
+    text = (ROOT / "examples" / "payroll.torusql").read_text()
+    stmts, _rest = split_statements(text)
+    stmts = [sql for sql in stmts if "fhe_payroll" in sql.lower()]
+    assert len(stmts) >= 6
+
+    srv = NoKeyTCPServer("127.0.0.1", 0)
+    host, port = srv.address
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    key = fhe.FheKey(value_range=50_000)
+    conn = torussql.connect(host, port, vault_path=str(tmp_path / "fhe_demo.vault"), fhe_key=key)
+    try:
+        got = {}
+        for sql in stmts:
+            got[" ".join(sql.split())] = conn.execute(sql).rows if sql.lstrip().upper().startswith("SELECT") \
+                else conn.execute(sql)
+        sel = {k: v for k, v in got.items() if k.upper().startswith("SELECT")}
+
+        def rows(prefix):
+            return next(v for k, v in sel.items() if k.startswith(prefix))
+        assert rows("SELECT SUM(rate) FROM fhe_payroll") == [[155]]
+        assert rows("SELECT DOT(rate, hours)") == [[5900]]
+        assert rows("SELECT rate * hours FROM fhe_payroll") == [[[2000, 2100, 1800]]]
+        assert rows("SELECT SUM(rate * hours)") == [[5900]]
+    finally:
+        conn.close(); srv.shutdown(); srv.server_close()

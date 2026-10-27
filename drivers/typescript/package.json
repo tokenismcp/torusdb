@@ -34,6 +34,8 @@
     "dist/expr.d.ts",
     "dist/exprEval.js",
     "dist/exprEval.d.ts",
+    "dist/fheExpr.js",
+    "dist/fheExpr.d.ts",
     "dist/exprShared.js",
     "dist/exprShared.d.ts",
     "dist/errors.js",

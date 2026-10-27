@@ -60,13 +60,47 @@ fn static_vectors_match_the_python_reference() {
     for c in cases {
         let text = c["expr"].as_str().unwrap();
         let r = resolver(scope_of(&v, c["scope"].as_str().unwrap()));
-        let out = parse_expression(text).and_then(|t| analyze_expression(&t, &r));
         let what = format!("{}: {:?}", c["scope"], text.chars().take(80).collect::<String>());
-        match c["error"].as_str() {
-            Some("ParseError") => {
-                let e = out.expect_err(&what);
+        let tree = match parse_expression(text) {
+            Ok(t) => t,
+            Err(e) => {
+                assert_eq!(c["error"].as_str(), Some("ParseError"), "{}: {}", what, e);
                 assert_eq!(e.kind, Kind::Parse, "{}: {}", what, e);
+                continue;
             }
+        };
+        // An expression referencing an FHE column is analyzed through a separate path
+        // (`fhe_expr::analyze_fhe_expr`), dispatched upstream of `analyze_expression` exactly like
+        // the Python reference's unified `torussql_parser.expr.analyze_expr` (`fhe_ok=True` default,
+        // see `Client::expr_plan` for the Rust mirror). `analyze_expression` on its own keeps
+        // rejecting a bare FHE column reference by design (the low-level analyzer Python's
+        // `fhe_ok=False` / `_an()` corresponds to) - this is what the vectors file's lone FHE "ok"
+        // case now exercises (v0.6.2: `SUM(f*f)` is accepted, `REJECT_BARE_COLUMN_PRODUCT = false`).
+        if references_fhe_column(&tree, &r).unwrap_or(false) {
+            let out = analyze_fhe_expr(&tree, &r);
+            match c["error"].as_str() {
+                Some("PlanError") => {
+                    let e = out.expect_err(&what);
+                    assert_eq!(e.kind, Kind::PlanError, "{}: {}", what, e);
+                    assert_eq!(e.message, c["message"].as_str().unwrap(), "{}", what);
+                }
+                Some(other) => panic!("{}: unexpected error kind {:?} for an FHE-column expression", what, other),
+                None => {
+                    let fx = out.unwrap_or_else(|e| panic!("{}: {}", what, e));
+                    // no row-level FHE projection vectors exist today (see the task report); this port
+                    // only reaches aggregate plans, so `analyze_fhe_expr` never returns a row-level one.
+                    assert_eq!(render_expr(&tree), c["text"].as_str().unwrap(), "{}", what);
+                    assert_eq!("agg", c["kind"].as_str().unwrap(), "{}", what);
+                    assert!(c["enc"].as_bool().unwrap(), "{}", what);
+                    assert_eq!(0, c["depth"].as_u64().unwrap(), "{}", what);
+                    assert_eq!(fx.products as u64, c["ct_muls"].as_u64().unwrap(), "{}", what);
+                    assert_eq!(0, c["inversions"].as_u64().unwrap(), "{}", what);
+                }
+            }
+            continue;
+        }
+        let out = analyze_expression(&tree, &r);
+        match c["error"].as_str() {
             Some("PlanError") => {
                 let e = out.expect_err(&what);
                 assert_eq!(e.kind, Kind::PlanError, "{}: {}", what, e);

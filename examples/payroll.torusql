@@ -67,3 +67,34 @@ SELECT SUM(rate * hours) / COUNT(*), SUM(salary) / SUM(hours) FROM payroll;
 -- Everything together, with an alias: gross + monthly salary - overtime
 -- -> [2000 + 2000/3 - 5, 2100 + 750 - 2, 1800 + 1750/3 - 4]
 SELECT rate * hours + salary / 12 - overtime AS total FROM payroll;
+
+-- ---- FHE columns (dialect v0.6.2): the server itself adds / multiplies ciphertexts, no key -------
+-- `FHE` is the OTHER mode (complementary to ENC/PAIRED above): no mask vault, no per-cell owner
+-- state, any number of clients may share one key. Reading/writing FHE cells needs a key the rest of
+-- this file does not: create one once (`torussql --fhe-keygen ./fhe.key --fhe-pass-env FHE_PASS`) and
+-- pass `--fhe-key ./fhe.key --fhe-pass-env FHE_PASS` to `torussql` for the statements below.
+-- See docs/fhe-columns.md "Expressions over FHE columns".
+
+CREATE TABLE fhe_payroll (
+    id    INT PLAIN,
+    rate  INT FHE,
+    hours INT FHE
+);
+INSERT INTO fhe_payroll (id, rate, hours) VALUES (1, 50, 40);
+INSERT INTO fhe_payroll (id, rate, hours) VALUES (2, 60, 35);
+INSERT INTO fhe_payroll (id, rate, hours) VALUES (3, 45, 40);
+
+-- Encrypted sum, server adds ciphertexts (EC point addition): total base rate = 155
+SELECT SUM(rate) FROM fhe_payroll;
+
+-- Encrypted inner product (DOT, a pairing): total gross across everyone
+-- = 50*40 + 60*35 + 45*40 = 5900, computed server-side from ciphertexts only.
+SELECT DOT(rate, hours) FROM fhe_payroll;
+
+-- v0.6.2: the SAME per-row product, UN-aggregated -- one ciphertext per row, the server pairs each
+-- row on its own (not summed), the owner decrypts each individually -> [2000, 2100, 1800].
+SELECT rate * hours FROM fhe_payroll;
+
+-- v0.6.2: SUM(x*y) of two bare FHE columns now gives the same answer as DOT(x, y) -- 5900,
+-- through the identical server-side pairing path (DOT keeps working unchanged).
+SELECT SUM(rate * hours) FROM fhe_payroll;
