@@ -14,7 +14,7 @@ categories = ["database", "cryptography"]
 include = ["src/**/*", "examples/**/*", "README.md", "LICENSE", "NOTICE", "Cargo.toml"]
 
 [dependencies]
-num-bigint = "0.4"
+num-bigint = "0.5"
 num-integer = "0.1"
 num-traits = "0.2"
 serde_json = "1"
