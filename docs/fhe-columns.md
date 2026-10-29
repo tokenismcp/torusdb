@@ -226,11 +226,18 @@ A public scale applied after decryption (`5*SUM(a*b)`) may leave the range; only
   an error rather than wrap. Decryption keeps a table of ≈ √(2·range) entries (range 10^9 ≈
   45 k entries, a few seconds the first time per process).
 * **Performance:** install the native back end (`pip install "torusdb-core[fhe-native]"`,
-  i.e. `mclbn256`/herumi mcl) and everything is ≈150× faster — measured on an Apple-silicon
-  laptop: 500-row `DOT` in 0.7 s, 1 000-cell `SUM` in 0.4 s, 1 000 encryptions in 0.3 s. Without
-  it the pure-Python `py_ecc` fallback is used automatically (a 1 000-row `DOT` takes ≈3 minutes
-  of server CPU; the server computes outside the database lock, in chunks of 100 rows per
-  request). Force a back end with `TORUSDB_FHE_BACKEND=pyecc|mcl`.
+  i.e. `mclbn256`/herumi mcl) and everything is ≈150× faster — measured end to end over a real
+  TCP connection on an Apple-silicon laptop: 500-row `DOT` in ≈1.1 s, 500-cell `SUM` in ≈0.2 s.
+  Without it the pure-Python `py_ecc` fallback is used automatically (the server computes
+  outside the database lock, in chunks of 100 rows per request, so it is slow rather than
+  blocking). Force a back end with `TORUSDB_FHE_BACKEND=pyecc|mcl`.
+* **Row-level products are one decrypt per row — budget accordingly.** `SUM(L*R)`/`DOT`
+  decrypt once for the whole query; `SELECT L*R FROM t` (v0.6.2, no aggregation) decrypts each
+  row's ciphertext separately. Measured: ≈60 ms/row with the native back end (500 rows in
+  ≈30 s), regardless of `value_range` — the subgroup-membership check on each result is a fixed
+  per-decrypt cost (it is *not* the range-dependent discrete-log search, which is cheap by
+  comparison once its table is built). For a query touching many rows, prefer an aggregate
+  (`SUM`, `DOT`, `AVG`) over the row-level form whenever the application allows it.
 * **Back ends are interoperable for cells and SUMs, not for DOT results.** Cells are plain
   curve points, so a cell written with one back end is read by the other. A `DOT` result is a
   target-group element whose encoding depends on the library's pairing; it carries a one-byte

@@ -110,8 +110,23 @@ class PyEcc:
         return p_pairing(g2pt, g1pt, final_exponentiate=False)
 
     def final(self, m): return final_exponentiate(m)
-    def gt_one(self): return p_pairing(PG2, PG1) ** 0
-    def gt_gen(self): return p_pairing(PG2, PG1)
+
+    # gt_one()/gt_gen() are pure functions of the fixed public generators G1/G2 (no secret,
+    # no per-call input) — always the same value — but a pure-Python pairing costs ~100-200 ms,
+    # and gt_in_subgroup() below calls gt_one() on every check (several times per decrypt).
+    # Caching them on this (singleton, see fhe_backend.get()) instance turns that into a
+    # one-time cost per process instead of one full extra pairing per call.
+    def gt_one(self):
+        v = getattr(self, "_gt_one_cached", None)
+        if v is None:
+            v = self._gt_one_cached = p_pairing(PG2, PG1) ** 0
+        return v
+
+    def gt_gen(self):
+        v = getattr(self, "_gt_gen_cached", None)
+        if v is None:
+            v = self._gt_gen_cached = p_pairing(PG2, PG1)
+        return v
     def gt_mul(self, a, c): return a * c
     def gt_pow(self, a, k): return a ** (k % N)
     def gt_to(self, g) -> bytes: return b"".join(_i32(c.n if hasattr(c, "n") else c) for c in g.coeffs)
@@ -232,8 +247,19 @@ class Mcl:
         return g1pt.pairing(g2pt, use_final_exp=False)
 
     def final(self, m): return m.final_exp()
-    def gt_gen(self): return self.G1.pairing(self.G2)
-    def gt_one(self): return self.gt_gen().pow(self._fr(0))
+    # Same reasoning as PyEcc.gt_one()/gt_gen() above: fixed public constants, cached once
+    # per (singleton) backend instance instead of re-pairing on every call.
+    def gt_gen(self):
+        v = getattr(self, "_gt_gen_cached", None)
+        if v is None:
+            v = self._gt_gen_cached = self.G1.pairing(self.G2)
+        return v
+
+    def gt_one(self):
+        v = getattr(self, "_gt_one_cached", None)
+        if v is None:
+            v = self._gt_one_cached = self.gt_gen().pow(self._fr(0))
+        return v
     def gt_mul(self, a, c): return a * c
     def gt_pow(self, a, k): return a.pow(self._fr(k))
 

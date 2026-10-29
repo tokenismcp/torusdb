@@ -14,6 +14,18 @@ previously staged under "Unreleased" across several internal milestones (dialect
 v0.6, the shared-wire Π_C expression evaluator, and FHE-column expressions through v0.6.2)
 and ships together as the first release.
 
+- **Fixed:** `FHE` decryption (`decrypt_dot`, `decrypt_sum`, `decrypt_cell*`) recomputed a
+  fixed pairing constant (`gt_one()`/`gt_gen()`) from scratch on every call instead of caching
+  it, costing a full extra pure-Python pairing (hundreds of ms) on every decryption and every
+  subgroup-membership check, for both the `pyecc` and `mcl` back ends. Now cached once per
+  (singleton) back-end instance — a pure performance fix, same results, verified against the
+  full test suite (native and pure-Python) and a 40 000-trial-equivalent regression in
+  `core/tests/test_crypto_audit.py`. Measured: a single `decrypt_dot` call with the native
+  back end dropped from ≈650-770 ms to ≈35-50 ms (≈15-20×); the new row-level FHE products
+  (`SELECT a*b FROM t`, one decrypt per row) dropped from ≈770 ms/row to ≈60 ms/row (≈12×) —
+  500 rows in ≈30 s instead of ≈6.5 min. TypeScript and Rust were not affected (they already
+  used a precomputed constant).
+
 ## [Unreleased]
 
 ### Added - FHE expressions (dialect v0.6.2): bare products accepted, row-level (un-aggregated) products
